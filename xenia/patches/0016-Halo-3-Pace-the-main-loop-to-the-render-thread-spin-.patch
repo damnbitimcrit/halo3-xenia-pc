@@ -1,0 +1,833 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Pace the main loop to the render thread; spin-free
+ frame cap
+
+The main thread publishes a frame per pass into a two-slot mailbox that
+keeps only the latest frame. When the render side is the bottleneck (about
+80 FPS in busy scenes) half the passes build a frame, with its 4 MB copy,
+that is overwritten without being drawn.
+
+- At the start of each main loop pass, wait for the render thread to take
+  the frame published last (state[wr % n] != 0 at 8294CA9C, read from
+  guest memory), woken by a hook on the take's return (821A866C). The wait
+  times out after twice the longest of the last 8 render times plus 4 ms
+  (10-64 ms); after 2 timeouts with no take in between, pacing stops until
+  the render thread takes a frame again. Pacing stops while the render
+  thread needs more than 30 ms per frame and resumes below 24 ms, where
+  waiting would cost more latency than it saves.
+- Late start (on by default): after that wait, sleep so the next frame is
+  ready a margin (1 ms and up, raised by 1 ms whenever the render thread
+  had to wait for a late-started frame) before the render thread finishes
+  the current one, using the shortest recent render time and the longest
+  recent main pass. This keeps the input latency of building frames
+  continuously.
+- The frame cap sleeps until each deadline on host ticks, with a
+  high-resolution waitable timer on Windows (NanoSleep elsewhere or if
+  unavailable), instead of yielding in a loop for the last millisecond
+  while taking the guest clock lock. halo3_pacer_spin_us adds an optional
+  busy-wait tail.
+- halo3_render_thread_sleep (on by default): the render thread waits up to
+  1 ms for a publish (821A85D0, woken from 820802CC) instead of polling,
+  and sleeps 1 ms per spin while the main thread draws (821A8730, mode 0).
+- Stats: frames taken and overwritten untaken, render drawing and waiting
+  time per frame, main thread time per frame, waits, timeouts, unpaced
+  passes, late starts and margin, and the cap's sleep, spin and lateness;
+  the GPU command processor thread's time split and counts (the GPU
+  thread timing counters).
+
+Cvars: halo3_pace_to_render, halo3_pace_late_start, halo3_pacer_spin_us,
+halo3_render_thread_sleep.
+---
+ src/xenia/kernel/title/halo3/halo3.cc       |  56 ++
+ src/xenia/kernel/title/halo3/halo3.h        |  33 ++
+ src/xenia/kernel/title/halo3/halo3_frame.cc | 590 +++++++++++++++++++-
+ 3 files changed, 661 insertions(+), 18 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 6295beb..0268d72 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -13,6 +13,7 @@
+ #include "xenia/base/clock.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/cpu/guest_hooks.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/kernel/kernel_state.h"
+ 
+ DEFINE_bool(halo3_unlock_framerate, false,
+@@ -111,6 +112,61 @@ void LogStats() {
+       s.exposure.load(), s.exposure_target.load(), s.exposure_min.load(),
+       s.exposure_max.load(), s.exposure_reads.exchange(0),
+       s.exposure_raw.load(), s.exposure_raw_changes.exchange(0));
++  const uint32_t takes = s.render_takes.exchange(0);
++  const uint32_t busy_frames = s.render_busy_frames.exchange(0);
++  const uint32_t work_passes = s.main_work_passes.exchange(0);
++  const uint32_t pace_waits = s.pace_waits.exchange(0);
++  const uint32_t late_starts = s.late_starts.exchange(0);
++  const uint32_t cap_waits = s.cap_waits.exchange(0);
++  const auto per = [](uint64_t us, uint32_t count) {
++    return count ? double(us) / 1000.0 / count : 0.0;
++  };
++  XELOGI(
++      "Halo 3 pacing: {:.1f} frames taken/s, {:.1f} overwritten untaken/s; "
++      "render thread {:.2f} ms drawing and {:.2f} ms waiting per frame ({} "
++      "waited over 0.5 ms); main thread {:.2f} ms per frame built; waited "
++      "for the render thread in {} passes ({:.2f} ms avg, {} timeouts, {} "
++      "passes unpaced as stalled, {} as too slow); late start in {} passes "
++      "({:.2f} ms avg, margin {:.2f} ms); cap waited {} times ({:.0f} ms "
++      "asleep, {:.0f} ms spinning, {:.3f} ms late avg)",
++      takes / seconds, s.frames_overwritten.exchange(0) / seconds,
++      per(s.render_busy_us.exchange(0), busy_frames),
++      per(s.render_idle_us.exchange(0), takes), s.render_starved.exchange(0),
++      per(s.main_work_us.exchange(0), work_passes), pace_waits,
++      per(s.pace_wait_us.exchange(0), pace_waits), s.pace_timeouts.exchange(0),
++      s.pace_bypassed.exchange(0), s.pace_too_slow.exchange(0), late_starts,
++      per(s.late_start_us.exchange(0), late_starts),
++      s.late_start_margin_us.load() / 1000.0, cap_waits,
++      double(s.cap_sleep_us.exchange(0)) / 1000.0,
++      double(s.cap_spin_us.exchange(0)) / 1000.0,
++      per(s.cap_late_us.exchange(0), cap_waits));
++  // The GPU command processor thread, in percent of the interval. Executing
++  // includes the swaps, which include the presents, and the waits for the
++  // host GPU and for guest memory (WAIT_REG_MEM).
++  gpu::GpuThreadStats& g = gpu::gpu_thread_stats();
++  const double percent = 100.0 / (seconds * double(frequency));
++  const uint32_t swaps = g.swaps.exchange(0);
++  const uint32_t draws = g.draws.exchange(0);
++  const uint32_t copies = g.copies.exchange(0);
++  const uint32_t delivered = g.small_readbacks_delivered.exchange(0);
++  const uint32_t latency = g.small_readback_latency_frames.exchange(0);
++  XELOGI(
++      "Halo 3 GPU thread: idle {:.0f}%, executing {:.0f}% (swaps {:.0f}%, "
++      "presents {:.0f}%, host GPU waits {:.0f}%, {} guest memory waits "
++      "{:.0f}%); {:.1f} swaps/s, {:.0f} draws and {:.0f} resolves per swap; "
++      "small readbacks: {} queued, {} delivered ({:.1f} frames late), {} "
++      "skipped",
++      double(g.idle_ticks.exchange(0)) * percent,
++      double(g.execute_ticks.exchange(0)) * percent,
++      double(g.swap_ticks.exchange(0)) * percent,
++      double(g.present_ticks.exchange(0)) * percent,
++      double(g.gpu_wait_ticks.exchange(0)) * percent,
++      g.wait_reg_mem_waits.exchange(0),
++      double(g.wait_reg_mem_ticks.exchange(0)) * percent, swaps / seconds,
++      swaps ? double(draws) / swaps : 0.0, swaps ? double(copies) / swaps : 0.0,
++      g.small_readbacks_queued.exchange(0), delivered,
++      delivered ? double(latency) / delivered : 0.0,
++      g.small_readbacks_skipped.exchange(0));
+ }
+ 
+ void OnExposureReadback(cpu::ppc::PPCContext* ctx, void*) {
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index c6fb754..1855b51 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -81,6 +81,39 @@ struct Stats {
+   std::atomic<float> exposure_target{0.0f};
+   std::atomic<float> exposure_min{0.0f};
+   std::atomic<float> exposure_max{0.0f};
++  // Frame pacing (halo3_frame.cc). Times are in microseconds.
++  // Render thread: frames taken from the queue, frames the main thread
++  // overwrote before they were taken, time from a take to the next wait for a
++  // frame (drawing; samples over 100 ms left out) and time waiting for one,
++  // and takes after waiting more than 0.5 ms.
++  std::atomic<uint32_t> render_takes{0};
++  std::atomic<uint32_t> frames_overwritten{0};
++  std::atomic<uint32_t> render_busy_frames{0};
++  std::atomic<uint64_t> render_busy_us{0};
++  std::atomic<uint64_t> render_idle_us{0};
++  std::atomic<uint32_t> render_starved{0};
++  // Main thread: time from the start of building a frame to the next pass.
++  std::atomic<uint32_t> main_work_passes{0};
++  std::atomic<uint64_t> main_work_us{0};
++  // Passes that waited for the render thread to take the previous frame, how
++  // long, the waits that timed out, and passes not paced: the render thread
++  // had stopped taking frames, or draws too slowly for pacing to pay off.
++  std::atomic<uint32_t> pace_waits{0};
++  std::atomic<uint64_t> pace_wait_us{0};
++  std::atomic<uint32_t> pace_timeouts{0};
++  std::atomic<uint32_t> pace_bypassed{0};
++  std::atomic<uint32_t> pace_too_slow{0};
++  // Late start: passes delayed so their frame is ready just in time, the
++  // delay, and the current safety margin.
++  std::atomic<uint32_t> late_starts{0};
++  std::atomic<uint64_t> late_start_us{0};
++  std::atomic<uint32_t> late_start_margin_us{0};
++  // Frame-rate cap: waits, time asleep and busy-waiting, and how late the
++  // waits ended past their deadline.
++  std::atomic<uint32_t> cap_waits{0};
++  std::atomic<uint64_t> cap_sleep_us{0};
++  std::atomic<uint64_t> cap_spin_us{0};
++  std::atomic<uint64_t> cap_late_us{0};
+ };
+ Stats& stats();
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index 5211dd8..e2e54f4 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -32,26 +32,81 @@
+ // To unlock the frame rate we skip the three vblank waits, publish a frame on
+ // every pass, and feed main_time_update's result from the host clock instead
+ // of the vblank counter, so dt stays exact at any frame rate and the
+-// simulation speed is unchanged. The frame-rate cap is a host-side wait at the
+-// start of the main loop body, before input is read; the render thread draws
+-// as fast as frames are published. Presents outside the main loop (loading
++// simulation speed is unchanged. Presents outside the main loop (loading
+ // screens drawn while the main thread loads) are already spaced out by the
+ // code that triggers them. Everything is decided per frame from cvars,
+ // because the per-game config is only loaded after the title module (and
+ // these hooks) are set up.
++//
++// The frame queue (8294CA9C) is a two-slot mailbox. The main thread publishes
++// into slot wr % n (sub_821D5888): a 4 MB copy, then state = 1, overwriting a
++// frame nobody took. The render thread polls slot rd % n; its take
++// (sub_821D5A08) sets the state to 0 and then wr++, and it draws while
++// holding that slot, which its release (sub_821D5B30) frees with rd++. So
++// "the frame published last hasn't been taken" is exactly state[wr % n] != 0,
++// and while the main thread doesn't publish only the render thread changes
++// it, from 1 to 0.
++//
++// Pacing, all at the start of the main loop body, before input is read:
++// - Wait for the render thread to take the frame published last, so the main
++//   thread doesn't build frames that are overwritten without being drawn
++//   (about 40% of passes when the render side is the bottleneck). Skipped
++//   when the render thread draws too slowly for it to pay off, and bounded by
++//   a timeout in case the render thread stalls.
++// - Late start: after that wait, sleep so the next frame is ready just before
++//   the render thread finishes the current one, which keeps the input latency
++//   of building frames continuously.
++// - The frame-rate cap, sleeping until each frame's deadline.
++// The render thread itself busy-polls for frames, and spins while the main
++// thread draws (mode 0); it sleeps in both instead.
+ 
++#include <algorithm>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
++#include <optional>
+ 
+ #include "xenia/base/byte_order.h"
+ #include "xenia/base/clock.h"
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/platform.h"
+ #include "xenia/base/threading.h"
+ #include "xenia/cpu/guest_hooks.h"
+ #include "xenia/cpu/ppc/ppc_context.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++#if XE_PLATFORM_WIN32
++#include "xenia/base/platform_win.h"
++#endif
++#if XE_ARCH_AMD64
++#include <immintrin.h>
++#endif
++
++DEFINE_bool(halo3_pace_to_render, true,
++            "Halo 3: start building a frame only once the render thread has "
++            "taken the previous one, instead of building frames that are "
++            "never drawn. Stops while the render thread needs more than 30 "
++            "ms per frame and resumes below 24 ms.",
++            "Halo3");
++DEFINE_bool(halo3_pace_late_start, true,
++            "Halo 3: with halo3_pace_to_render, also delay building each "
++            "frame so it is ready just before the render thread needs it, "
++            "which keeps input latency as low as without pacing.",
++            "Halo3");
++DEFINE_int32(halo3_pacer_spin_us, 0,
++             "Halo 3: the frame-rate cap sleeps until each frame's deadline. "
++             "This many microseconds (at most 2000) before it, it busy-waits "
++             "instead, for an exact wake-up at the cost of CPU time. 0 never "
++             "busy-waits.",
++             "Halo3");
++DEFINE_bool(halo3_render_thread_sleep, true,
++            "Halo 3: let the game's render thread sleep while it waits for a "
++            "frame and while the main thread draws (loads), instead of "
++            "spinning on a CPU core.",
++            "Halo3");
++
+ namespace xe {
+ namespace kernel {
+ namespace title {
+@@ -74,10 +129,56 @@ constexpr uint32_t kOuterLoopWaitBranch = 0x821A9810;
+ // a frame even without a new tick.
+ constexpr uint32_t kRenderReasonBranch = 0x821A9524;
+ 
++// The frame queue (see the top of the file). The mode word is 1 while the
++// render thread draws and 0 while the main thread does (never 2 here).
++constexpr uint32_t kRenderModeWord = 0x82948F68;
++constexpr uint32_t kQueue = 0x8294CA9C;
++constexpr uint32_t kQueueSlotState = kQueue + 0x0C;  // + kQueueSlotStride * i
++constexpr uint32_t kQueueSlotStride = 0x10;
++constexpr uint32_t kQueueWriteIndex = kQueue + 0x48;  // wr, ++ by a take
++constexpr uint32_t kQueueReadIndex = kQueue + 0x4C;   // rd, ++ by a release
++constexpr uint32_t kQueueSlotCount = kQueue + 0x6C;   // n, 2 once set up
++constexpr uint32_t kMaxQueueSlots = 4;
++// Render thread (sub_821A8500) in mode 1. `bl sub_82080608` starting each
++// round of waiting for a frame (66 ms each), reached only by falling through
++// the loop storing 82948F6C = 1.
++constexpr uint32_t kRenderPollStart = 0x821A8588;
++// The poll loop, before it re-reads rd; reached only by falling through the
++// `bge` at 821A85CC (the round's time not up).
++constexpr uint32_t kRenderPollLoop = 0x821A85D0;
++// The return of the take (`bl sub_821D5A08` at 821A8668): r3 = the frame, or
++// 0 if there was none.
++constexpr uint32_t kRenderTakeReturn = 0x821A866C;
++// The mode word, in r11, isn't 1; reached only by the `bne` at 821A8564. In
++// mode 0 the thread loops back here without a call.
++constexpr uint32_t kRenderModeNotOne = 0x821A8730;
++// Main thread. sub_82080278 after its publish (`bl sub_821D5888` at
++// 820802C8): the low byte of r3 is whether it published.
++constexpr uint32_t kPublishReturn = 0x820802CC;
++// Publish (sub_821D5888) found its slot still holding a frame nobody took
++// (the `beq` at 821D5900 not taken) and overwrites it.
++constexpr uint32_t kPublishOverwrite = 0x821D5904;
++
++// Pacing stops once the render thread takes longer than this per frame, where
++// each wait would add more latency than late start can win back, and resumes
++// below the second; the gap keeps it from toggling on every frame.
++constexpr uint64_t kMaxPacedRenderMs = 30;
++constexpr uint64_t kResumePacedRenderMs = 24;
++// The wait for a take times out after twice the longest recent render time
++// plus this, clamped to the bounds below.
++constexpr uint64_t kTakeTimeoutExtraMs = 4;
++constexpr uint64_t kTakeTimeoutMinMs = 10;
++constexpr uint64_t kTakeTimeoutMaxMs = 64;
++// Timeouts in a row with no take in between before pacing stops until the
++// render thread takes a frame again.
++constexpr uint32_t kTimeoutsBeforeBypass = 2;
++// Render and main work times are tracked over this many frames.
++constexpr uint32_t kTimingFrames = 8;
++
+ // Only the game's main thread runs main_time_update.
+ struct FramePacer {
+   uint64_t last_ticks = 0;
+-  uint64_t deadline = 0;
++  uint64_t deadline = 0;  // host ticks
+ };
+ FramePacer pacer;
+ 
+@@ -87,6 +188,171 @@ FramePacer pacer;
+ thread_local float frame_delta_seconds = 0.0f;
+ thread_local uint64_t last_present_ticks = 0;
+ 
++bool LogStatsOn() { return cvars::halo3_log_stats; }
++
++uint64_t TicksToUs(uint64_t ticks, uint64_t frequency) {
++  return uint64_t(double(ticks) * 1000000.0 / double(frequency));
++}
++int64_t TicksToNs(uint64_t ticks, uint64_t frequency) {
++  return int64_t(double(ticks) * 1000000000.0 / double(frequency));
++}
++
++uint32_t Guest32(const cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return *ctx->TranslateVirtualBE<uint32_t>(address);
++}
++
++bool RenderThreadDraws(const cpu::ppc::PPCContext* ctx) {
++  return Guest32(ctx, kRenderModeWord) == 1;
++}
++
++// The state word of the slot at a queue index (wr or rd), non-zero while the
++// slot holds a frame; nullopt before the queue is set up.
++std::optional<uint32_t> SlotState(const cpu::ppc::PPCContext* ctx,
++                                  uint32_t index_address) {
++  const uint32_t count = Guest32(ctx, kQueueSlotCount);
++  if (!count || count > kMaxQueueSlots) {
++    return std::nullopt;
++  }
++  const uint32_t slot = Guest32(ctx, index_address) % count;
++  return Guest32(ctx, kQueueSlotState + slot * kQueueSlotStride);
++}
++
++// The frame the main thread published last hasn't been taken yet. Read
++// without the queue's locks: the take clears the state before wr++, so an old
++// wr shows the old slot (1, or 0 once taken) and a new one a slot released
++// earlier (0); the waiting main thread is the only publisher.
++bool PublishedFramePending(const cpu::ppc::PPCContext* ctx) {
++  const std::optional<uint32_t> state = SlotState(ctx, kQueueWriteIndex);
++  return state && *state;
++}
++
++// Set by the render thread's takes (for the main thread's wait) and by the
++// main thread's publishes (for the render thread's). Never destroyed: guest
++// threads may still run hooks while the process exits.
++threading::Event* take_event = nullptr;
++threading::Event* publish_event = nullptr;
++
++void WaitForEvent(threading::Event* event, uint64_t milliseconds) {
++  if (event) {
++    threading::Wait(event, false, std::chrono::milliseconds(milliseconds));
++  } else {
++    threading::NanoSleep(250000);
++  }
++}
++
++// The render thread's timing, measured by its hooks.
++struct RenderTiming {
++  // Read by the main thread.
++  std::atomic<uint32_t> takes{0};
++  std::atomic<uint64_t> last_take{0};  // host ticks
++  // The shortest and longest of the last kTimingFrames times from a take to
++  // the next wait for a frame; 0 until there are that many.
++  std::atomic<uint64_t> busy_low{0};
++  std::atomic<uint64_t> busy_high{0};
++  // Takes after waiting more than 0.5 ms for a frame.
++  std::atomic<uint32_t> starved{0};
++  // Render thread only.
++  uint64_t take_ticks = 0;   // the last take, 0 after a mode 0 stretch
++  uint64_t ready_ticks = 0;  // the start of the current wait for a frame
++  bool waiting = false;
++  uint64_t busy[kTimingFrames] = {};
++  uint32_t busy_count = 0;
++};
++RenderTiming render;
++
++// The main thread's pacing state.
++struct MainPacing {
++  uint64_t build_start = 0;  // host ticks; 0 if the last pass didn't count
++  uint64_t work[kTimingFrames] = {};
++  uint32_t work_count = 0;
++  uint64_t work_high = 0;  // the longest of the last kTimingFrames passes
++  bool too_slow = false;   // the render thread draws too slowly to pace
++  uint32_t takes_at_timeout = 0;
++  uint32_t timeouts_without_take = 0;
++  bool bypass = false;
++  uint32_t takes_at_bypass = 0;
++  uint64_t margin = 0;  // late start: how early the frame should be ready
++  uint32_t starved_seen = 0;
++  bool late_start_last = false;  // the previous pass started late
++};
++MainPacing pacing;
++
++// Sleeps the calling thread for about ns nanoseconds.
++#if XE_PLATFORM_WIN32
++#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
++#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
++#endif
++void HostSleepNs(int64_t ns) {
++  // A high-resolution waitable timer (Windows 10 1803 and later) wakes up
++  // within a fraction of a millisecond; otherwise fall back to NanoSleep.
++  struct Timer {
++    HANDLE handle = nullptr;
++    bool tried = false;
++    ~Timer() {
++      if (handle) {
++        CloseHandle(handle);
++      }
++    }
++  };
++  thread_local Timer timer;
++  if (!timer.tried) {
++    timer.tried = true;
++    timer.handle = CreateWaitableTimerExW(nullptr, nullptr,
++                                          CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
++                                          TIMER_ALL_ACCESS);
++  }
++  LARGE_INTEGER due;
++  due.QuadPart = -std::max<int64_t>(ns / 100, 1);
++  if (!timer.handle ||
++      !SetWaitableTimer(timer.handle, &due, 0, nullptr, nullptr, FALSE)) {
++    threading::NanoSleep(ns);
++    return;
++  }
++  WaitForSingleObject(timer.handle, INFINITE);
++}
++#else
++void HostSleepNs(int64_t ns) { threading::NanoSleep(ns); }
++#endif
++
++// Sleeps until the host tick count reaches target, busy-waiting for at most
++// the last halo3_pacer_spin_us. Returns the time spent spinning in ticks.
++uint64_t SleepUntil(uint64_t target, uint64_t frequency) {
++  // How late a sleep tends to wake up: rises at once, decays slowly.
++  thread_local int64_t oversleep_ns = 500000;
++  const int64_t spin_ns =
++      int64_t(std::clamp<int32_t>(cvars::halo3_pacer_spin_us, 0, 2000)) * 1000;
++  for (;;) {
++    const uint64_t now = Clock::QueryHostTickCount();
++    if (now >= target) {
++      return 0;
++    }
++    const int64_t request =
++        TicksToNs(target - now, frequency) - std::min(spin_ns, oversleep_ns);
++    if (request >= 50000) {
++      HostSleepNs(request);
++      const int64_t over = std::max<int64_t>(
++          TicksToNs(Clock::QueryHostTickCount() - now, frequency) - request, 0);
++      oversleep_ns = over > oversleep_ns
++                         ? over
++                         : oversleep_ns - (oversleep_ns - over) / 16;
++      if (!spin_ns) {
++        return 0;
++      }
++      continue;
++    }
++    if (!spin_ns) {
++      return 0;
++    }
++    // The tail, with no system calls and no guest clock lock.
++    while (Clock::QueryHostTickCount() < target) {
++#if XE_ARCH_AMD64
++      _mm_pause();
++#endif
++    }
++    return Clock::QueryHostTickCount() - now;
++  }
++}
++
+ void WaitForFrameDeadline(uint64_t frequency) {
+   const int32_t limit = cvars::halo3_framerate_limit;
+   if (limit <= 0) {
+@@ -94,26 +360,277 @@ void WaitForFrameDeadline(uint64_t frequency) {
+     return;
+   }
+   const uint64_t period = frequency / uint64_t(limit);
+-  uint64_t now = Clock::QueryGuestTickCount();
++  const uint64_t now = Clock::QueryHostTickCount();
+   if (!pacer.deadline || now > pacer.deadline + period) {
+     // First frame, or we fell more than a frame behind: restart the cadence.
+     pacer.deadline = now + period;
+     return;
+   }
+-  while (now < pacer.deadline) {
+-    const int64_t remaining_ns =
+-        int64_t((pacer.deadline - now) * 1000000000ull / frequency);
+-    if (remaining_ns > 1500000) {
+-      // Coarse sleep, leaving ~1 ms to absorb scheduler wake-up jitter.
+-      threading::NanoSleep(remaining_ns - 1000000);
+-    } else {
+-      threading::MaybeYield();
++  if (now < pacer.deadline) {
++    const uint64_t spun = SleepUntil(pacer.deadline, frequency);
++    if (LogStatsOn()) {
++      const uint64_t end = Clock::QueryHostTickCount();
++      Stats& s = stats();
++      s.cap_waits.fetch_add(1, std::memory_order_relaxed);
++      s.cap_sleep_us.fetch_add(TicksToUs(end - now - spun, frequency),
++                               std::memory_order_relaxed);
++      s.cap_spin_us.fetch_add(TicksToUs(spun, frequency),
++                              std::memory_order_relaxed);
++      if (end > pacer.deadline) {
++        s.cap_late_us.fetch_add(TicksToUs(end - pacer.deadline, frequency),
++                                std::memory_order_relaxed);
++      }
+     }
+-    now = Clock::QueryGuestTickCount();
+   }
+   pacer.deadline += period;
+ }
+ 
++// Waits for the render thread to take the frame published last. Returns
++// whether it waited for a take that happened.
++bool WaitForRenderTake(cpu::ppc::PPCContext* ctx, uint64_t frequency) {
++  if (!cvars::halo3_pace_to_render) {
++    pacing.bypass = false;
++    pacing.timeouts_without_take = 0;
++    return false;
++  }
++  const uint64_t busy_high = render.busy_high.load(std::memory_order_acquire);
++  if (!busy_high) {
++    return false;
++  }
++  if (busy_high > frequency * kMaxPacedRenderMs / 1000) {
++    pacing.too_slow = true;
++  } else if (busy_high <= frequency * kResumePacedRenderMs / 1000) {
++    pacing.too_slow = false;
++  }
++  if (!PublishedFramePending(ctx)) {
++    return false;
++  }
++  Stats& s = stats();
++  if (pacing.too_slow) {
++    if (LogStatsOn()) {
++      s.pace_too_slow.fetch_add(1, std::memory_order_relaxed);
++    }
++    return false;
++  }
++  if (pacing.bypass) {
++    if (render.takes.load(std::memory_order_acquire) ==
++        pacing.takes_at_bypass) {
++      if (LogStatsOn()) {
++        s.pace_bypassed.fetch_add(1, std::memory_order_relaxed);
++      }
++      return false;
++    }
++    pacing.bypass = false;
++    pacing.timeouts_without_take = 0;
++  }
++  const uint64_t timeout = std::clamp<uint64_t>(
++      2 * busy_high + frequency * kTakeTimeoutExtraMs / 1000,
++      frequency * kTakeTimeoutMinMs / 1000,
++      frequency * kTakeTimeoutMaxMs / 1000);
++  const uint64_t start = Clock::QueryHostTickCount();
++  for (;;) {
++    // Reset, then test, so a take between the two still ends the wait.
++    if (take_event) {
++      take_event->Reset();
++    }
++    if (!RenderThreadDraws(ctx)) {
++      // The main thread draws now (mode 0); nothing more to wait for.
++      return false;
++    }
++    if (!PublishedFramePending(ctx)) {
++      break;
++    }
++    const uint64_t now = Clock::QueryHostTickCount();
++    if (now - start >= timeout) {
++      const uint32_t takes = render.takes.load(std::memory_order_acquire);
++      pacing.timeouts_without_take = takes == pacing.takes_at_timeout
++                                         ? pacing.timeouts_without_take + 1
++                                         : 1;
++      pacing.takes_at_timeout = takes;
++      if (pacing.timeouts_without_take >= kTimeoutsBeforeBypass) {
++        // The render thread has stopped taking frames: don't pace until it
++        // takes one again.
++        pacing.bypass = true;
++        pacing.takes_at_bypass = takes;
++      }
++      if (LogStatsOn()) {
++        s.pace_timeouts.fetch_add(1, std::memory_order_relaxed);
++      }
++      return false;
++    }
++    const uint64_t left_ms =
++        ((start + timeout - now) * 1000 + frequency - 1) / frequency;
++    WaitForEvent(take_event, std::clamp<uint64_t>(left_ms, 1, 2));
++  }
++  pacing.timeouts_without_take = 0;
++  if (LogStatsOn()) {
++    s.pace_waits.fetch_add(1, std::memory_order_relaxed);
++    s.pace_wait_us.fetch_add(
++        TicksToUs(Clock::QueryHostTickCount() - start, frequency),
++        std::memory_order_relaxed);
++  }
++  return true;
++}
++
++// Right after a take: delays this pass so its frame is ready a margin before
++// the render thread finishes the frame it just took.
++void LateStart(uint64_t frequency) {
++  const uint64_t busy = render.busy_low.load(std::memory_order_acquire);
++  if (!busy || pacing.work_count < kTimingFrames) {
++    return;
++  }
++  const uint64_t min_margin = frequency / 1000;  // 1 ms
++  const uint64_t step = frequency / 1000;        // 1 ms
++  const uint64_t decay = frequency / 50000;      // 20 us
++  if (!pacing.margin) {
++    pacing.margin = 2 * min_margin;
++  }
++  const uint32_t starved = render.starved.load(std::memory_order_acquire);
++  if (pacing.late_start_last && starved != pacing.starved_seen) {
++    // The render thread waited for our late frame: back off quickly.
++    pacing.margin = std::min(pacing.margin + step, busy);
++  } else if (pacing.margin > min_margin + decay) {
++    pacing.margin -= decay;
++  }
++  pacing.starved_seen = starved;
++  pacing.late_start_last = false;
++  Stats& s = stats();
++  if (LogStatsOn()) {
++    s.late_start_margin_us.store(uint32_t(TicksToUs(pacing.margin, frequency)),
++                                 std::memory_order_relaxed);
++  }
++  const int64_t lead =
++      int64_t(busy) - int64_t(pacing.work_high) - int64_t(pacing.margin);
++  if (lead <= 0) {
++    return;
++  }
++  const uint64_t target =
++      render.last_take.load(std::memory_order_acquire) + uint64_t(lead);
++  const uint64_t now = Clock::QueryHostTickCount();
++  if (target <= now + frequency * 3 / 10000) {
++    // Under 0.3 ms: not worth a sleep.
++    return;
++  }
++  SleepUntil(target, frequency);
++  pacing.late_start_last = true;
++  if (LogStatsOn()) {
++    s.late_starts.fetch_add(1, std::memory_order_relaxed);
++    s.late_start_us.fetch_add(
++        TicksToUs(Clock::QueryHostTickCount() - now, frequency),
++        std::memory_order_relaxed);
++  }
++}
++
++// Render thread: the start of each round of waiting for a frame.
++void OnRenderPollStart(cpu::ppc::PPCContext*, void*) {
++  if (render.waiting) {
++    // Another round of the same wait.
++    return;
++  }
++  const uint64_t now = Clock::QueryHostTickCount();
++  render.ready_ticks = now;
++  render.waiting = true;
++  if (!render.take_ticks) {
++    return;
++  }
++  const uint64_t busy = now - render.take_ticks;
++  render.busy[render.busy_count++ % kTimingFrames] = busy;
++  if (render.busy_count >= kTimingFrames) {
++    uint64_t low = busy;
++    uint64_t high = busy;
++    for (uint64_t sample : render.busy) {
++      low = std::min(low, sample);
++      high = std::max(high, sample);
++    }
++    render.busy_low.store(low, std::memory_order_release);
++    render.busy_high.store(high, std::memory_order_release);
++  }
++  const uint64_t frequency = Clock::QueryHostTickFrequency();
++  if (LogStatsOn() && busy < frequency / 10) {
++    Stats& s = stats();
++    s.render_busy_frames.fetch_add(1, std::memory_order_relaxed);
++    s.render_busy_us.fetch_add(TicksToUs(busy, frequency),
++                               std::memory_order_relaxed);
++  }
++}
++
++// Render thread: the poll loop found no frame on its first look.
++void OnRenderPollLoop(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_render_thread_sleep) {
++    return;
++  }
++  // Reset, then test, so a publish between the two still ends the wait.
++  if (publish_event) {
++    publish_event->Reset();
++  }
++  const std::optional<uint32_t> state = SlotState(ctx, kQueueReadIndex);
++  if (!state || *state) {
++    return;
++  }
++  // The guest's own 66 ms limit keeps working: its tick count advances
++  // every millisecond.
++  WaitForEvent(publish_event, 1);
++}
++
++// Render thread: the return of the take.
++void OnRenderTakeReturn(cpu::ppc::PPCContext* ctx, void*) {
++  if (!static_cast<uint32_t>(ctx->r[3])) {
++    return;
++  }
++  const uint64_t now = Clock::QueryHostTickCount();
++  const uint64_t frequency = Clock::QueryHostTickFrequency();
++  const bool log_stats = LogStatsOn();
++  Stats& s = stats();
++  if (render.waiting) {
++    const uint64_t idle = now - render.ready_ticks;
++    if (idle > frequency / 2000) {
++      render.starved.fetch_add(1, std::memory_order_release);
++      if (log_stats) {
++        s.render_starved.fetch_add(1, std::memory_order_relaxed);
++      }
++    }
++    if (log_stats && idle < frequency / 10) {
++      s.render_idle_us.fetch_add(TicksToUs(idle, frequency),
++                                 std::memory_order_relaxed);
++    }
++    render.waiting = false;
++  }
++  render.take_ticks = now;
++  render.last_take.store(now, std::memory_order_release);
++  render.takes.fetch_add(1, std::memory_order_release);
++  if (log_stats) {
++    s.render_takes.fetch_add(1, std::memory_order_relaxed);
++  }
++  if (take_event) {
++    take_event->Set();
++  }
++}
++
++// Render thread: the mode word isn't 1. In mode 0 the main thread draws, and
++// this thread spins until the mode is 1 again.
++void OnRenderModeNotOne(cpu::ppc::PPCContext* ctx, void*) {
++  // Don't count the stretch as drawing or waiting time.
++  render.waiting = false;
++  render.take_ticks = 0;
++  if (cvars::halo3_render_thread_sleep && !static_cast<uint32_t>(ctx->r[11])) {
++    threading::NanoSleep(1000000);
++  }
++}
++
++// Main thread: sub_82080278's publish returned.
++void OnPublishReturn(cpu::ppc::PPCContext* ctx, void*) {
++  if ((ctx->r[3] & 0xFF) && publish_event) {
++    publish_event->Set();
++  }
++}
++
++// Main thread: a published frame is overwritten before it was taken.
++void OnPublishOverwrite(cpu::ppc::PPCContext*, void*) {
++  if (LogStatsOn()) {
++    stats().frames_overwritten.fetch_add(1, std::memory_order_relaxed);
++  }
++}
++
+ bool Unlocked() { return cvars::halo3_unlock_framerate; }
+ 
+ // Run right before a conditional branch on CR6[EQ] to pick its direction:
+@@ -173,12 +690,39 @@ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ float FrameDeltaSeconds() { return frame_delta_seconds; }
+ 
+-void OnPacingFrameStart(cpu::ppc::PPCContext*) {
+-  if (Unlocked()) {
+-    WaitForFrameDeadline(Clock::guest_tick_frequency());
+-  } else {
++void OnPacingFrameStart(cpu::ppc::PPCContext* ctx) {
++  if (!Unlocked()) {
+     pacer.deadline = 0;
++    pacing = MainPacing();
++    return;
+   }
++  const uint64_t frequency = Clock::QueryHostTickFrequency();
++  const uint64_t entry = Clock::QueryHostTickCount();
++  const bool render_draws = RenderThreadDraws(ctx);
++  if (!render_draws) {
++    // Mode 0: this thread draws too, so its passes say nothing about building
++    // frames.
++    pacing.work_count = 0;
++  } else if (pacing.build_start) {
++    const uint64_t work = entry - pacing.build_start;
++    pacing.work[pacing.work_count++ % kTimingFrames] = work;
++    pacing.work_high = 0;
++    for (uint32_t i = 0; i < std::min(pacing.work_count, kTimingFrames); ++i) {
++      pacing.work_high = std::max(pacing.work_high, pacing.work[i]);
++    }
++    if (LogStatsOn()) {
++      Stats& s = stats();
++      s.main_work_passes.fetch_add(1, std::memory_order_relaxed);
++      s.main_work_us.fetch_add(TicksToUs(work, frequency),
++                               std::memory_order_relaxed);
++    }
++  }
++  if (render_draws && WaitForRenderTake(ctx, frequency) &&
++      cvars::halo3_pace_late_start) {
++    LateStart(frequency);
++  }
++  WaitForFrameDeadline(frequency);
++  pacing.build_start = render_draws ? Clock::QueryHostTickCount() : 0;
+ }
+ 
+ void InstallFramePacing(KernelState* kernel_state) {
+@@ -189,6 +733,16 @@ void InstallFramePacing(KernelState* kernel_state) {
+   hooks.Add(processor, kPresentWaitBranch, OnPresent);
+   hooks.Add(processor, kOuterLoopWaitBranch, ForceNotEqual);
+   hooks.Add(processor, kRenderReasonBranch, ForceEqual);
++  if (!take_event) {
++    take_event = threading::Event::CreateAutoResetEvent(false).release();
++    publish_event = threading::Event::CreateAutoResetEvent(false).release();
++  }
++  hooks.Add(processor, kRenderPollStart, OnRenderPollStart);
++  hooks.Add(processor, kRenderPollLoop, OnRenderPollLoop);
++  hooks.Add(processor, kRenderTakeReturn, OnRenderTakeReturn);
++  hooks.Add(processor, kRenderModeNotOne, OnRenderModeNotOne);
++  hooks.Add(processor, kPublishReturn, OnPublishReturn);
++  hooks.Add(processor, kPublishOverwrite, OnPublishOverwrite);
+ }
+ 
+ }  // namespace halo3

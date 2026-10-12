@@ -1,0 +1,1282 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Let title code snapshot GPU-written memory without
+ waiting
+
+The counterpart of the guest readback that never waits for the host GPU,
+for data a title wants to keep but reads only later. A guest thread posts
+physical ranges into one of 16 slots (guest_readback.h): the parts whose
+host GPU copy is newer than guest memory are listed under the global
+lock, and the post returns at once. The command processor thread takes
+posts lock-free right before executing each batch of the ring (and at
+its loop top, idle wake-ups and in WAIT_REG_MEM's poll), so a copy is
+recorded before any command the guest wrote after its post. At the take
+it lists the parts again: if one listed at the post is gone (a load
+replaced the data since), the job fails; otherwise it copies the current
+parts, one consistent state, into its own 1 MiB readback buffer and ends
+the submission unless that would wait for pipeline creation. Completed
+copies are read into a host store at the usual completion pumps and
+delivered with try_lock, so the thread never waits for a guest thread.
+
+Guest threads can await a slot (the command processor thread then ends
+and waits for the submission only if the copy isn't done yet), flush
+before replacing the posted memory (waits until every post's copy is
+recorded, or withdraws it), and drop slots. Nothing is written to guest
+memory; the title takes the bytes and writes them where and when it
+chooses. D3D12 and Vulkan.
+---
+ src/xenia/gpu/command_processor.cc            | 202 +++++++++
+ src/xenia/gpu/command_processor.h             |  50 +++
+ .../gpu/d3d12/d3d12_command_processor.cc      | 143 +++++-
+ src/xenia/gpu/d3d12/d3d12_command_processor.h |  18 +
+ src/xenia/gpu/guest_readback.h                | 412 ++++++++++++++++++
+ .../gpu/pm4_command_processor_implement.h     |   1 +
+ .../gpu/vulkan/vulkan_command_processor.cc    | 173 ++++++++
+ .../gpu/vulkan/vulkan_command_processor.h     |  22 +
+ 8 files changed, 1020 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/gpu/command_processor.cc b/src/xenia/gpu/command_processor.cc
+index 730a55a..fd9c633 100644
+--- a/src/xenia/gpu/command_processor.cc
++++ b/src/xenia/gpu/command_processor.cc
+@@ -22,6 +22,7 @@
+ #include "xenia/gpu/guest_readback.h"
+ #include "xenia/gpu/packet_disassembler.h"
+ #include "xenia/gpu/sampler_info.h"
++#include "xenia/gpu/shared_memory.h"
+ #include "xenia/gpu/texture_info.h"
+ #include "xenia/gpu/xenos_zpd_report.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -436,12 +437,195 @@ void CommandProcessor::ServiceGuestReadback() {
+   readback.changed.notify_all();
+ }
+ 
++void CommandProcessor::WakeForGuestReadback(void* context) {
++  // Ends the idle loop's 2 ms wait now (an extra set only ends a later wait
++  // early). The event lives as long as this object, and the service is
++  // stopped before it's destroyed.
++  static_cast<CommandProcessor*>(context)->write_ptr_index_event_->Set();
++}
++
++void CommandProcessor::CollectGpuNewerParts(
++    void* context, const uint32_t* starts, const uint32_t* lengths,
++    uint32_t count, std::vector<std::pair<uint32_t, uint32_t>>& parts) {
++  const SharedMemory* shared_memory =
++      static_cast<CommandProcessor*>(context)->GetGuestReadbackSharedMemory();
++  // Page flags and kept ranges change only under this lock.
++  auto global_lock = global_critical_region::Acquire();
++  for (uint32_t i = 0; i < count; ++i) {
++    shared_memory->ForEachGpuNewerPart(
++        starts[i], lengths[i], [&parts](uint32_t start, uint32_t length) {
++          parts.emplace_back(start, length);
++        });
++  }
++}
++
++void CommandProcessor::FailGuestSnapshotJob(GuestSnapshotJob& job,
++                                            const char* reason) {
++  ReleaseGuestSnapshotBuffer(job);
++  job.completed = true;
++  job.failed = true;
++  XELOGW("GPU: guest snapshot {} not copied: {}", job.slot, reason);
++}
++
++bool CommandProcessor::DeliverGuestSnapshot(GuestSnapshotJob& job) {
++  GuestSnapshots& snapshots = guest_snapshots();
++  // Never wait for a guest thread: retried later.
++  std::unique_lock<std::mutex> lock(snapshots.mutex, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    return false;
++  }
++  GuestSnapshots::Slot& slot = snapshots.slots[job.slot];
++  // Otherwise posted again or dropped since: discarded.
++  if (slot.sequence == job.sequence &&
++      slot.state == GuestSnapshots::State::kPending) {
++    if (job.failed) {
++      slot.state = GuestSnapshots::State::kFailed;
++    } else {
++      job.data->ready_time = std::chrono::steady_clock::now();
++      slot.data = std::move(job.data);
++      slot.state = GuestSnapshots::State::kReady;
++    }
++    snapshots.changed.notify_all();
++  }
++  return true;
++}
++
++void CommandProcessor::PumpGuestSnapshots() {
++  for (size_t i = 0; i < guest_snapshot_jobs_.size();) {
++    GuestSnapshotJob& job = guest_snapshot_jobs_[i];
++    if (!job.completed && ReadGuestSnapshotCopy(job)) {
++      job.completed = true;
++    }
++    if (job.completed && DeliverGuestSnapshot(job)) {
++      guest_snapshot_jobs_.erase(guest_snapshot_jobs_.begin() + i);
++    } else {
++      ++i;
++    }
++  }
++}
++
++void CommandProcessor::ServiceGuestSnapshots() {
++  GuestSnapshots& snapshots = guest_snapshots();
++  const uint32_t attention = snapshots.attention.load(std::memory_order_acquire)
++                                 ? snapshots.attention.exchange(0)
++                                 : 0;
++  if (!attention && !guest_snapshot_redeliver_) {
++    return;
++  }
++  const uint32_t posts =
++      attention & ((UINT32_C(1) << GuestSnapshots::kMaxSlots) - 1);
++  if (posts) {
++    // Until the copies are recorded, a flush before a load keeps waiting.
++    snapshots.taking.store(1);
++    bool recorded = false;
++    for (uint32_t i = 0; i < GuestSnapshots::kMaxSlots; ++i) {
++      if (!(posts & (UINT32_C(1) << i))) {
++        continue;
++      }
++      std::unique_ptr<GuestSnapshotPost> post(
++          snapshots.posted[i].exchange(nullptr));
++      if (!post) {
++        continue;
++      }
++      GuestSnapshotJob job;
++      job.slot = post->slot;
++      job.sequence = post->sequence;
++      job.data = std::move(post->data);
++      // Copy what's newer now, one consistent state: still everything listed
++      // at the post (a load since would have dropped some, and the copy would
++      // see the loaded data), plus whatever the GPU wrote since. Only this
++      // thread uploads or marks GPU writes, and the copy is recorded next.
++      std::vector<std::pair<uint32_t, uint32_t>>& current =
++          guest_snapshot_current_parts_;
++      current.clear();
++      CollectGpuNewerParts(this, job.data->range_starts,
++                           job.data->range_lengths, job.data->range_count,
++                           current);
++      // Recording may pump guest_snapshot_jobs_ (BeginSubmission ->
++      // CheckSubmissionCompletion): push only afterwards.
++      const bool covered = GuestSnapshotPartsCovered(job.data->parts, current);
++      uint64_t length = 0;
++      for (const std::pair<uint32_t, uint32_t>& part : current) {
++        length += part.second;
++      }
++      if (!covered) {
++        FailGuestSnapshotJob(job,
++                             "its memory was replaced since it was posted");
++      } else if (length > GuestSnapshots::kMaxBytes) {
++        FailGuestSnapshotJob(job, "over the size limit when taken");
++      } else {
++        job.data->parts = current;
++        job.length = uint32_t(length);
++        if (RecordGuestSnapshotCopy(job)) {
++          recorded = true;
++        } else {
++          FailGuestSnapshotJob(
++              job,
++              "couldn't record the copy (no readback buffer or no "
++              "submission)");
++        }
++      }
++      guest_snapshot_jobs_.push_back(std::move(job));
++    }
++    if (recorded) {
++      SubmitGuestSnapshotCopies();
++    }
++    snapshots.taking.store(0);
++    // Flushers; without the mutex.
++    snapshots.changed.notify_all();
++  }
++  const uint32_t awaited =
++      (attention >> GuestSnapshots::kAwaitedShift) | guest_snapshot_redeliver_;
++  if (!awaited) {
++    return;
++  }
++  GpuProfileZone profile_zone(GpuProfileBucket::kSync);
++  // By value: awaiting may pump guest_snapshot_jobs_.
++  uint64_t await_submission = 0;
++  for (const GuestSnapshotJob& job : guest_snapshot_jobs_) {
++    if ((awaited & (UINT32_C(1) << job.slot)) && !job.completed) {
++      await_submission = std::max(await_submission, job.submission);
++    }
++  }
++  if (await_submission) {
++    AwaitGuestSnapshotSubmission(await_submission);
++  }
++  for (GuestSnapshotJob& job : guest_snapshot_jobs_) {
++    if (!(awaited & (UINT32_C(1) << job.slot)) || job.completed) {
++      continue;
++    }
++    if (ReadGuestSnapshotCopy(job)) {
++      job.completed = true;
++    } else {
++      FailGuestSnapshotJob(job,
++                           "the copy didn't complete (host GPU error, or the "
++                           "submission couldn't be ended)");
++    }
++  }
++  PumpGuestSnapshots();
++  // A delivery that missed the mutex: retried at the next service point.
++  guest_snapshot_redeliver_ = 0;
++  for (const GuestSnapshotJob& job : guest_snapshot_jobs_) {
++    if (awaited & (UINT32_C(1) << job.slot)) {
++      guest_snapshot_redeliver_ |= UINT32_C(1) << job.slot;
++    }
++  }
++}
++
+ void CommandProcessor::WorkerThreadMain() {
+   if (!SetupContext()) {
+     xe::FatalError("Unable to setup command processor internal state");
+     return;
+   }
+   guest_readback_service_thread = true;
++  if (GetGuestReadbackSharedMemory()) {
++    GuestSnapshots::Service service;
++    service.context = this;
++    service.wake = WakeForGuestReadback;
++    service.collect_gpu_newer_parts = CollectGpuNewerParts;
++    StartGuestSnapshotService(service);
++  }
++  GuestSnapshots& snapshots = guest_snapshots();
+ 
+   while (worker_running_) {
+     while (!pending_fns_.empty()) {
+@@ -453,6 +637,7 @@ void CommandProcessor::WorkerThreadMain() {
+     // A guest thread waiting for GPU-written data: everything before what it
+     // waited for has been executed.
+     ServiceGuestReadback();
++    ServiceGuestSnapshots();
+ 
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+@@ -475,6 +660,15 @@ void CommandProcessor::WorkerThreadMain() {
+           if (zpd_mode_ == ZPDMode::kStrict && zpd_awaited_report_count_) {
+             PrepareForWait();
+           }
++          // Guest snapshot copies: submitted if pipeline creation held them
++          // back, and delivered while idle.
++          if (!guest_snapshot_jobs_.empty()) {
++            SubmitGuestSnapshotCopies();
++            PollCompletedSubmission();
++            // Also delivers failed jobs where polling doesn't pump (a lost
++            // Vulkan device).
++            PumpGuestSnapshots();
++          }
+         } else {
+           xe::threading::MaybeYield();
+         }
+@@ -482,6 +676,7 @@ void CommandProcessor::WorkerThreadMain() {
+         write_ptr_index = write_ptr_index_.load();
+       } while (worker_running_ && pending_fns_.empty() &&
+                !guest_readback().pending.load(std::memory_order_relaxed) &&
++               !snapshots.attention.load(std::memory_order_relaxed) &&
+                (write_ptr_index == 0xBAADF00D ||
+                 read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+@@ -497,6 +692,12 @@ void CommandProcessor::WorkerThreadMain() {
+     }
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
++    // Guest snapshots must be copied before anything written to the ring
++    // after their post: the load of the write pointer above synchronizes with
++    // the guest's store of it, so every post made before the guest wrote
++    // these commands is visible here.
++    ServiceGuestSnapshots();
++
+     // Execute. Note that we handle wraparound transparently.
+     {
+       ScopedGpuThreadTicks execute_ticks(gpu_thread_stats().execute_ticks);
+@@ -516,6 +717,7 @@ void CommandProcessor::WorkerThreadMain() {
+     // but no games seem to actually use it.
+   }
+ 
++  StopGuestSnapshotService();
+   if (thread_profiler_) {
+     gpu_thread_profiler = nullptr;
+     thread_profiler_.reset();
+diff --git a/src/xenia/gpu/command_processor.h b/src/xenia/gpu/command_processor.h
+index d7db1fb..2437826 100644
+--- a/src/xenia/gpu/command_processor.h
++++ b/src/xenia/gpu/command_processor.h
+@@ -23,6 +23,7 @@
+ #include "xenia/base/math.h"
+ #include "xenia/base/ring_buffer.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
++#include "xenia/gpu/guest_readback.h"
+ #include "xenia/gpu/register_file.h"
+ #include "xenia/gpu/trace_writer.h"
+ #include "xenia/gpu/xenos.h"
+@@ -83,6 +84,7 @@ constexpr size_t kFastZPDCacheMaxEntries = 1024;
+ 
+ class GraphicsSystem;
+ class Shader;
++class SharedMemory;
+ 
+ struct SwapState {
+   // Lock must be held when changing data in this structure.
+@@ -308,6 +310,54 @@ class CommandProcessor {
+     return false;
+   }
+ 
++  // A guest snapshot (guest_readback.h) whose copy this thread has recorded.
++  struct GuestSnapshotJob {
++    uint32_t slot = 0;
++    uint64_t sequence = 0;
++    // Sum of the part lengths.
++    uint32_t length = 0;
++    std::shared_ptr<GuestSnapshotData> data;
++    // The submission with the copy, and the backend's readback buffer.
++    uint64_t submission = 0;
++    uint32_t buffer = UINT32_MAX;
++    bool completed = false;
++    bool failed = false;
++  };
++  // Takes posted guest snapshots and records their copies, then serves
++  // awaits. At the loop top, at idle wake-ups, in WAIT_REG_MEM's poll, and
++  // (for the ordering posts rely on) right before ExecutePrimaryBuffer. One
++  // load when nothing is posted or awaited.
++  void ServiceGuestSnapshots();
++  // Reads the copies that have completed and delivers them; never waits.
++  void PumpGuestSnapshots();
++  bool DeliverGuestSnapshot(GuestSnapshotJob& job);
++  void FailGuestSnapshotJob(GuestSnapshotJob& job, const char* reason);
++  static void WakeForGuestReadback(void* context);
++  static void CollectGpuNewerParts(
++      void* context, const uint32_t* starts, const uint32_t* lengths,
++      uint32_t count, std::vector<std::pair<uint32_t, uint32_t>>& parts);
++  // The backend's part: null and false where it can't copy.
++  virtual SharedMemory* GetGuestReadbackSharedMemory() { return nullptr; }
++  // Records the copy of job.data->parts (job.length bytes) into a readback
++  // buffer in the open submission, setting job.submission and job.buffer.
++  virtual bool RecordGuestSnapshotCopy(GuestSnapshotJob& job) { return false; }
++  // Ends the submission with recorded copies if that doesn't wait.
++  virtual void SubmitGuestSnapshotCopies() {}
++  // Ends the submission if needed and waits for it to complete on the GPU.
++  virtual bool AwaitGuestSnapshotSubmission(uint64_t submission) {
++    return false;
++  }
++  // If the copy has completed, reads it into job.data->bytes (or fails the
++  // job) and frees the buffer, returning true.
++  virtual bool ReadGuestSnapshotCopy(GuestSnapshotJob& job) { return false; }
++  virtual void ReleaseGuestSnapshotBuffer(GuestSnapshotJob& job) {}
++  // This thread only.
++  std::vector<GuestSnapshotJob> guest_snapshot_jobs_;
++  std::vector<std::pair<uint32_t, uint32_t>> guest_snapshot_current_parts_;
++  // Awaited slots whose delivery missed the mutex: retried at each service
++  // point (not through attention, so the idle loop still waits).
++  uint32_t guest_snapshot_redeliver_ = 0;
++
+   virtual void PollCompletedSubmission() {}
+ 
+   // Used by strict ZPD to distinguish normal in flight latency from a
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.cc b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+index 7d501ed..98fa125 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.cc
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+@@ -119,6 +119,7 @@ void D3D12CommandProcessor::PollCompletedSubmission() {
+   completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
+   PumpQueryResolves();
+   PumpSmallReadbacks();
++  PumpGuestSnapshots();
+ }
+ 
+ bool D3D12CommandProcessor::PushTransitionBarrier(
+@@ -1704,6 +1705,13 @@ void D3D12CommandProcessor::ShutdownContext() {
+   // failure; this executes anything left and joins it.
+   ShutdownSubmissionThread();
+ 
++  // The service has been stopped (slots failed): nothing to deliver.
++  guest_snapshot_jobs_.clear();
++  for (GuestSnapshotBuffer& buffer : guest_snapshot_buffers_) {
++    ui::d3d12::util::ReleaseAndNull(buffer.resource);
++  }
++  guest_snapshot_buffers_.clear();
++
+   for (auto& pair : readback_buffers_) {
+     ui::d3d12::util::ReleaseAndNull(pair.second.buffers[0]);
+     ui::d3d12::util::ReleaseAndNull(pair.second.buffers[1]);
+@@ -2635,9 +2643,10 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+   // Pump any completed resolves now since the guest is likely about to poll.
+   PumpQueryResolves();
+   PumpPendingRetire();
+-  if (!small_readbacks_pending_.empty()) {
++  if (!small_readbacks_pending_.empty() || !guest_snapshot_jobs_.empty()) {
+     completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
+     PumpSmallReadbacks();
++    PumpGuestSnapshots();
+   }
+ 
+   if (cvars::d3d12_submit_on_primary_buffer_end && submission_open_ &&
+@@ -3441,6 +3450,137 @@ bool D3D12CommandProcessor::ReadbackToGuestMemory(const uint32_t* starts,
+   return true;
+ }
+ 
++uint32_t D3D12CommandProcessor::RequestGuestSnapshotBuffer() {
++  const auto find_free = [this]() -> uint32_t {
++    const uint64_t completed_submission = GetCompletedSubmission();
++    for (uint32_t i = 0; i < uint32_t(guest_snapshot_buffers_.size()); ++i) {
++      const GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[i];
++      if (!buffer.owned && buffer.last_submission <= completed_submission) {
++        return i;
++      }
++    }
++    return UINT32_MAX;
++  };
++  uint32_t index = find_free();
++  if (index != UINT32_MAX) {
++    return index;
++  }
++  if (guest_snapshot_buffers_.size() >= GuestSnapshots::kMaxSlots) {
++    // Refresh the completed submission, without waiting.
++    completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
++    // Read the completed copies (the job being recorded isn't listed yet).
++    PumpGuestSnapshots();
++    return find_free();
++  }
++  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  D3D12_RESOURCE_DESC buffer_desc;
++  ui::d3d12::util::FillBufferResourceDesc(
++      buffer_desc, GuestSnapshots::kMaxBytes, D3D12_RESOURCE_FLAG_NONE);
++  GuestSnapshotBuffer buffer;
++  if (FAILED(provider.GetDevice()->CreateCommittedResource(
++          &ui::d3d12::util::kHeapPropertiesReadback,
++          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
++          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++          IID_PPV_ARGS(&buffer.resource)))) {
++    XELOGE("Failed to create a guest snapshot readback buffer");
++    return UINT32_MAX;
++  }
++  guest_snapshot_buffers_.push_back(buffer);
++  return uint32_t(guest_snapshot_buffers_.size() - 1);
++}
++
++bool D3D12CommandProcessor::RecordGuestSnapshotCopy(GuestSnapshotJob& job) {
++  if (!BeginSubmission(false)) {
++    return false;
++  }
++  const uint32_t index = RequestGuestSnapshotBuffer();
++  if (index == UINT32_MAX) {
++    return false;
++  }
++  GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[index];
++  // Also commits the UAV writes of memory export draws.
++  shared_memory_->UseAsCopySource();
++  SubmitBarriers();
++  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
++  uint64_t offset = 0;
++  for (const std::pair<uint32_t, uint32_t>& part : job.data->parts) {
++    deferred_command_list_.D3DCopyBufferRegion(
++        buffer.resource, offset, shared_memory_buffer, part.first, part.second);
++    offset += part.second;
++  }
++  job.submission = GetCurrentSubmission();
++  job.buffer = index;
++  buffer.owned = true;
++  buffer.last_submission = job.submission;
++  return true;
++}
++
++void D3D12CommandProcessor::SubmitGuestSnapshotCopies() {
++  // To the GPU now, unless ending the submission would wait for pipeline
++  // creation (then the next primary buffer end, an idle wake-up or an await
++  // ends it).
++  if (!submission_open_ || !CanEndSubmissionImmediately()) {
++    return;
++  }
++  bool copies_open = false;
++  for (const GuestSnapshotJob& job : guest_snapshot_jobs_) {
++    if (!job.completed && job.submission == GetCurrentSubmission()) {
++      copies_open = true;
++      break;
++    }
++  }
++  if (copies_open) {
++    EndSubmission(false);
++  }
++}
++
++bool D3D12CommandProcessor::AwaitGuestSnapshotSubmission(uint64_t submission) {
++  if (GetCompletedSubmission() >= submission) {
++    return true;
++  }
++  if (device_removed_) {
++    return false;
++  }
++  // Ends it if it's still open, drains the submission thread, waits.
++  CheckSubmissionCompletion(std::min(submission, GetCurrentSubmission()));
++  return GetCompletedSubmission() >= submission;
++}
++
++bool D3D12CommandProcessor::ReadGuestSnapshotCopy(GuestSnapshotJob& job) {
++  if (job.buffer == UINT32_MAX) {
++    job.failed = true;
++    return true;
++  }
++  if (GetCompletedSubmission() < job.submission) {
++    return false;
++  }
++  GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[job.buffer];
++  D3D12_RANGE read_range;
++  read_range.Begin = 0;
++  read_range.End = SIZE_T(job.length);
++  void* mapping;
++  if (SUCCEEDED(buffer.resource->Map(0, &read_range, &mapping))) {
++    const uint8_t* bytes = static_cast<const uint8_t*>(mapping);
++    job.data->bytes.assign(bytes, bytes + job.length);
++    D3D12_RANGE written_range = {};
++    buffer.resource->Unmap(0, &written_range);
++  } else {
++    job.failed = true;
++  }
++  buffer.owned = false;
++  job.buffer = UINT32_MAX;
++  return true;
++}
++
++void D3D12CommandProcessor::ReleaseGuestSnapshotBuffer(GuestSnapshotJob& job) {
++  if (job.buffer == UINT32_MAX) {
++    return;
++  }
++  // last_submission keeps it from being reused until the copy is done.
++  guest_snapshot_buffers_[job.buffer].owned = false;
++  job.buffer = UINT32_MAX;
++}
++
+ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+@@ -4004,6 +4144,7 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
+   PumpQueryResolves();
+   PumpPendingRetire();
+   PumpSmallReadbacks();
++  PumpGuestSnapshots();
+ }
+ 
+ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.h b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+index 9e17beb..6cf065e 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.h
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+@@ -353,6 +353,14 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   void InitializeTrace() override;
+   bool ReadbackToGuestMemory(const uint32_t* starts, const uint32_t* lengths,
+                              uint32_t count, uint32_t& bytes) override;
++  SharedMemory* GetGuestReadbackSharedMemory() override {
++    return shared_memory_.get();
++  }
++  bool RecordGuestSnapshotCopy(GuestSnapshotJob& job) override;
++  void SubmitGuestSnapshotCopies() override;
++  bool AwaitGuestSnapshotSubmission(uint64_t submission) override;
++  bool ReadGuestSnapshotCopy(GuestSnapshotJob& job) override;
++  void ReleaseGuestSnapshotBuffer(GuestSnapshotJob& job) override;
+ 
+  private:
+   static constexpr uint32_t kQueueFrames = 3;
+@@ -888,6 +896,16 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   uint32_t memexport_readback_buffer_size_ = 0;
+   // ReadbackToGuestMemory's parts (start, length), kept allocated.
+   std::vector<std::pair<uint32_t, uint32_t>> guest_readback_parts_;
++  // Guest snapshot copies (GuestSnapshots::kMaxBytes each; at most
++  // GuestSnapshots::kMaxSlots copies outstanding, superseded ones included),
++  // each free once its job is done and its last submission completed.
++  struct GuestSnapshotBuffer {
++    ID3D12Resource* resource = nullptr;
++    uint64_t last_submission = 0;
++    bool owned = false;
++  };
++  uint32_t RequestGuestSnapshotBuffer();
++  std::vector<GuestSnapshotBuffer> guest_snapshot_buffers_;
+ 
+   // Resolve downscale compute shader for scaled resolution readback,
+   // reversing the scaled resolve buffer packing back to 1x on the GPU.
+diff --git a/src/xenia/gpu/guest_readback.h b/src/xenia/gpu/guest_readback.h
+index ab3e653..3f56306 100644
+--- a/src/xenia/gpu/guest_readback.h
++++ b/src/xenia/gpu/guest_readback.h
+@@ -15,7 +15,10 @@
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstdint>
++#include <memory>
+ #include <mutex>
++#include <utility>
++#include <vector>
+ 
+ namespace xe {
+ namespace gpu {
+@@ -116,6 +119,415 @@ inline GuestReadbackOutcome RequestGuestReadback(
+   return outcome;
+ }
+ 
++// Guest snapshots: the counterpart of RequestGuestReadback that never waits
++// for the host GPU. A guest thread posts physical ranges into one of kMaxSlots
++// slots; the bytes the host GPU copy holds newer than guest memory there
++// (SharedMemory::ForEachGpuNewerPart) are copied by the GPU in the background
++// and kept here, on the host. Nothing is written to guest memory: title code
++// takes the bytes (AwaitGuestSnapshot) and writes them itself when it chooses.
++//
++// Threads: guest threads post, await, flush and drop under
++// GuestSnapshots::mutex (posting also takes the global critical region inside
++// it). The command processor thread never waits for that mutex while running:
++// it takes posts lock-free (an exchange of posted[]) and delivers with
++// try_lock; it locks the mutex only to start and stop the service.
++
++// What the host GPU copy of guest memory held newer than guest memory in some
++// physical ranges. Immutable once ready.
++struct GuestSnapshotData {
++  static constexpr uint32_t kMaxRanges = GuestReadback::kMaxRanges;
++  // As posted.
++  uint32_t range_count = 0;
++  uint32_t range_starts[kMaxRanges] = {};
++  uint32_t range_lengths[kMaxRanges] = {};
++  // (physical start, length), ascending: listed at the post, then again when
++  // the command processor thread records the copy (a superset by then: only
++  // that thread adds GPU-written bytes). bytes holds them back to back once
++  // ready.
++  std::vector<std::pair<uint32_t, uint32_t>> parts;
++  std::vector<uint8_t> bytes;
++  std::chrono::steady_clock::time_point post_time;
++  std::chrono::steady_clock::time_point ready_time;
++};
++
++// A post handed to the command processor thread, owned by whoever exchanges
++// it out of GuestSnapshots::posted.
++struct GuestSnapshotPost {
++  uint32_t slot = 0;
++  uint64_t sequence = 0;
++  std::shared_ptr<GuestSnapshotData> data;
++};
++
++struct GuestSnapshots {
++  static constexpr uint32_t kMaxSlots = 16;
++  static constexpr uint32_t kMaxRanges = GuestSnapshotData::kMaxRanges;
++  // Per snapshot, and the size of each readback buffer.
++  static constexpr uint32_t kMaxBytes = UINT32_C(1) << 20;
++  // attention: bit slot for a post, bit kAwaitedShift + slot for an awaiter.
++  static constexpr uint32_t kAwaitedShift = 16;
++  static_assert(kMaxSlots <= kAwaitedShift);
++
++  enum class State : uint32_t {
++    kEmpty,
++    // Posted; the bytes haven't arrived yet.
++    kPending,
++    // data holds the snapshot (no parts if nothing was newer).
++    kReady,
++    // Couldn't be made (too large, no GPU backend, replaced since the post,
++    // no readback buffer, host GPU error, withdrawn, shutdown).
++    kFailed,
++  };
++
++  struct Slot {
++    State state = State::kEmpty;
++    // Unique per post or drop: a delivery for another sequence is discarded.
++    uint64_t sequence = 0;
++    std::shared_ptr<const GuestSnapshotData> data;
++  };
++
++  // The command processor's callbacks, set and cleared under mutex by
++  // Start/StopGuestSnapshotService and called under it.
++  struct Service {
++    void* context = nullptr;
++    // Makes the command processor thread look at attention now. Never waits.
++    void (*wake)(void* context) = nullptr;
++    // SharedMemory::ForEachGpuNewerPart of each range under the global
++    // critical region, appended to parts. Never waits for the GPU.
++    void (*collect_gpu_newer_parts)(
++        void* context, const uint32_t* starts, const uint32_t* lengths,
++        uint32_t count,
++        std::vector<std::pair<uint32_t, uint32_t>>& parts) = nullptr;
++  };
++
++  std::mutex mutex;
++  // Notified when a slot changes state or sequence, and (without the mutex)
++  // when the command processor thread has recorded the copies it took.
++  std::condition_variable changed;
++  // Under mutex.
++  Slot slots[kMaxSlots];
++  uint64_t next_sequence = 1;
++  Service service;
++  // Lock-free hand-off: stored by posters under mutex, exchanged out by the
++  // command processor thread (take) or a guest thread (replace, withdraw).
++  std::atomic<GuestSnapshotPost*> posted[kMaxSlots] = {};
++  // Set by the command processor thread from before it takes posts until
++  // their copies are recorded (or failed).
++  std::atomic<uint32_t> taking{0};
++  // Set after storing posted[] or registering an awaiter; polled by the
++  // command processor thread, which clears it with an exchange.
++  std::atomic<uint32_t> attention{0};
++};
++
++inline GuestSnapshots& guest_snapshots() {
++  static GuestSnapshots snapshots;
++  return snapshots;
++}
++
++// Sorts (start, length) parts and merges those that overlap or touch (from
++// overlapping ranges).
++inline void MergeGuestSnapshotParts(
++    std::vector<std::pair<uint32_t, uint32_t>>& parts) {
++  std::sort(parts.begin(), parts.end());
++  size_t merged = 0;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    if (merged &&
++        uint64_t(parts[merged - 1].first) + parts[merged - 1].second >=
++            parts[i].first) {
++      const uint64_t end =
++          std::max(uint64_t(parts[merged - 1].first) + parts[merged - 1].second,
++                   uint64_t(parts[i].first) + parts[i].second);
++      parts[merged - 1].second = uint32_t(end - parts[merged - 1].first);
++    } else {
++      parts[merged++] = parts[i];
++    }
++  }
++  parts.resize(merged);
++}
++
++// Whether every byte of each part is inside one of the current runs, both
++// (start, length); current is merged here.
++inline bool GuestSnapshotPartsCovered(
++    const std::vector<std::pair<uint32_t, uint32_t>>& parts,
++    std::vector<std::pair<uint32_t, uint32_t>>& current) {
++  MergeGuestSnapshotParts(current);
++  for (const std::pair<uint32_t, uint32_t>& part : parts) {
++    auto it = std::upper_bound(
++        current.cbegin(), current.cend(), part.first,
++        [](uint32_t value, const std::pair<uint32_t, uint32_t>& run) {
++          return value < run.first;
++        });
++    if (it == current.cbegin()) {
++      return false;
++    }
++    --it;
++    if (uint64_t(it->first) + it->second < uint64_t(part.first) + part.second) {
++      return false;
++    }
++  }
++  return true;
++}
++
++enum class GuestSnapshotPostResult {
++  // The copy will be made in the background.
++  kPosted,
++  // Nothing was newer: the slot is ready with no parts.
++  kNothingNewer,
++  // Over kMaxBytes: the slot holds a failure.
++  kTooLarge,
++  // No command processor to copy, or posted from its own thread: the slot
++  // holds a failure.
++  kNoService,
++};
++
++struct GuestSnapshotPostOutcome {
++  GuestSnapshotPostResult result = GuestSnapshotPostResult::kNoService;
++  uint32_t bytes = 0;
++  uint32_t parts = 0;
++};
++
++// Guest threads. Replaces the slot's snapshot with what the host GPU copy
++// holds newer than guest memory in the physical ranges [start, start +
++// length). Never waits for the host GPU or the command processor thread. That
++// thread records the copy before executing any command written to the ring
++// after this returns (it takes posts after each load of the write pointer,
++// before executing what it covers), so call this after waiting for the GPU
++// work that produced the data and before letting the threads that submit GPU
++// work issue more. Meant for memory export targets, like RequestGuestReadback.
++inline GuestSnapshotPostOutcome PostGuestSnapshot(uint32_t slot_index,
++                                                  const uint32_t* starts,
++                                                  const uint32_t* lengths,
++                                                  uint32_t count) {
++  using State = GuestSnapshots::State;
++  GuestSnapshotPostOutcome outcome;
++  if (slot_index >= GuestSnapshots::kMaxSlots) {
++    return outcome;
++  }
++  count = std::min(count, GuestSnapshots::kMaxRanges);
++  // Allocated before taking the lock, and what's replaced is freed after.
++  auto post = std::make_unique<GuestSnapshotPost>();
++  post->data = std::make_shared<GuestSnapshotData>();
++  GuestSnapshotData& data = *post->data;
++  data.range_count = count;
++  std::copy_n(starts, count, data.range_starts);
++  std::copy_n(lengths, count, data.range_lengths);
++  data.parts.reserve(64);
++  data.post_time = std::chrono::steady_clock::now();
++  std::unique_ptr<GuestSnapshotPost> replaced_post;
++  std::shared_ptr<const GuestSnapshotData> replaced_data;
++  GuestSnapshots& snapshots = guest_snapshots();
++  std::lock_guard<std::mutex> lock(snapshots.mutex);
++  GuestSnapshots::Slot& slot = snapshots.slots[slot_index];
++  // Supersedes whatever the slot held: a post not taken yet is dropped here,
++  // a copy in flight is discarded when it completes (sequence).
++  replaced_post.reset(snapshots.posted[slot_index].exchange(nullptr));
++  slot.sequence = snapshots.next_sequence++;
++  replaced_data = std::move(slot.data);
++  slot.state = State::kFailed;
++  snapshots.changed.notify_all();
++  const GuestSnapshots::Service& service = snapshots.service;
++  if (!service.collect_gpu_newer_parts || guest_readback_service_thread) {
++    return outcome;
++  }
++  service.collect_gpu_newer_parts(service.context, starts, lengths, count,
++                                  data.parts);
++  MergeGuestSnapshotParts(data.parts);
++  uint64_t length = 0;
++  for (const std::pair<uint32_t, uint32_t>& part : data.parts) {
++    length += part.second;
++  }
++  outcome.bytes = uint32_t(std::min(length, uint64_t(UINT32_MAX)));
++  outcome.parts = uint32_t(data.parts.size());
++  if (!length) {
++    data.ready_time = data.post_time;
++    slot.data = std::move(post->data);
++    slot.state = State::kReady;
++    outcome.result = GuestSnapshotPostResult::kNothingNewer;
++    return outcome;
++  }
++  if (length > GuestSnapshots::kMaxBytes) {
++    outcome.result = GuestSnapshotPostResult::kTooLarge;
++    return outcome;
++  }
++  post->slot = slot_index;
++  post->sequence = slot.sequence;
++  slot.state = State::kPending;
++  snapshots.posted[slot_index].store(post.release());
++  snapshots.attention.fetch_or(UINT32_C(1) << slot_index);
++  service.wake(service.context);
++  outcome.result = GuestSnapshotPostResult::kPosted;
++  return outcome;
++}
++
++enum class GuestSnapshotAwaitResult {
++  // data holds the snapshot (possibly with no parts).
++  kReady,
++  // Nothing posted in the slot (never, or dropped), or it was posted again or
++  // dropped by another thread meanwhile.
++  kEmpty,
++  // Its copy couldn't be made.
++  kFailed,
++  // Not ready within the timeout (emulator paused, a stalled command
++  // processor thread). The slot keeps it, and gets it later.
++  kTimedOut,
++};
++
++// Guest threads. Gets the slot's snapshot, waiting (at most timeout) only if
++// its bytes haven't arrived yet: the command processor thread then ends the
++// submission with the copy if needed and waits for the host GPU to complete
++// it, which needs no guest thread.
++inline GuestSnapshotAwaitResult AwaitGuestSnapshot(
++    uint32_t slot_index, std::chrono::milliseconds timeout,
++    std::shared_ptr<const GuestSnapshotData>& data) {
++  using State = GuestSnapshots::State;
++  data.reset();
++  if (slot_index >= GuestSnapshots::kMaxSlots ||
++      guest_readback_service_thread) {
++    return GuestSnapshotAwaitResult::kFailed;
++  }
++  GuestSnapshots& snapshots = guest_snapshots();
++  std::unique_lock<std::mutex> lock(snapshots.mutex);
++  GuestSnapshots::Slot& slot = snapshots.slots[slot_index];
++  const uint64_t sequence = slot.sequence;
++  const auto resolved = [&slot, sequence] {
++    return slot.sequence != sequence || slot.state != State::kPending;
++  };
++  if (!resolved()) {
++    snapshots.attention.fetch_or(
++        UINT32_C(1) << (GuestSnapshots::kAwaitedShift + slot_index));
++    if (snapshots.service.wake) {
++      snapshots.service.wake(snapshots.service.context);
++    }
++    if (!snapshots.changed.wait_for(lock, timeout, resolved)) {
++      return GuestSnapshotAwaitResult::kTimedOut;
++    }
++  }
++  if (slot.sequence != sequence) {
++    return GuestSnapshotAwaitResult::kEmpty;
++  }
++  switch (slot.state) {
++    case State::kReady:
++      data = slot.data;
++      return GuestSnapshotAwaitResult::kReady;
++    case State::kFailed:
++      return GuestSnapshotAwaitResult::kFailed;
++    default:
++      return GuestSnapshotAwaitResult::kEmpty;
++  }
++}
++
++// Any thread, lock-free: whether a post hasn't been taken, or its copy not
++// recorded, yet. posted[] first: a post exchanged out by the command
++// processor thread was preceded by its store to taking.
++inline bool GuestSnapshotPostsUntaken() {
++  GuestSnapshots& snapshots = guest_snapshots();
++  for (const std::atomic<GuestSnapshotPost*>& post : snapshots.posted) {
++    if (post.load()) {
++      return true;
++    }
++  }
++  return snapshots.taking.load() != 0;
++}
++
++// Guest threads. Returns true once the command processor thread has recorded
++// the copy of every post (before anything it executes next) or failed it,
++// waking it. A post still not taken after timeout is withdrawn (its slot
++// fails) and this returns false; one taken but still being recorded then is
++// either recorded before anything the thread executes next or failed if what
++// it covers was replaced first, never copied from replaced data. Call it
++// before replacing what posted ranges cover in a way the GPU copy of guest
++// memory follows (a game state load: a protect, then file reads and uploads),
++// so no copy sees the replaced data.
++inline bool FlushGuestSnapshotPosts(std::chrono::milliseconds timeout) {
++  if (!GuestSnapshotPostsUntaken()) {
++    return true;
++  }
++  if (guest_readback_service_thread) {
++    return false;
++  }
++  GuestSnapshots& snapshots = guest_snapshots();
++  const auto deadline = std::chrono::steady_clock::now() + timeout;
++  std::unique_lock<std::mutex> lock(snapshots.mutex);
++  for (;;) {
++    if (!GuestSnapshotPostsUntaken()) {
++      return true;
++    }
++    if (std::chrono::steady_clock::now() >= deadline) {
++      bool withdrawn = false;
++      for (uint32_t i = 0; i < GuestSnapshots::kMaxSlots; ++i) {
++        // Exactly one side gets the post: if the command processor thread
++        // took it meanwhile, it records the copy (or fails it) at once.
++        std::unique_ptr<GuestSnapshotPost> post(
++            snapshots.posted[i].exchange(nullptr));
++        if (post) {
++          snapshots.slots[i].state = GuestSnapshots::State::kFailed;
++          withdrawn = true;
++        }
++      }
++      snapshots.changed.notify_all();
++      return !withdrawn;
++    }
++    if (snapshots.service.wake) {
++      snapshots.service.wake(snapshots.service.context);
++    }
++    // Recording is notified without the mutex (that thread never waits for
++    // it), so a notification can fall between the check above and this wait:
++    // recheck every millisecond.
++    snapshots.changed.wait_until(
++        lock, std::min(deadline, std::chrono::steady_clock::now() +
++                                     std::chrono::milliseconds(1)));
++  }
++}
++
++// Guest threads. Forgets the slot's snapshot.
++inline void DropGuestSnapshot(uint32_t slot_index) {
++  if (slot_index >= GuestSnapshots::kMaxSlots) {
++    return;
++  }
++  std::unique_ptr<GuestSnapshotPost> dropped_post;
++  std::shared_ptr<const GuestSnapshotData> dropped_data;
++  GuestSnapshots& snapshots = guest_snapshots();
++  std::lock_guard<std::mutex> lock(snapshots.mutex);
++  dropped_post.reset(snapshots.posted[slot_index].exchange(nullptr));
++  GuestSnapshots::Slot& slot = snapshots.slots[slot_index];
++  slot.sequence = snapshots.next_sequence++;
++  slot.state = GuestSnapshots::State::kEmpty;
++  dropped_data = std::move(slot.data);
++  snapshots.changed.notify_all();
++}
++
++inline void DropGuestSnapshots() {
++  for (uint32_t i = 0; i < GuestSnapshots::kMaxSlots; ++i) {
++    DropGuestSnapshot(i);
++  }
++}
++
++// Command processor thread, after SetupContext.
++inline void StartGuestSnapshotService(const GuestSnapshots::Service& service) {
++  GuestSnapshots& snapshots = guest_snapshots();
++  std::lock_guard<std::mutex> lock(snapshots.mutex);
++  snapshots.service = service;
++}
++
++// Command processor thread, leaving its loop, before ShutdownContext: nothing
++// calls the callbacks afterwards, posts fail at once, and every snapshot not
++// delivered yet has failed. Guest threads hold the mutex only briefly (a
++// title's termination runs them out of host code first).
++inline void StopGuestSnapshotService() {
++  GuestSnapshots& snapshots = guest_snapshots();
++  std::lock_guard<std::mutex> lock(snapshots.mutex);
++  snapshots.service = GuestSnapshots::Service();
++  for (uint32_t i = 0; i < GuestSnapshots::kMaxSlots; ++i) {
++    delete snapshots.posted[i].exchange(nullptr);
++    GuestSnapshots::Slot& slot = snapshots.slots[i];
++    if (slot.state == GuestSnapshots::State::kPending) {
++      slot.state = GuestSnapshots::State::kFailed;
++    }
++  }
++  snapshots.taking.store(0);
++  snapshots.attention.store(0);
++  snapshots.changed.notify_all();
++}
++
+ }  // namespace gpu
+ }  // namespace xe
+ 
+diff --git a/src/xenia/gpu/pm4_command_processor_implement.h b/src/xenia/gpu/pm4_command_processor_implement.h
+index 3f53762..d5a0fb2 100644
+--- a/src/xenia/gpu/pm4_command_processor_implement.h
++++ b/src/xenia/gpu/pm4_command_processor_implement.h
+@@ -768,6 +768,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+       }
+       // A guest thread waiting for a readback may be what this waits for.
+       ServiceGuestReadback();
++      ServiceGuestSnapshots();
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.cc b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+index 2bf1875..d0ccd99 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.cc
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+@@ -1195,6 +1195,20 @@ bool VulkanCommandProcessor::SetupContext() {
+ void VulkanCommandProcessor::ShutdownContext() {
+   AwaitAllQueueOperationsCompletion();
+ 
++  {
++    // The service has been stopped (slots failed): nothing to deliver.
++    guest_snapshot_jobs_.clear();
++    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++    const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++    const VkDevice device = vulkan_device->device();
++    for (GuestSnapshotBuffer& buffer : guest_snapshot_buffers_) {
++      dfn.vkUnmapMemory(device, buffer.memory);
++      dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
++      dfn.vkFreeMemory(device, buffer.memory, nullptr);
++    }
++    guest_snapshot_buffers_.clear();
++  }
++
+   ShutdownQueryResources();
+   host_query_pool_.reset();
+ 
+@@ -4306,6 +4320,163 @@ bool VulkanCommandProcessor::ReadbackToGuestMemory(const uint32_t* starts,
+   return true;
+ }
+ 
++uint32_t VulkanCommandProcessor::RequestGuestSnapshotBuffer() {
++  const auto find_free = [this]() -> uint32_t {
++    const uint64_t completed_submission = GetCompletedSubmission();
++    for (uint32_t i = 0; i < uint32_t(guest_snapshot_buffers_.size()); ++i) {
++      const GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[i];
++      if (!buffer.owned && buffer.last_submission <= completed_submission) {
++        return i;
++      }
++    }
++    return UINT32_MAX;
++  };
++  uint32_t index = find_free();
++  if (index != UINT32_MAX) {
++    return index;
++  }
++  if (guest_snapshot_buffers_.size() >= GuestSnapshots::kMaxSlots) {
++    // Refresh the completed submission, without waiting.
++    completion_timeline_.AwaitSubmissionAndUpdateCompleted(
++        GetCompletedSubmission());
++    // Read the completed copies (the job being recorded isn't listed yet).
++    PumpGuestSnapshots();
++    return find_free();
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  GuestSnapshotBuffer buffer;
++  uint32_t memory_type;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, GuestSnapshots::kMaxBytes,
++          VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++          ui::vulkan::util::MemoryPurpose::kReadback, buffer.buffer,
++          buffer.memory, &memory_type)) {
++    XELOGE(
++        "VulkanCommandProcessor: Failed to create a guest snapshot "
++        "readback buffer");
++    return UINT32_MAX;
++  }
++  void* mapping;
++  if (dfn.vkMapMemory(device, buffer.memory, 0, VK_WHOLE_SIZE, 0, &mapping) !=
++      VK_SUCCESS) {
++    XELOGE(
++        "VulkanCommandProcessor: Failed to map a guest snapshot readback "
++        "buffer");
++    dfn.vkDestroyBuffer(device, buffer.buffer, nullptr);
++    dfn.vkFreeMemory(device, buffer.memory, nullptr);
++    return UINT32_MAX;
++  }
++  buffer.mapping = static_cast<const uint8_t*>(mapping);
++  buffer.coherent =
++      ((vulkan_device->memory_types().host_coherent >> memory_type) & 1) != 0;
++  guest_snapshot_buffers_.push_back(buffer);
++  return uint32_t(guest_snapshot_buffers_.size() - 1);
++}
++
++bool VulkanCommandProcessor::RecordGuestSnapshotCopy(GuestSnapshotJob& job) {
++  if (!BeginSubmission(false)) {
++    return false;
++  }
++  const uint32_t index = RequestGuestSnapshotBuffer();
++  if (index == UINT32_MAX) {
++    return false;
++  }
++  GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[index];
++  // As ReadbackToGuestMemory: commit the shader writes and leave the render
++  // pass before the copy, then make the copy visible to the host.
++  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++  SubmitBarriers(true);
++  const std::vector<std::pair<uint32_t, uint32_t>>& parts = job.data->parts;
++  VkBufferCopy* regions = deferred_command_buffer_.CmdCopyBufferEmplace(
++      shared_memory_->buffer(), buffer.buffer, uint32_t(parts.size()));
++  VkDeviceSize offset = 0;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    regions[i].srcOffset = parts[i].first;
++    regions[i].dstOffset = offset;
++    regions[i].size = parts[i].second;
++    offset += parts[i].second;
++  }
++  PushBufferMemoryBarrier(
++      buffer.buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_ACCESS_HOST_READ_BIT);
++  SubmitBarriers(true);
++  job.submission = GetCurrentSubmission();
++  job.buffer = index;
++  buffer.owned = true;
++  buffer.last_submission = job.submission;
++  return true;
++}
++
++void VulkanCommandProcessor::SubmitGuestSnapshotCopies() {
++  // Vulkan submissions otherwise end only at swaps (or awaits): to the GPU
++  // now. Ending one never waits for pipeline creation here (draws hold the
++  // pipeline or a placeholder).
++  if (!submission_open_) {
++    return;
++  }
++  bool copies_open = false;
++  for (const GuestSnapshotJob& job : guest_snapshot_jobs_) {
++    if (!job.completed && job.submission == GetCurrentSubmission()) {
++      copies_open = true;
++      break;
++    }
++  }
++  if (copies_open) {
++    EndSubmission(false);
++  }
++}
++
++bool VulkanCommandProcessor::AwaitGuestSnapshotSubmission(uint64_t submission) {
++  if (GetCompletedSubmission() >= submission) {
++    return true;
++  }
++  if (device_lost_) {
++    return false;
++  }
++  // Ends it if it's still open, then waits.
++  CheckSubmissionCompletionAndDeviceLoss(
++      std::min(submission, GetCurrentSubmission()));
++  return GetCompletedSubmission() >= submission;
++}
++
++bool VulkanCommandProcessor::ReadGuestSnapshotCopy(GuestSnapshotJob& job) {
++  if (job.buffer == UINT32_MAX) {
++    job.failed = true;
++    return true;
++  }
++  if (GetCompletedSubmission() < job.submission) {
++    return false;
++  }
++  GuestSnapshotBuffer& buffer = guest_snapshot_buffers_[job.buffer];
++  if (!buffer.coherent) {
++    const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++    VkMappedMemoryRange mapped_range;
++    mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    mapped_range.pNext = nullptr;
++    mapped_range.memory = buffer.memory;
++    mapped_range.offset = 0;
++    mapped_range.size = VK_WHOLE_SIZE;
++    vulkan_device->functions().vkInvalidateMappedMemoryRanges(
++        vulkan_device->device(), 1, &mapped_range);
++  }
++  job.data->bytes.assign(buffer.mapping, buffer.mapping + job.length);
++  buffer.owned = false;
++  job.buffer = UINT32_MAX;
++  return true;
++}
++
++void VulkanCommandProcessor::ReleaseGuestSnapshotBuffer(GuestSnapshotJob& job) {
++  if (job.buffer == UINT32_MAX) {
++    return;
++  }
++  // last_submission keeps it from being reused until the copy is done.
++  guest_snapshot_buffers_[job.buffer].owned = false;
++  job.buffer = UINT32_MAX;
++}
++
+ void VulkanCommandProcessor::PollCompletedSubmission() {
+   // Strict ZPD can skip unnecessary work here that can wait for the next full
+   // CheckSubmissionCompletionAndDeviceLoss and it's not needed for retirement.
+@@ -4315,6 +4486,7 @@ void VulkanCommandProcessor::PollCompletedSubmission() {
+   completion_timeline_.AwaitSubmissionAndUpdateCompleted(
+       GetCompletedSubmission());
+   PumpQueryResolves();
++  PumpGuestSnapshots();
+ }
+ 
+ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
+@@ -4376,6 +4548,7 @@ void VulkanCommandProcessor::CheckSubmissionCompletionAndDeviceLoss(
+ 
+   PumpQueryResolves();
+   PumpPendingRetire();
++  PumpGuestSnapshots();
+ 
+   // Destroy objects scheduled for destruction.
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.h b/src/xenia/gpu/vulkan/vulkan_command_processor.h
+index 7cea5bd..5074a4c 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.h
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.h
+@@ -293,6 +293,14 @@ class VulkanCommandProcessor final : public CommandProcessor {
+   void InitializeTrace() override;
+   bool ReadbackToGuestMemory(const uint32_t* starts, const uint32_t* lengths,
+                              uint32_t count, uint32_t& bytes) override;
++  SharedMemory* GetGuestReadbackSharedMemory() override {
++    return shared_memory_.get();
++  }
++  bool RecordGuestSnapshotCopy(GuestSnapshotJob& job) override;
++  void SubmitGuestSnapshotCopies() override;
++  bool AwaitGuestSnapshotSubmission(uint64_t submission) override;
++  bool ReadGuestSnapshotCopy(GuestSnapshotJob& job) override;
++  void ReleaseGuestSnapshotBuffer(GuestSnapshotJob& job) override;
+ 
+  private:
+   struct CommandBuffer {
+@@ -870,6 +878,20 @@ class VulkanCommandProcessor final : public CommandProcessor {
+   uint32_t memexport_readback_buffer_size_ = 0;
+   // ReadbackToGuestMemory's parts (start, length), kept allocated.
+   std::vector<std::pair<uint32_t, uint32_t>> guest_readback_parts_;
++  // Guest snapshot copies (GuestSnapshots::kMaxBytes each, mapped for their
++  // lifetime; at most GuestSnapshots::kMaxSlots copies outstanding,
++  // superseded ones included), each free once its job is done and its last
++  // submission completed.
++  struct GuestSnapshotBuffer {
++    VkBuffer buffer = VK_NULL_HANDLE;
++    VkDeviceMemory memory = VK_NULL_HANDLE;
++    const uint8_t* mapping = nullptr;
++    bool coherent = false;
++    uint64_t last_submission = 0;
++    bool owned = false;
++  };
++  uint32_t RequestGuestSnapshotBuffer();
++  std::vector<GuestSnapshotBuffer> guest_snapshot_buffers_;
+ 
+   // Resolve downscale compute pipeline for scaled resolution readback,
+   // reversing the scaled resolve buffer packing back to 1x on the GPU.

@@ -1,0 +1,183 @@
+name: Build Xenia for Halo 3 (Windows)
+
+on:
+  workflow_dispatch:
+  # Branches with a pull request build through the pull_request event only.
+  push:
+    branches: [main]
+    paths:
+      - 'xenia/**'
+      - 'dist/**'
+      - '.github/workflows/build-windows.yml'
+  pull_request:
+    paths:
+      - 'xenia/**'
+      - 'dist/**'
+      - '.github/workflows/build-windows.yml'
+  # Publishing a release builds it and attaches the zip to the release.
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    # Same runner image upstream xenia-canary uses for this commit.
+    runs-on: windows-2025-vs2026
+    outputs:
+      name: ${{ steps.package.outputs.name }}
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v6
+        with:
+          path: blam
+          sparse-checkout: |
+            xenia
+            dist
+            docs
+            README.md
+            LICENSE
+
+      - name: Checkout pinned xenia-canary
+        run: |-
+          $commit = (Get-Content blam\xenia\UPSTREAM_COMMIT -Raw).Trim()
+          git init -q xenia
+          git -C xenia remote add origin https://github.com/xenia-canary/xenia-canary
+          git -C xenia fetch -q --depth 1 origin $commit
+          git -C xenia checkout -q -B blam $commit
+          echo "XENIA_COMMIT=$commit" >> $env:GITHUB_ENV
+
+      - name: Apply patch series
+        working-directory: xenia
+        run: |-
+          $patches = Get-ChildItem ..\blam\xenia\patches\*.patch -ErrorAction SilentlyContinue | Sort-Object Name
+          if ($patches) {
+            git -c user.name=ci -c user.email=ci@localhost am --3way --keep-non-patch @($patches.FullName)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          echo "Applied $(@($patches).Count) patch(es)"
+          git log --oneline -n 20
+
+      - name: Cache Vulkan SDK
+        uses: actions/cache@v6
+        with:
+          path: C:\VulkanSDK
+          key: ${{ runner.os }}-vulkan-sdk
+          restore-keys: ${{ runner.os }}-vulkan-sdk
+
+      - name: Install Vulkan SDK
+        run: |-
+          if (-not (Test-Path "C:\VulkanSDK")) {
+            Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe" -OutFile "vulkan-sdk.exe"
+            Start-Process -FilePath "vulkan-sdk.exe" -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -NoNewWindow -Wait
+          }
+          $sdk = "C:\VulkanSDK\$(Get-ChildItem -Path 'C:\VulkanSDK' -Directory | Select-Object -First 1 -ExpandProperty Name)"
+          echo "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          echo "$sdk\Bin" >> $env:GITHUB_PATH
+
+      - name: Download submodules
+        working-directory: xenia
+        run: |-
+          $SUBMODULES=(Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
+          git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
+
+      # Compiler cache: each object is stored in the GitHub Actions cache and
+      # reused while its preprocessed source and flags are unchanged, so a run
+      # recompiles only what the patches touch (the final link-time code
+      # generation still runs every time). Statistics are printed at the end
+      # of the job.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        with:
+          version: v0.18.0
+
+      - name: Build xenia_canary.exe
+        working-directory: xenia
+        env:
+          SCCACHE_GHA_ENABLED: 'true'
+          # If the cache server can't run, compile without it instead of
+          # failing the build.
+          SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+        run: |-
+          # sccache can't cache objects that write a shared PDB (/Zi): keep the
+          # debug information in each object instead (/Z7). CI builds only.
+          $cmake = Get-Content CMakeLists.txt -Raw
+          $zi = '$<$<CONFIG:Release>:/Zi>'
+          if (-not $cmake.Contains($zi)) { echo "::error:: CMakeLists.txt no longer adds /Zi for Release, so the /Z7 replacement for sccache does not apply."; exit 1 }
+          Set-Content CMakeLists.txt -NoNewline -Value $cmake.Replace($zi, '$<$<CONFIG:Release>:/Z7>')
+          # The launcher is passed as a define, not through the environment:
+          # CMake then leaves it out of its compiler checks, whose Debug test
+          # compile (/Zi with a directory /Fd) sccache can't handle.
+          python xenia-build.py build --config=Release --target=xenia-app `
+            --cmake-define CMAKE_C_COMPILER_LAUNCHER=sccache `
+            --cmake-define CMAKE_CXX_COMPILER_LAUNCHER=sccache
+
+      - name: Package
+        id: package
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |-
+          $exe = "xenia\build\bin\Windows\Release\xenia_canary.exe"
+          if ((Get-Item $exe).Length -le 100000) { echo "::error:: Executable is too small."; exit 1 }
+          $out = "package"
+          New-Item -ItemType Directory -Force $out | Out-Null
+          Copy-Item $exe $out\
+          # Names Xenia's own functions in guest_profile reports.
+          $map = "xenia\build\bin\Windows\Release\xenia_canary.map"
+          if (Test-Path $map) { Copy-Item $map $out\ } else { echo "::warning:: No linker map ($map)." }
+          Copy-Item xenia\LICENSE $out\LICENSE-xenia.txt
+          Copy-Item blam\LICENSE $out\LICENSE.txt
+          Copy-Item -Recurse blam\dist\* $out\
+          Copy-Item blam\README.md $out\
+          New-Item -ItemType Directory -Force $out\docs | Out-Null
+          Copy-Item blam\docs\*.md $out\docs\
+          # Name the artifact after the release tag, or after the branch
+          # commit (not the PR merge commit).
+          if ($env:TAG) {
+            $name = "halo3-xenia-pc-" + ($env:TAG -replace '[^A-Za-z0-9._-]', '-')
+          } else {
+            $name = "halo3-xenia-pc-" + $env:SHA.Substring(0, 7)
+          }
+          echo "name=$name" >> $env:GITHUB_OUTPUT
+          Get-ChildItem -Recurse $out | Select-Object FullName, Length
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: package
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Attach to release
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ needs.build.outputs.name }}
+          path: package
+
+      - name: Zip and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NAME: ${{ needs.build.outputs.name }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |-
+          (cd package && zip -r -9 "../$NAME.zip" .)
+          gh release upload "$TAG" "$NAME.zip" --repo "$GITHUB_REPOSITORY" --clobber

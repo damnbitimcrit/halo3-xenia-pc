@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Mouse aim
+
+Adds raw mouse motion to the yaw and pitch deltas of local player 0's
+action where the game builds it from the controller (sub_82211EA8), after
+the stick acceleration and aim assist. The game then treats it like stick
+input: it is dropped while player input is disabled (pause menu, scripted
+scenes), follows the "scale all input" script factor and the pitch, seat
+and vehicle limits. It is divided by the zoom magnification like the
+stick.
+
+Configured with halo3_mouse_aim, halo3_mouse_sensitivity,
+halo3_mouse_zoom_sensitivity and halo3_mouse_invert_y.
+---
+ src/xenia/kernel/title/halo3/halo3.cc       |   1 +
+ src/xenia/kernel/title/halo3/halo3.h        |   2 +
+ src/xenia/kernel/title/halo3/halo3_input.cc | 134 ++++++++++++++++++++
+ 3 files changed, 137 insertions(+)
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_input.cc
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 0dc208e..7e049ed 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -30,6 +30,7 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   XELOGI("Halo 3 (TU0) detected; installing hooks");
+   InstallFramePacing(kernel_state);
+   InstallInterpolation(kernel_state);
++  InstallInput(kernel_state);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index ace2a70..541acb8 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -36,6 +36,8 @@ void Install(KernelState* kernel_state, UserModule* module);
+ void InstallFramePacing(KernelState* kernel_state);
+ // halo3_interp.cc
+ void InstallInterpolation(KernelState* kernel_state);
++// halo3_input.cc
++void InstallInput(KernelState* kernel_state);
+ 
+ }  // namespace halo3
+ }  // namespace title
+diff --git a/src/xenia/kernel/title/halo3/halo3_input.cc b/src/xenia/kernel/title/halo3/halo3_input.cc
+new file mode 100644
+index 0000000..9e4a9ac
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_input.cc
+@@ -0,0 +1,134 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// Mouse aiming.
++//
++// Once per frame, player_control_update (sub_82098900) builds each local
++// player's action from the controller in sub_82211EA8: the right stick goes
++// through the look acceleration curve and is divided by the zoom
++// magnification, then stored as yaw and pitch deltas in radians at action
++// +0x10 and +0x14. The caller then zeroes the action while player input is
++// disabled (pause menu, scripted scenes), applies the "scale all input" script
++// factor, and adds the deltas to the player's facing with the pitch, seat and
++// vehicle limits.
++//
++// Raw mouse motion is added to those deltas at the point where every path
++// through sub_82211EA8 joins, after the stick acceleration and aim assist
++// (so the mouse gets neither), scaled by the same zoom factor the stick uses.
++// Everything after that treats it exactly like stick input.
++
++#include <cmath>
++#include <cstdint>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/cpu/ppc/ppc_context.h"
++#include "xenia/hid/mouse_input.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++
++DEFINE_bool(halo3_mouse_aim, true,
++            "Halo 3: aim with the mouse while it is locked to the window "
++            "(see mouse_lock).",
++            "Halo3");
++DEFINE_double(halo3_mouse_sensitivity, 1.0,
++              "Halo 3: mouse sensitivity. 1.0 turns 0.001 radians (0.057 "
++              "degrees) per mouse count.",
++              "Halo3");
++DEFINE_double(halo3_mouse_zoom_sensitivity, 1.0,
++              "Halo 3: extra mouse sensitivity multiplier while zoomed. The "
++              "game already divides aim speed by the zoom magnification, so "
++              "1.0 keeps the same feel relative to the field of view.",
++              "Halo3");
++DEFINE_bool(halo3_mouse_invert_y, false, "Halo 3: invert vertical mouse aim.",
++            "Halo3");
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// main loop body (sub_821A8ED8) entry: once per frame, before input and
++// player_control_update.
++constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
++// sub_82211EA8, right after "fdivs f0, f29(=1.0), f1(=magnification)" for a
++// zoomed player: f0 = 1 / magnification. r25 = local player index.
++constexpr uint32_t kZoomScaleComputed = 0x822125E4;
++// sub_82211EA8, the join of all paths once the action is built: r15 = action,
++// r25 = local player index.
++constexpr uint32_t kActionBuilt = 0x82212A0C;
++constexpr uint32_t kActionYawDelta = 0x10;
++constexpr uint32_t kActionPitchDelta = 0x14;
++
++constexpr double kRadiansPerCount = 0.001;
++// The keyboard and mouse drive local player 0.
++constexpr uint64_t kMouseLocalPlayer = 0;
++
++// Only touched by the game's main thread, which runs all three hooks.
++struct FrameMouse {
++  int32_t dx = 0;
++  int32_t dy = 0;
++  // 1 / zoom magnification of the mouse player this frame, 1 if not zoomed.
++  float zoom_scale = 1.0f;
++} frame_mouse;
++
++void OnMainLoopBody(cpu::ppc::PPCContext* ctx, void*) {
++  // Motion that the previous frame didn't consume (no player, loading) is
++  // dropped so it can't turn the view all at once later.
++  hid::MouseInput::TakeMotion(&frame_mouse.dx, &frame_mouse.dy);
++  frame_mouse.zoom_scale = 1.0f;
++}
++
++void OnZoomScaleComputed(cpu::ppc::PPCContext* ctx, void*) {
++  if (ctx->r[25] != kMouseLocalPlayer) {
++    return;
++  }
++  const float scale = static_cast<float>(ctx->f[0]);
++  if (std::isfinite(scale) && scale > 0.0f && scale <= 1.0f) {
++    frame_mouse.zoom_scale = scale;
++  }
++}
++
++void OnActionBuilt(cpu::ppc::PPCContext* ctx, void*) {
++  if (ctx->r[25] != kMouseLocalPlayer || !cvars::halo3_mouse_aim ||
++      (!frame_mouse.dx && !frame_mouse.dy)) {
++    return;
++  }
++  double scale = kRadiansPerCount * cvars::halo3_mouse_sensitivity;
++  if (frame_mouse.zoom_scale < 1.0f) {
++    scale *= frame_mouse.zoom_scale * cvars::halo3_mouse_zoom_sensitivity;
++  }
++  const uint32_t action = static_cast<uint32_t>(ctx->r[15]);
++  auto yaw = ctx->TranslateVirtual<xe::be<float>*>(action + kActionYawDelta);
++  auto pitch =
++      ctx->TranslateVirtual<xe::be<float>*>(action + kActionPitchDelta);
++  // Mouse right turns right (yaw decreases), mouse down looks down.
++  const int32_t dy =
++      cvars::halo3_mouse_invert_y ? -frame_mouse.dy : frame_mouse.dy;
++  *yaw = *yaw - float(frame_mouse.dx * scale);
++  *pitch = *pitch - float(dy * scale);
++  frame_mouse.dx = 0;
++  frame_mouse.dy = 0;
++}
++
++}  // namespace
++
++void InstallInput(KernelState* kernel_state) {
++  auto& hooks = cpu::GuestHooks::Get();
++  auto* processor = kernel_state->processor();
++  hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBody);
++  hooks.Add(processor, kZoomScaleComputed, OnZoomScaleComputed);
++  hooks.Add(processor, kActionBuilt, OnActionBuilt);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe

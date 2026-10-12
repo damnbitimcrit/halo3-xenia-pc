@@ -1,0 +1,5 @@
+#!/bin/sh
+# Local-only shim: distro spirv-opt lacks --canonicalize-ids (newer Vulkan SDK flag).
+args=""
+for a in "$@"; do [ "$a" = "--canonicalize-ids" ] || args="$args \"$a\""; done
+eval exec /usr/bin/spirv-opt $args

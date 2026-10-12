@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [CPU] Add guest hooks: host code before a guest instruction
+
+Title code can register a host callback for a guest address before the
+title's code is translated. The PPC HIR builder emits a CALL_EXTERN to a
+per-hook builtin right before that instruction; CALL_EXTERN is volatile, so
+every guest register is in the PPCContext during the callback and changes
+are picked up by the instruction that follows. Hooks only run while the
+table is active, so code translated for a previous title stays inert.
+---
+ src/xenia/cpu/guest_hooks.cc              |  56 +++++++++
+ src/xenia/cpu/guest_hooks.h               |  83 ++++++++++++++
+ src/xenia/cpu/ppc/ppc_hir_builder.cc      |   7 ++
+ src/xenia/cpu/testing/guest_hooks_test.cc | 133 ++++++++++++++++++++++
+ 4 files changed, 279 insertions(+)
+ create mode 100644 src/xenia/cpu/guest_hooks.cc
+ create mode 100644 src/xenia/cpu/guest_hooks.h
+ create mode 100644 src/xenia/cpu/testing/guest_hooks_test.cc
+
+diff --git a/src/xenia/cpu/guest_hooks.cc b/src/xenia/cpu/guest_hooks.cc
+new file mode 100644
+index 0000000..1fcc876
+--- /dev/null
++++ b/src/xenia/cpu/guest_hooks.cc
+@@ -0,0 +1,56 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/cpu/guest_hooks.h"
++
++#include "third_party/fmt/include/fmt/format.h"
++#include "xenia/base/logging.h"
++#include "xenia/cpu/processor.h"
++
++namespace xe {
++namespace cpu {
++
++GuestHooks& GuestHooks::Get() {
++  static GuestHooks hooks;
++  return hooks;
++}
++
++void GuestHooks::Thunk(ppc::PPCContext* ctx, void* arg0, void* arg1) {
++  if (!Get().active()) {
++    return;
++  }
++  auto hook = static_cast<const Hook*>(arg0);
++  hook->fn(ctx, hook->user);
++}
++
++bool GuestHooks::Add(Processor* processor, uint32_t address, GuestHookFn fn,
++                     void* user) {
++  if (frozen()) {
++    XELOGE("GuestHooks: cannot add hook at {:08X} after freeze", address);
++    return false;
++  }
++  auto existing = hooks_.find(address);
++  if (existing != hooks_.end()) {
++    existing->second->fn = fn;
++    existing->second->user = user;
++    return true;
++  }
++  auto hook = std::make_unique<Hook>();
++  hook->address = address;
++  hook->fn = fn;
++  hook->user = user;
++  hook->builtin = processor->DefineBuiltin(
++      fmt::format("GuestHook_{:08X}", address), Thunk, hook.get(), nullptr);
++  hooks_.emplace(address, std::move(hook));
++  XELOGI("GuestHooks: hook at {:08X}", address);
++  return true;
++}
++
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/cpu/guest_hooks.h b/src/xenia/cpu/guest_hooks.h
+new file mode 100644
+index 0000000..9eeeeae
+--- /dev/null
++++ b/src/xenia/cpu/guest_hooks.h
+@@ -0,0 +1,83 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_CPU_GUEST_HOOKS_H_
++#define XENIA_CPU_GUEST_HOOKS_H_
++
++#include <atomic>
++#include <cstdint>
++#include <memory>
++#include <unordered_map>
++
++#include "xenia/cpu/ppc/ppc_context.h"
++
++namespace xe {
++namespace cpu {
++
++class Function;
++class Processor;
++
++// Host code that runs immediately before the guest instruction at a given
++// address. The JIT emits a CALL_EXTERN there, which flushes every guest
++// register to the PPCContext before the call and reloads them afterwards, so a
++// hook may read and modify any register or guest memory. It cannot redirect
++// control flow; the guest instruction at the address always executes next.
++//
++// Hooks must be registered before any guest code containing the address is
++// translated: KernelState::FinishLoadingUserModule unfreezes the table, lets
++// the title register its hooks and freezes it again before the title's code
++// runs, so lookups from concurrent JIT threads need no locking. Entries are
++// never removed because code translated for an earlier title may still
++// reference them; instead hooks only run while the table is active, which is
++// cleared whenever a new executable loads.
++using GuestHookFn = void (*)(ppc::PPCContext* ctx, void* user);
++
++class GuestHooks {
++ public:
++  static GuestHooks& Get();
++
++  // Registers (or re-points, when the title is launched again) the hook at
++  // address. Only valid while unfrozen.
++  bool Add(Processor* processor, uint32_t address, GuestHookFn fn,
++           void* user = nullptr);
++  void Unfreeze() { frozen_.store(false, std::memory_order_release); }
++  void Freeze() { frozen_.store(true, std::memory_order_release); }
++  bool frozen() const { return frozen_.load(std::memory_order_acquire); }
++  void SetActive(bool active) {
++    active_.store(active, std::memory_order_release);
++  }
++  bool active() const { return active_.load(std::memory_order_acquire); }
++
++  // Builtin to call before the instruction at address, or nullptr.
++  Function* Find(uint32_t address) const {
++    if (!frozen() || hooks_.empty()) {
++      return nullptr;
++    }
++    auto it = hooks_.find(address);
++    return it == hooks_.end() ? nullptr : it->second->builtin;
++  }
++
++ private:
++  struct Hook {
++    uint32_t address;
++    GuestHookFn fn;
++    void* user;
++    Function* builtin;
++  };
++  static void Thunk(ppc::PPCContext* ctx, void* arg0, void* arg1);
++
++  std::unordered_map<uint32_t, std::unique_ptr<Hook>> hooks_;
++  std::atomic<bool> frozen_{false};
++  std::atomic<bool> active_{false};
++};
++
++}  // namespace cpu
++}  // namespace xe
++
++#endif  // XENIA_CPU_GUEST_HOOKS_H_
+diff --git a/src/xenia/cpu/ppc/ppc_hir_builder.cc b/src/xenia/cpu/ppc/ppc_hir_builder.cc
+index 42d996c..7e8ed1e 100644
+--- a/src/xenia/cpu/ppc/ppc_hir_builder.cc
++++ b/src/xenia/cpu/ppc/ppc_hir_builder.cc
+@@ -21,6 +21,7 @@
+ #include "xenia/base/profiling.h"
+ #include "xenia/base/string.h"
+ #include "xenia/cpu/cpu_flags.h"
++#include "xenia/cpu/guest_hooks.h"
+ #include "xenia/cpu/hir/label.h"
+ #include "xenia/cpu/ppc/ppc_context.h"
+ #include "xenia/cpu/ppc/ppc_decode_data.h"
+@@ -172,6 +173,12 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
+       ContextBarrier();
+     }
+ 
++    // Title hooks run right before the instruction, with every guest register
++    // flushed to the context (CALL_EXTERN is volatile and ends the block).
++    if (Function* hook = GuestHooks::Get().Find(address)) {
++      CallExtern(hook);
++    }
++
+     MaybeBreakOnInstruction(address);
+ 
+     InstrData i;
+diff --git a/src/xenia/cpu/testing/guest_hooks_test.cc b/src/xenia/cpu/testing/guest_hooks_test.cc
+new file mode 100644
+index 0000000..7dbcbf4
+--- /dev/null
++++ b/src/xenia/cpu/testing/guest_hooks_test.cc
+@@ -0,0 +1,133 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include <cstdio>
++#include <filesystem>
++#include <vector>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/cpu/raw_module.h"
++#include "xenia/cpu/testing/util.h"
++#include "xenia/cpu/thread_state.h"
++
++namespace xe {
++namespace cpu {
++namespace testing {
++namespace {
++
++constexpr uint32_t kBase = 0x82000000;
++
++// A: li r3, 1 / addi r3, r3, 1 / blr
++constexpr uint32_t kFuncInt = kBase + 0x000;
++// B: cmpwi cr6, r3, 5 / beq cr6, +12 / li r4, 1 / blr / li r4, 2 / blr
++constexpr uint32_t kFuncBranch = kBase + 0x100;
++// C: fadd f1, f1, f1 / blr
++constexpr uint32_t kFuncFloat = kBase + 0x200;
++// D: fdivs f0, f1, f2 / fmr f3, f0 / blr
++constexpr uint32_t kFuncFloatRead = kBase + 0x280;
++
++void AddToR3(ppc::PPCContext* ctx, void*) { ctx->r[3] += 100; }
++void ForceCr6Eq(ppc::PPCContext* ctx, void*) { ctx->cr6.cr6_none_equal = 1; }
++void SetF1(ppc::PPCContext* ctx, void*) { ctx->f[1] = 0.25; }
++void ReadF0(ppc::PPCContext* ctx, void* user) {
++  *static_cast<double*>(user) = ctx->f[0];
++}
++
++std::filesystem::path WriteCode() {
++  std::vector<uint32_t> words(0x300 / 4, 0);
++  auto put = [&](uint32_t address, std::initializer_list<uint32_t> code) {
++    size_t i = (address - kBase) / 4;
++    for (uint32_t w : code) {
++      words[i++] = xe::byte_swap(w);
++    }
++  };
++  put(kFuncInt, {0x38600001, 0x38630001, 0x4E800020});
++  put(kFuncBranch,
++      {0x2F030005, 0x419A000C, 0x38800001, 0x4E800020, 0x38800002, 0x4E800020});
++  put(kFuncFloat, {0xFC21082A, 0x4E800020});
++  put(kFuncFloatRead, {0xEC011024, 0xFC600090, 0x4E800020});
++  auto path = std::filesystem::temp_directory_path() / "xenia_guest_hooks.bin";
++  FILE* file = std::fopen(path.string().c_str(), "wb");
++  std::fwrite(words.data(), sizeof(uint32_t), words.size(), file);
++  std::fclose(file);
++  return path;
++}
++
++}  // namespace
++
++TEST_CASE("GUEST_HOOKS", "[guest_hooks]") {
++  auto memory = std::make_unique<Memory>();
++  memory->Initialize();
++  auto processor = std::make_unique<Processor>(memory.get(), nullptr);
++#if XE_ARCH_AMD64
++  processor->Setup(std::make_unique<backend::x64::X64Backend>());
++#elif XE_ARCH_ARM64
++  processor->Setup(std::make_unique<backend::a64::A64Backend>());
++#endif
++
++  auto module = std::make_unique<RawModule>(processor.get());
++  REQUIRE(module->LoadFile(kBase, WriteCode()));
++  processor->AddModule(std::move(module));
++
++  auto& hooks = GuestHooks::Get();
++  hooks.Unfreeze();
++  REQUIRE(hooks.Add(processor.get(), kFuncInt + 4, AddToR3));
++  REQUIRE(hooks.Add(processor.get(), kFuncBranch + 4, ForceCr6Eq));
++  REQUIRE(hooks.Add(processor.get(), kFuncFloat, SetF1));
++  double f0_seen = 0.0;
++  REQUIRE(hooks.Add(processor.get(), kFuncFloatRead + 4, ReadF0, &f0_seen));
++  hooks.Freeze();
++  REQUIRE_FALSE(hooks.Add(processor.get(), kBase + 0x2FC, AddToR3));
++
++  uint32_t stack_size = 64 * 1024;
++  uint32_t stack_address = memory->SystemHeapAlloc(stack_size);
++  auto thread_state = std::make_unique<ThreadState>(processor.get(), 0x100,
++                                                    stack_address + stack_size);
++  auto ctx = thread_state->context();
++  auto call = [&](uint32_t address) {
++    ctx->lr = 0xBCBCBCBC;
++    processor->ResolveFunction(address)->Call(thread_state.get(),
++                                              uint32_t(ctx->lr));
++  };
++
++  hooks.SetActive(true);
++  call(kFuncInt);
++  REQUIRE(ctx->r[3] == 102);  // 1, +100 from the hook, +1
++
++  ctx->r[3] = 0;
++  call(kFuncBranch);
++  REQUIRE(ctx->r[4] == 2);  // r3 != 5, but the hook forced the branch
++
++  ctx->f[1] = 8.0;
++  call(kFuncFloat);
++  REQUIRE(ctx->f[1] == 0.5);  // hook replaced f1 with 0.25 before fadd
++
++  ctx->f[1] = 1.0;
++  ctx->f[2] = 4.0;
++  call(kFuncFloatRead);
++  REQUIRE(f0_seen == 0.25);  // the hook sees f0 from the preceding fdivs
++  REQUIRE(ctx->f[3] == 0.25);
++
++  // Inactive hooks are skipped by the already translated code.
++  hooks.SetActive(false);
++  ctx->r[3] = 0;
++  call(kFuncBranch);
++  REQUIRE(ctx->r[4] == 1);
++  call(kFuncInt);
++  REQUIRE(ctx->r[3] == 2);
++
++  thread_state.reset();
++  memory->SystemHeapFree(stack_address);
++  processor.reset();
++}
++
++}  // namespace testing
++}  // namespace cpu
++}  // namespace xe

@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Keep the effect state of Theater rewind snapshots
+
+While a multiplayer film plays in Theater, every 300 ticks the game
+copies its state into a rewind cache (cache1:\sf_history.blob, 16 slots)
+and a seek back restores the nearest one. The GPU effect storages in it
+were stale, so effects alive then glitched after seeking back; reading
+them back at the snapshot would pause playback every 10 seconds.
+
+halo3_gpu_readback_film_snapshots (default on, with halo3_gpu_readback)
+uses the guest snapshots instead (halo3_theater.cc):
+- 820A4580, after the snapshot's before-save procs (render thread
+  parked, fence after the last effect pass waited; r30 = the slot):
+  post the four effect storage windows for the slot.
+- 820A4650: if writing the record failed (r28 = 0), the game still
+  commits the slot over the previous record, so drop what was posted.
+- 821D698C, in the before-load procs of every game state load, after
+  their fence wait: flush, so no copy sees loaded data.
+- 8227FB34, restoring a slot after the image read into B passed its
+  marker or hash check, before sub_821E1C98 (8227FB44, which makes the
+  clip's start state when a clip starts there) and the sample CRC:
+  if the image carries the snapshot marker, take the slot's bytes
+  (waiting only if the copy isn't done) and write them into B through
+  the physical view, never over the CRC words or the hash field, then
+  invalidate the GPU copy of those pages.
+
+All four are reached only as described (fall-through, or the three
+failure branches for 820A4650).
+
+The main thread spends tens of microseconds per snapshot. One info line
+per restore of a snapshot taken during playback, with what was put back
+and counters since the previous such line.
+---
+ src/xenia/kernel/title/halo3/halo3.cc         |   7 +-
+ src/xenia/kernel/title/halo3/halo3.h          |   2 +
+ src/xenia/kernel/title/halo3/halo3_theater.cc | 421 ++++++++++++++++++
+ 3 files changed, 428 insertions(+), 2 deletions(-)
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_theater.cc
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index caaf259..b08e8e8 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -44,7 +44,8 @@ DEFINE_bool(halo3_gpu_readback, true,
+             "(black otherwise) and the GPU effect state in checkpoints and "
+             "saves (stale otherwise: effects alive at a checkpoint glitch "
+             "after a revert). Each pauses the game briefly at that moment "
+-            "only.",
++            "only. Theater rewind snapshots: "
++            "halo3_gpu_readback_film_snapshots.",
+             "Halo3");
+ 
+ namespace xe {
+@@ -103,7 +104,8 @@ constexpr uint32_t kEffectStorageAddress = 0x28;
+ // 820A6A10, and 820A46AC every 300 ticks outside Theater playback), and
+ // Theater's rewind snapshot (820A457C): every 300 ticks while a multiplayer
+ // film plays, the game copies its state into cache1:\sf_history.blob for
+-// seeking. Reading it back here would wait for the GPU every 10 seconds.
++// seeking. Reading it back here would wait for the GPU every 10 seconds;
++// halo3_theater.cc keeps its effect state without waiting.
+ constexpr uint32_t kBeforeSaveFenceWaited = 0x821D67E4;
+ constexpr uint32_t kSaveFlagsBracketOrFilmSnapshot = 0x100;
+ // Theater screenshot: entry of sub_824E0BE0, called only from 824DFE24
+@@ -732,6 +734,7 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   InstallInterpolation(kernel_state);
+   InstallInput(kernel_state);
+   InstallTiming(kernel_state);
++  InstallTheaterSnapshots(kernel_state);
+   auto& hooks = cpu::GuestHooks::Get();
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBodyEntry);
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index b3ddd91..cd9711d 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -177,6 +177,8 @@ bool InGameUpdate(const cpu::ppc::PPCContext* ctx);
+ void InstallTiming(KernelState* kernel_state);
+ // halo3_input.cc
+ void InstallInput(KernelState* kernel_state);
++// halo3_theater.cc
++void InstallTheaterSnapshots(KernelState* kernel_state);
+ // Takes the mouse motion for this frame.
+ void OnInputFrameStart(cpu::ppc::PPCContext* ctx);
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3_theater.cc b/src/xenia/kernel/title/halo3/halo3_theater.cc
+new file mode 100644
+index 0000000..004b2af
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_theater.cc
+@@ -0,0 +1,421 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// Theater's rewind snapshots and the GPU effect state.
++//
++// While a multiplayer film plays in Theater, every 300 ticks the game copies
++// its state into a rewind cache (cache1:\sf_history.blob, 16 slots of
++// 0x7F0000 bytes), and a seek back restores the nearest one. Halo 3 simulates
++// its particles, contrails, light volumes and beams on the GPU (memory export
++// into four storages inside that state), which in Xenia never reaches guest
++// memory, so the snapshots carried stale effect state and effects alive then
++// glitched after a seek. Reading it back at the snapshot would wait for the
++// GPU every 10 seconds; instead the GPU copies it in the background
++// (PostGuestSnapshot), Xenia keeps it on the host, and it's written into the
++// restored state before the game checks it or makes a clip from it.
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/base/clock.h"
++#include "xenia/base/logging.h"
++#include "xenia/base/mutex.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/gpu/guest_readback.h"
++#include "xenia/gpu/memexport_keep.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++#include "xenia/memory.h"
++
++DECLARE_bool(halo3_gpu_readback);
++
++DEFINE_bool(halo3_gpu_readback_film_snapshots, true,
++            "Halo 3, with halo3_gpu_readback: keep the GPU effect state of "
++            "Theater's rewind snapshots (every 10 seconds while a multiplayer "
++            "film plays, kept for seeking) and put it back when a seek "
++            "restores one. Off: effects alive then glitch after seeking back. "
++            "Copied in the background, without pausing the game.",
++            "Halo3");
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// The rewind cache's slots: 16 of 0x18 bytes, +8 = the record's offset in
++// sf_history.blob (slot * 0x7F0000), set by the allocator sub_8227FFD0.
++constexpr uint32_t kHistorySlots = 0x82F02E44;
++constexpr uint32_t kHistorySlotSize = 0x18;
++constexpr uint32_t kHistorySlotFileOffset = 0x08;
++constexpr uint32_t kHistoryRecordBytes = 0x7F0000;
++// The game state B (*828E3D98) that a record holds after a 64 KB header.
++constexpr uint32_t kGameStateBytes = 0x7E0000;
++
++// sub_820A4320, the periodic snapshot (game mode 2, film playback, world tick
++// % 300 == 0, no slot with that film position yet): right after
++// sub_821D67A0(0x100) (820A457C), with the render thread parked (821D67BC)
++// and the fence after the last effect pass waited (821D67E0); before the copy
++// of B (820A4600, 820A4624) and the unpark (820A4654 -> 821D6938). Reached by
++// fall-through only; r30 = the slot entry from sub_8227FFD0 (820A4568).
++constexpr uint32_t kSnapshotParked = 0x820A4580;
++// Same function, `li r3, 0x100` before sub_821D6890 (the unpark): reached by
++// fall-through (r28 = 1, the copies and the write queued) and from the three
++// failure branches 820A4610, 820A4634, 820A4648 (r28 = 0); r30 = the slot
++// entry. On a failure the game still commits the slot (sub_820A6118) over the
++// previous record in the file, which the kept effect state doesn't belong to.
++constexpr uint32_t kSnapshotWritten = 0x820A4650;
++// sub_821D6948, the before-load procs of every game state load: `lwsync`
++// right after BlockOnFence (821D6988), with the render thread parked
++// (821D6964), before the procs (821D69D4), among them the protect of the game
++// state (8219A948), which drops the GPU data Xenia keeps there. Reached by
++// fall-through only.
++constexpr uint32_t kBeforeLoadFenceWaited = 0x821D698C;
++// sub_8227F938, restoring a slot: after sub_8219C0D0(0, 1) accepted the image
++// read into B (8227FB24, marker or hash), before sub_821E1C98 (8227FB44,
++// which hashes and compresses B into a clip when one starts here: a "go to
++// clip start" seek) and the sample CRC (8227FB48-8227FBB8). Reached by
++// fall-through only; r29 = slot, r26 = slot entry, r31 = B, *(r1 + 0x50) =
++// bytes read.
++constexpr uint32_t kSnapshotLoaded = 0x8227FB34;
++constexpr uint32_t kLoadedBytesOnStack = 0x50;
++// The game state hash field: *(828E3DB0) + 0xF980, 20 bytes, inside B.
++// sub_8219BCB0(1, 0) fills it with this marker for the periodic snapshots
++// (sub_821D67A0 with flags 0x100); the first snapshot after a load
++// (sub_8227F6C0) carries a real hash.
++constexpr uint32_t kHashFieldPointer = 0x828E3DB0;
++constexpr uint32_t kHashFieldOffset = 0xF980;
++constexpr uint32_t kHashFieldBytes = 0x14;
++constexpr uint32_t kSnapshotMarker = 0xBBBBBBBB;
++// The words of B the restore checks against the slot's CRC.
++constexpr uint32_t kSampleCrcOffsets[] = {0x0, 0x1F8000, 0x3F0000, 0x7DFFFC};
++
++constexpr auto kFlushTimeout = std::chrono::milliseconds(1000);
++constexpr auto kAwaitTimeout = std::chrono::milliseconds(2000);
++static_assert(gpu::MemExportKeepWindows::kMaxWindows <=
++              gpu::GuestSnapshots::kMaxRanges);
++
++// Since the last seek.
++struct Counters {
++  std::atomic<uint32_t> posted{0};
++  std::atomic<uint32_t> nothing_newer{0};
++  // PostGuestSnapshot couldn't keep it (too large, no GPU backend).
++  std::atomic<uint32_t> not_kept{0};
++  // Not posted (off, no effect storage yet, an unexpected slot).
++  std::atomic<uint32_t> skipped{0};
++  std::atomic<uint32_t> flush_waits{0};
++  std::atomic<uint64_t> post_ticks{0};
++  std::atomic<uint64_t> post_ticks_max{0};
++  std::atomic<uint64_t> flush_ticks_max{0};
++};
++Counters counters;
++
++bool Enabled() {
++  return cvars::halo3_gpu_readback && cvars::halo3_gpu_readback_film_snapshots;
++}
++
++double TicksToMs(uint64_t ticks) {
++  return double(ticks) * 1000.0 / double(Clock::QueryHostTickFrequency());
++}
++
++void AtomicMax(std::atomic<uint64_t>& value, uint64_t candidate) {
++  uint64_t current = value.load(std::memory_order_relaxed);
++  while (current < candidate &&
++         !value.compare_exchange_weak(current, candidate,
++                                      std::memory_order_relaxed)) {
++  }
++}
++
++// The slot index of a slot entry, or UINT32_MAX (sub_82280418 found nothing to
++// evict: the game then writes the entry below the table).
++uint32_t SlotIndex(uint32_t entry) {
++  const uint32_t offset = entry - kHistorySlots;
++  if (offset % kHistorySlotSize) {
++    return UINT32_MAX;
++  }
++  const uint32_t slot = offset / kHistorySlotSize;
++  return slot < gpu::GuestSnapshots::kMaxSlots ? slot : UINT32_MAX;
++}
++
++void OnSnapshotParked(cpu::ppc::PPCContext* ctx, void*) {
++  const uint32_t entry = static_cast<uint32_t>(ctx->r[30]);
++  const uint32_t slot = SlotIndex(entry);
++  if (slot == UINT32_MAX) {
++    return;
++  }
++  const uint32_t file_offset = xe::load_and_swap<uint32_t>(
++      ctx->TranslateVirtual(entry + kHistorySlotFileOffset));
++  const gpu::MemExportKeepWindows& windows = gpu::memexport_keep_windows();
++  const uint32_t count = std::min(windows.count.load(std::memory_order_acquire),
++                                  gpu::MemExportKeepWindows::kMaxWindows);
++  if (!Enabled() || !count || file_offset != slot * kHistoryRecordBytes) {
++    // Whatever it held belongs to the record being replaced.
++    gpu::DropGuestSnapshot(slot);
++    counters.skipped.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  uint32_t starts[gpu::MemExportKeepWindows::kMaxWindows];
++  uint32_t lengths[gpu::MemExportKeepWindows::kMaxWindows];
++  for (uint32_t i = 0; i < count; ++i) {
++    starts[i] = windows.start[i].load(std::memory_order_relaxed);
++    lengths[i] = windows.end[i].load(std::memory_order_relaxed) - starts[i];
++  }
++  const uint64_t start = Clock::QueryHostTickCount();
++  const gpu::GuestSnapshotPostOutcome outcome =
++      gpu::PostGuestSnapshot(slot, starts, lengths, count);
++  const uint64_t ticks = Clock::QueryHostTickCount() - start;
++  counters.post_ticks.fetch_add(ticks, std::memory_order_relaxed);
++  AtomicMax(counters.post_ticks_max, ticks);
++  switch (outcome.result) {
++    case gpu::GuestSnapshotPostResult::kPosted:
++      counters.posted.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case gpu::GuestSnapshotPostResult::kNothingNewer:
++      counters.nothing_newer.fetch_add(1, std::memory_order_relaxed);
++      break;
++    case gpu::GuestSnapshotPostResult::kTooLarge: {
++      counters.not_kept.fetch_add(1, std::memory_order_relaxed);
++      static bool warned = false;
++      if (!warned) {
++        warned = true;
++        XELOGW(
++            "Halo 3: Theater rewind snapshots can't keep the GPU effect "
++            "state: {} bytes is over the {} byte limit",
++            outcome.bytes, gpu::GuestSnapshots::kMaxBytes);
++      }
++      break;
++    }
++    case gpu::GuestSnapshotPostResult::kNoService: {
++      counters.not_kept.fetch_add(1, std::memory_order_relaxed);
++      static bool warned = false;
++      if (!warned) {
++        warned = true;
++        XELOGW(
++            "Halo 3: Theater rewind snapshots can't keep the GPU effect "
++            "state: this GPU backend doesn't copy it");
++      }
++      break;
++    }
++  }
++  XELOGD(
++      "Halo 3: Theater rewind snapshot {}: {} bytes in {} parts to copy, "
++      "{:.3f} ms",
++      slot, outcome.bytes, outcome.parts, TicksToMs(ticks));
++}
++
++void OnSnapshotWritten(cpu::ppc::PPCContext* ctx, void*) {
++  if (static_cast<uint8_t>(ctx->r[28])) {
++    return;
++  }
++  const uint32_t slot = SlotIndex(static_cast<uint32_t>(ctx->r[30]));
++  if (slot != UINT32_MAX) {
++    gpu::DropGuestSnapshot(slot);
++    XELOGW(
++        "Halo 3: Theater couldn't write rewind snapshot {} (the game commits "
++        "the slot anyway, over its previous record); its effect state is "
++        "dropped",
++        slot);
++  }
++}
++
++void OnBeforeLoadFenceWaited(cpu::ppc::PPCContext* ctx, void*) {
++  // Usually nothing is in flight: one load per slot.
++  if (!gpu::GuestSnapshotPostsUntaken()) {
++    return;
++  }
++  const uint64_t start = Clock::QueryHostTickCount();
++  const bool taken = gpu::FlushGuestSnapshotPosts(kFlushTimeout);
++  const uint64_t ticks = Clock::QueryHostTickCount() - start;
++  counters.flush_waits.fetch_add(1, std::memory_order_relaxed);
++  AtomicMax(counters.flush_ticks_max, ticks);
++  if (!taken) {
++    XELOGW(
++        "Halo 3: the GPU thread didn't take a Theater rewind snapshot's copy "
++        "within {:.0f} ms before a load; that snapshot keeps stale effects",
++        TicksToMs(ticks));
++  }
++}
++
++// Writes the snapshot's bytes into the restored game state at image, then
++// makes the GPU copy of those pages take them. Checks everything first.
++bool PutBack(cpu::ppc::PPCContext* ctx, uint32_t image, uint32_t hash_field,
++             const gpu::GuestSnapshotData& data, uint32_t& bytes,
++             const char*& reason) {
++  Memory* memory = ctx->kernel_state->memory();
++  BaseHeap* heap = memory->LookupHeap(image);
++  if (!heap || heap->heap_type() != HeapType::kGuestPhysical ||
++      memory->LookupHeap(image + kGameStateBytes - 1) != heap) {
++    reason = "the game state isn't in one physical heap";
++    return false;
++  }
++  auto* physical_heap = static_cast<PhysicalHeap*>(heap);
++  const uint32_t image_physical = physical_heap->GetPhysicalAddress(image);
++  const auto overlaps = [](uint32_t a, uint32_t a_length, uint32_t b,
++                           uint32_t b_length) {
++    return uint64_t(a) < uint64_t(b) + b_length &&
++           uint64_t(b) < uint64_t(a) + a_length;
++  };
++  uint64_t total = 0;
++  for (const std::pair<uint32_t, uint32_t>& part : data.parts) {
++    const uint32_t offset = part.first - image_physical;
++    if (part.first < image_physical || part.second > kGameStateBytes ||
++        offset > kGameStateBytes - part.second) {
++      reason = "outside the restored game state";
++      return false;
++    }
++    for (uint32_t crc_offset : kSampleCrcOffsets) {
++      if (overlaps(offset, part.second, crc_offset, 4)) {
++        reason = "over a word the game checks";
++        return false;
++      }
++    }
++    if (overlaps(image + offset, part.second, hash_field, kHashFieldBytes)) {
++      reason = "over the hash field";
++      return false;
++    }
++    total += part.second;
++  }
++  if (total != data.bytes.size()) {
++    reason = "its size doesn't match";
++    return false;
++  }
++  const uint8_t* source = data.bytes.data();
++  for (const std::pair<uint32_t, uint32_t>& part : data.parts) {
++    std::memcpy(memory->TranslatePhysical(part.first), source, part.second);
++    source += part.second;
++  }
++  // The physical view has no write watches: drop the GPU copy of those pages
++  // now (exact, and also where unwatched, as a protect does), so the next
++  // use uploads these bytes, also if something uploaded the ones read from
++  // the file since.
++  for (const std::pair<uint32_t, uint32_t>& part : data.parts) {
++    physical_heap->TriggerCallbacks(xe::global_critical_region::AcquireDirect(),
++                                    image + (part.first - image_physical),
++                                    part.second, true, true, true, true);
++  }
++  bytes = uint32_t(total);
++  return true;
++}
++
++void OnSnapshotLoaded(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Enabled()) {
++    return;
++  }
++  const uint32_t slot = static_cast<uint32_t>(ctx->r[29]);
++  const uint32_t entry = static_cast<uint32_t>(ctx->r[26]);
++  const uint32_t image = static_cast<uint32_t>(ctx->r[31]);
++  const uint32_t loaded = xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(
++      static_cast<uint32_t>(ctx->r[1]) + kLoadedBytesOnStack));
++  // A short read: the game fails it (sample CRC).
++  if (slot >= gpu::GuestSnapshots::kMaxSlots || SlotIndex(entry) != slot ||
++      loaded != kGameStateBytes ||
++      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(
++          entry + kHistorySlotFileOffset)) != slot * kHistoryRecordBytes) {
++    return;
++  }
++  const uint32_t hash_field =
++      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(kHashFieldPointer)) +
++      kHashFieldOffset;
++  for (uint32_t i = 0; i < kHashFieldBytes; i += 4) {
++    if (xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(hash_field + i)) !=
++        kSnapshotMarker) {
++      // The first snapshot after a load (sub_8227F6C0, a real hash): the GPU
++      // had nothing newer then, and what is kept for the slot belongs to an
++      // older record.
++      gpu::DropGuestSnapshot(slot);
++      XELOGD(
++          "Halo 3: Theater seek to the snapshot taken at the film's load "
++          "(slot {}): nothing to put back",
++          slot);
++      return;
++    }
++  }
++  std::shared_ptr<const gpu::GuestSnapshotData> data;
++  const uint64_t start = Clock::QueryHostTickCount();
++  const gpu::GuestSnapshotAwaitResult result =
++      gpu::AwaitGuestSnapshot(slot, kAwaitTimeout, data);
++  const double waited_ms = TicksToMs(Clock::QueryHostTickCount() - start);
++  const char* reason = nullptr;
++  uint32_t bytes = 0;
++  switch (result) {
++    case gpu::GuestSnapshotAwaitResult::kReady:
++      PutBack(ctx, image, hash_field, *data, bytes, reason);
++      break;
++    case gpu::GuestSnapshotAwaitResult::kEmpty:
++      reason =
++          "none was kept (taken with halo3_gpu_readback or "
++          "halo3_gpu_readback_film_snapshots off or before the effect "
++          "storage existed, or the game failed to write it)";
++      break;
++    case gpu::GuestSnapshotAwaitResult::kFailed:
++      reason = "no copy was made (see the earlier warning)";
++      break;
++    case gpu::GuestSnapshotAwaitResult::kTimedOut:
++      reason = "its copy wasn't ready within 2000 ms";
++      break;
++  }
++  const uint32_t posted = counters.posted.exchange(0);
++  const uint32_t nothing_newer = counters.nothing_newer.exchange(0);
++  const uint32_t not_kept = counters.not_kept.exchange(0);
++  const uint32_t skipped = counters.skipped.exchange(0);
++  const uint32_t flush_waits = counters.flush_waits.exchange(0);
++  const uint64_t post_ticks = counters.post_ticks.exchange(0);
++  const uint64_t post_ticks_max = counters.post_ticks_max.exchange(0);
++  const uint64_t flush_ticks_max = counters.flush_ticks_max.exchange(0);
++  // Calls of PostGuestSnapshot.
++  const uint32_t posts = posted + nothing_newer + not_kept;
++  const std::string since = fmt::format(
++      "since the last seek line: {} snapshots ({} with nothing newer, {} not "
++      "kept, {} skipped), {:.3f} ms avg and {:.3f} ms max on the main "
++      "thread; {} loads waited for a copy to be taken ({:.1f} ms max)",
++      posts + skipped, nothing_newer, not_kept, skipped,
++      posts ? TicksToMs(post_ticks) / posts : 0.0, TicksToMs(post_ticks_max),
++      flush_waits, TicksToMs(flush_ticks_max));
++  if (reason) {
++    XELOGW(
++        "Halo 3: Theater seek to rewind snapshot {}: effect state not put back "
++        "({}); effects alive then may glitch; {}",
++        slot, reason, since);
++    return;
++  }
++  XELOGI(
++      "Halo 3: Theater seek to rewind snapshot {}: {} bytes of GPU effect "
++      "state put back (copy ready {:.1f} ms after the snapshot, waited {:.1f} "
++      "ms); {}",
++      slot, bytes,
++      std::chrono::duration<double, std::milli>(data->ready_time -
++                                                data->post_time)
++          .count(),
++      waited_ms, since);
++}
++
++}  // namespace
++
++void InstallTheaterSnapshots(KernelState* kernel_state) {
++  // Nothing from an earlier run in this process belongs to this one.
++  gpu::DropGuestSnapshots();
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  hooks.Add(processor, kSnapshotParked, OnSnapshotParked);
++  hooks.Add(processor, kSnapshotWritten, OnSnapshotWritten);
++  hooks.Add(processor, kBeforeLoadFenceWaited, OnBeforeLoadFenceWaited);
++  hooks.Add(processor, kSnapshotLoaded, OnSnapshotLoaded);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe

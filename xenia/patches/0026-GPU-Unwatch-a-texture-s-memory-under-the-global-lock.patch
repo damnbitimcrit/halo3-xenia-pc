@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Unwatch a texture's memory under the global lock
+
+Xenia could crash on the GPU command thread (in Halo 3, right after a
+checkpoint, as the game streamed in new data), writing a watch range
+that SharedMemory::WatchMemoryRange had just taken off its free list:
+the list's head was a range still in use by a texture.
+
+The watch lists are only changed under the global lock, but a texture's
+destructor read its watch handles without it. Textures are destroyed
+without the lock (on eviction in CompletedSubmissionUpdated, in
+ClearCache and at shutdown), while a guest thread writing to watched
+memory fires the same watches under it (FireWatches: WatchCallback
+clears the handle, then the range is unlinked). A watch fired between
+the destructor reading a handle and UnwatchMemoryRange taking the lock
+was unlinked twice, putting its range and nodes on the free lists twice
+and corrupting the bucket links.
+
+Take the global lock (recursive) around reading and unwatching the
+handles in Texture::~Texture.
+
+Also mark a freed watch range (page_first > page_last), and have
+UnlinkWatchRange log and skip a range released twice instead of
+corrupting the lists, which crashed far from the cause.
+---
+ src/xenia/gpu/shared_memory.cc | 11 +++++++++++
+ src/xenia/gpu/texture_cache.cc | 22 +++++++++++++++++-----
+ 2 files changed, 28 insertions(+), 5 deletions(-)
+
+diff --git a/src/xenia/gpu/shared_memory.cc b/src/xenia/gpu/shared_memory.cc
+index 1df729e..dab388a 100644
+--- a/src/xenia/gpu/shared_memory.cc
++++ b/src/xenia/gpu/shared_memory.cc
+@@ -351,6 +351,15 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length,
+ }
+ 
+ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
++  // A freed range has page_first > page_last (set below). Unlinking it again
++  // would put it and its nodes on the free lists twice, so the next watches
++  // would share them and the lists would break (crashing later, far from the
++  // cause). Log and skip it instead.
++  if (range->page_first > range->page_last) {
++    XELOGE("SharedMemory: watch range {} released twice",
++           static_cast<const void*>(range));
++    return;
++  }
+   uint32_t bucket =
+       range->page_first << page_size_log2_ >> kWatchBucketSizeLog2;
+   WatchNode* node = range->node_first;
+@@ -369,6 +378,8 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+     node = node_next;
+     ++bucket;
+   }
++  range->page_first = UINT32_MAX;
++  range->page_last = 0;
+   range->next_free = watch_range_first_free_;
+   watch_range_first_free_ = range;
+ }
+diff --git a/src/xenia/gpu/texture_cache.cc b/src/xenia/gpu/texture_cache.cc
+index e44f0f1..157548b 100644
+--- a/src/xenia/gpu/texture_cache.cc
++++ b/src/xenia/gpu/texture_cache.cc
+@@ -507,11 +507,23 @@ TextureCache::Texture::Texture(TextureCache& texture_cache,
+ }
+ 
+ TextureCache::Texture::~Texture() {
+-  if (mips_watch_handle_) {
+-    texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
+-  }
+-  if (base_watch_handle_) {
+-    texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
++  {
++    // A guest thread writing to watched memory fires these watches under the
++    // global lock at any time, which unlinks them and clears the handles (in
++    // WatchCallback). Textures are destroyed without the lock (on eviction in
++    // CompletedSubmissionUpdated, in ClearCache and at shutdown), so read the
++    // handles under it too: otherwise a watch fired between reading a handle
++    // and unwatching it was unlinked twice, which corrupted the shared
++    // memory's watch free lists (and later crashed in WatchMemoryRange).
++    auto global_lock = xe::global_critical_region::Acquire();
++    if (mips_watch_handle_) {
++      texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
++      mips_watch_handle_ = nullptr;
++    }
++    if (base_watch_handle_) {
++      texture_cache().shared_memory().UnwatchMemoryRange(base_watch_handle_);
++      base_watch_handle_ = nullptr;
++    }
+   }
+ 
+   // Only remove from usage list if we were added to it (track_usage=true).

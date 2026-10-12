@@ -1,0 +1,1178 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Draw cut ticks as is; smooth the first-person eye,
+ melee and hand
+
+Four things only showed with the frame rate unlocked:
+
+- Cutscene cuts: a shot change happens in one tick (the script sets the
+  new shot, restarts every actor's animation without interpolation and
+  re-places it; then the objects update). The camera hook showed the new
+  shot from the first frame, but the objects had already been blended
+  from the old shot's last state, so the actors slid into place over the
+  tick. Now the tick that cuts is found when it ends, from the scripted
+  camera's globals (another mode, a new camera point set without a move,
+  another camera animation or shot, the same shot set again, the
+  cinematic's own shot; not a camera transition) and is drawn as is:
+  objects and first-person poses. The camera hook uses the same decision
+  (the globals' new-command byte alone no longer cuts: the Cortana effect
+  sets it too); a cut it finds only by a jump draws the rest of the tick
+  as is (the exact state is put back before the observer and the frame's
+  publication). After several ticks in one frame, the scripted camera
+  keeps blending from an estimate of where it was a tick ago instead of
+  cutting.
+- Objects the game moves without blending in a tick (a unit's custom
+  animation started without interpolation, 823910A4; a scenery animation
+  started, 8236139C; object_teleport / object_set_facing, 822BB210;
+  ai_teleport and cs_teleport, 82509E84, 82509FD4, 825137D0) are drawn as
+  is for that tick, with what is attached to them. An object is only
+  blended over the tick's own state, and in the main menu, where the UI
+  turns the player model every frame outside the ticks, objects placed
+  between ticks are drawn as is at the next tick.
+- First-person legs: looking down, the eye moves toward the head by an
+  offset in the frame of the unit's aiming vector (+0x1A8) and the
+  biped's eye offset (+0x4B4), both per tick, around the blended body;
+  while turning the view smoothly, the eye hopped around the body at
+  30 Hz and the nearby legs with it. Both are blended with the biped
+  (restored on their own: a later change keeps the object blended).
+- First-person melee and grenade throws: any one of the pose's matrices
+  turning more than 60 degrees in a tick dropped the blend of the whole
+  pose for that tick, and these are the fastest animations, while the
+  game blends almost every first-person animation change itself. Now a
+  pose (still as a whole: its matrices are absolute) is drawn as is only
+  on an identity change, a matrix moving over 0.5 units or turning over
+  150 degrees, or over 60 degrees in a tick its animation state (P+0x30)
+  changed in. halo3_fp_snap = any also snaps on any turn over 60 degrees
+  in a tick; off keeps only identity changes. The hand IK weight
+  (B+0x23B4, which pulls the left hand onto the weapon at render time
+  and fades out and in around melee and throws) is blended too, while
+  the weapon pose is. A melee lunge's turn toward its target, which
+  player_control takes over in one frame after each tick
+  (82215090-82215118), is drawn spread over the tick (the drawn facing
+  only; the live facing and the simulation are untouched).
+
+Stats: cuts by source, objects drawn as is on cuts and their largest
+move, objects moved unblended by the game, objects placed between ticks;
+first-person pose changes, ticks drawn as is, ticks turning over 60
+degrees and the largest turn, facings taken over by the game and the
+frames that drew them spread.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        |  28 +-
+ src/xenia/kernel/title/halo3/halo3.h         |  35 +
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 725 +++++++++++++++++--
+ 3 files changed, 726 insertions(+), 62 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 752497b..cd3b535 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -322,14 +322,32 @@ void LogStats() {
+   const uint32_t biped = s.mismatches_biped.exchange(0);
+   const uint32_t vehicle = s.mismatches_vehicle.exchange(0);
+   const uint32_t other = s.mismatches_other.exchange(0);
++  XELOGI(
++      "Halo 3 cuts: {} by the camera mode, {} by the camera, {} by the "
++      "cinematic, {} camera moves not cut; {} objects drawn as is (largest "
++      "move {:.2f})",
++      s.cuts_by_camera_mode.exchange(0), s.cuts_by_camera.exchange(0),
++      s.cuts_by_cinematic.exchange(0), s.cuts_skipped_camera_moves.exchange(0),
++      s.cut_objects.exchange(0), s.cut_largest_move.exchange(0.0f));
++  XELOGI(
++      "Halo 3 first person: {} pose changes, {} ticks drawn as is, {} ticks "
++      "turning over 60 degrees (largest turn {} degrees), {} facings taken "
++      "over by the game (melee lunges), drawn spread over {} frames",
++      s.fp_pose_changes.exchange(0), s.fp_snaps.exchange(0),
++      s.fp_over_60_degrees.exchange(0), s.fp_worst_turn_degrees.exchange(0),
++      s.facing_takeovers.exchange(0), s.facing_takeovers_blended.exchange(0));
+   XELOGI(
+       "Halo 3 details: not blended: {} teleports, {} restore mismatches "
+-      "(biped {}, vehicle {}, other {}), {} frames with no blend; player 0 "
+-      "vehicle blended in {} of {} frames; cameras: {} scripted blends, {} "
+-      "cuts ({} by a jump), {} driver focus moves; {:.0f} shader times "
+-      "smoothed/s",
++      "(biped {}, vehicle {}, other {}), {} frames with no blend, {} objects "
++      "moved unblended by the game, {} placed between ticks, {} cut ticks "
++      "({} found after the blend); "
++      "player 0 vehicle blended in {} of {} frames; cameras: {} scripted "
++      "blends, {} cuts ({} by a jump), {} driver focus moves; {:.0f} shader "
++      "times smoothed/s",
+       s.teleports.exchange(0), biped + vehicle + other, biped, vehicle, other,
+-      s.frames_without_blend.exchange(0), s.vehicle_blended_frames.exchange(0),
++      s.frames_without_blend.exchange(0), s.unblended_by_game.exchange(0),
++      s.placed_between_ticks.exchange(0), s.cut_ticks.exchange(0),
++      s.cuts_after_blend.exchange(0), s.vehicle_blended_frames.exchange(0),
+       s.vehicle_frames.exchange(0), s.scripted_camera_blends.exchange(0),
+       s.scripted_camera_cuts.exchange(0), s.scripted_camera_jumps.exchange(0),
+       s.driver_focus_moves.exchange(0),
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index a9ce046..d74ea87 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -48,6 +48,19 @@ struct Stats {
+   std::atomic<uint32_t> mouse_frames{0};  // frames that turned the view
+   std::atomic<uint32_t> blended_objects{0};
+   std::atomic<uint32_t> blended_poses{0};
++  // First-person poses: identity changes in a tick (another weapon, model
++  // or animation set: not blended), ticks drawn as is by halo3_fp_snap,
++  // ticks a matrix turned over 60 degrees in (what halo3_fp_snap = any snaps),
++  // and the largest turn of a matrix in a tick, in degrees.
++  std::atomic<uint32_t> fp_pose_changes{0};
++  std::atomic<uint32_t> fp_snaps{0};
++  std::atomic<uint32_t> fp_over_60_degrees{0};
++  std::atomic<uint32_t> fp_worst_turn_degrees{0};
++  // Frames in which the game set a player's facing from the unit's aim (a
++  // melee lunge, among others): the view turns a whole tick's turn at once.
++  std::atomic<uint32_t> facing_takeovers{0};
++  // Frames that drew such a turn spread over the tick.
++  std::atomic<uint32_t> facing_takeovers_blended{0};
+   // Renderer node updates: full rebuilds (objects left unblended) and
+   // single nodes it turned (biped head look-at) on top of a blend.
+   std::atomic<uint32_t> render_rebuilds{0};
+@@ -70,6 +83,28 @@ struct Stats {
+   std::atomic<uint32_t> scripted_camera_cuts{0};
+   // Cuts found only by the camera jumping or turning (no scripted signal).
+   std::atomic<uint32_t> scripted_camera_jumps{0};
++  // Ticks drawn as is, everything unblended: the scripts cut to another
++  // camera in the tick, or a camera jump showed a cut once the frame was
++  // already blended. Objects the game itself moved without blending
++  // (animations started without interpolation, scenery animations,
++  // teleports), with what is attached to them.
++  std::atomic<uint32_t> cut_ticks{0};
++  std::atomic<uint32_t> cuts_after_blend{0};
++  // Cut ticks by what showed them: another scripted camera mode, another
++  // camera in the mode (point, animation, shot, or the shot set again), the
++  // cinematic's own scene or shot; camera points set with a move (not cuts);
++  // objects drawn as is on cut ticks that would have blended, and the
++  // largest of their root moves (world units).
++  std::atomic<uint32_t> cuts_by_camera_mode{0};
++  std::atomic<uint32_t> cuts_by_camera{0};
++  std::atomic<uint32_t> cuts_by_cinematic{0};
++  std::atomic<uint32_t> cuts_skipped_camera_moves{0};
++  std::atomic<uint32_t> cut_objects{0};
++  std::atomic<float> cut_largest_move{0.0f};
++  std::atomic<uint32_t> unblended_by_game{0};
++  // Objects placed between a tick and our blend (not blended until the next
++  // tick).
++  std::atomic<uint32_t> placed_between_ticks{0};
+   std::atomic<uint32_t> driver_focus_moves{0};
+   // Shader time inputs given the time between ticks (halo3_timing.cc).
+   std::atomic<uint32_t> smoothed_shader_times{0};
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 29c5662..c15c95f 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -36,6 +36,7 @@
+ #include <atomic>
+ #include <cmath>
+ #include <cstring>
++#include <string>
+ #include <vector>
+ 
+ #include "xenia/base/byte_order.h"
+@@ -50,6 +51,15 @@ DEFINE_bool(halo3_interpolation, true,
+             "Halo 3: smooth object and first-person weapon motion between 30 "
+             "Hz simulation ticks when the frame rate is unlocked.",
+             "Halo3");
++DEFINE_string(halo3_fp_snap, "animation",
++              "Halo 3: when the first-person weapon and arms are drawn as a "
++              "tick left them instead of blended. \"animation\": when a "
++              "matrix moves over 0.5 units or turns over 150 degrees in a "
++              "tick, or turns over 60 degrees in a tick its animation "
++              "changed in. \"any\": whenever a matrix moves over 0.5 units "
++              "or turns over 60 degrees (fast melee and grenade throws then "
++              "step). \"off\": only when the weapon, models or unit change.",
++              "Halo3");
+ 
+ namespace xe {
+ namespace kernel {
+@@ -97,19 +107,63 @@ constexpr uint32_t kFollowingCameraCenterPoint = 0x88;
+ // blend), but in modes 2 (point transitions), 3 (animated camera) and 5
+ // (cinematic scene) the camera only advances in game_tick, in whole ticks.
+ // Every mode ends in the common tail 822928F8 with r31 = the command, its
+-// pose complete, and the globals' "new command" byte (set by every
+-// camera_set_* call) not yet cleared. The command is a stack local of the
+-// director's update, the same for every local player.
++// pose complete. The command is a stack local of the director's update, the
++// same for every local player.
+ constexpr uint32_t kScriptedCameraTail = 0x822928F8;
+ constexpr uint32_t kTlsScriptedCamera = 0x8C;
+-constexpr uint32_t kScriptedCameraNewCommand = 0x1;  // u8
+-constexpr uint32_t kScriptedCameraMode = 0x2;        // s16
++constexpr uint32_t kScriptedCameraMode = 0x2;  // s16
+ // Camera command.
+ constexpr uint32_t kCameraCommandFlags = 0x00;  // bit 0: the director uses it
+ constexpr uint32_t kCameraCommandPosition = 0x04;
+ constexpr uint32_t kCameraCommandFov = 0x28;
+ constexpr uint32_t kCameraCommandForward = 0x2C;
+ constexpr uint32_t kCameraCommandUp = 0x38;
++// Mode 1 (a camera point, possibly relative to an object, set by camera_set
++// and the terminals; sub_822913F8): position +0x18, forward +0x24, up +0x30,
++// the object +0x3C.
++constexpr uint32_t kScriptedCameraPoint = 0x18;
++constexpr uint32_t kScriptedCameraPointObject = 0x3C;
++// Ticks left of the observer's move to a new camera point (sub_822913F8
++// sets it from camera_set's seconds, 822914AC; every scripted camera tick
++// counts it down, 82290FA4-82290FB8): not 0 at the end of the tick that set
++// it, a smooth move rather than a cut.
++constexpr uint32_t kScriptedCameraPointTransition = 0x14;
++// Game mode (TLS[0x80]+0x10): 3 in the main menu (82483A30, 8212A7C8).
++constexpr uint32_t kTlsGameOptions = 0x80;
++constexpr uint32_t kGameOptionsMode = 0x10;
++constexpr uint32_t kGameModeMainMenu = 3;
++// Mode 5: ticks since the shot was set, reset by every shot set
++// (camera_set_cinematic_scene, cinematic start) in the script update and
++// counted up by the camera's own update later in the same tick.
++constexpr uint32_t kScriptedCameraShotTicks = 0x60;
++// The cinematic globals (TLS[0x9C]): the scene and shot cinematic_set_shot
++// set (822D5988, 822D598C).
++constexpr uint32_t kTlsCinematic = 0x9C;
++constexpr uint32_t kCinematicScene = 0x4;
++constexpr uint32_t kCinematicShot = 0x8;
++// A frame that ran several ticks keeps blending the scripted camera (from an
++// estimate of where it was a tick ago) up to this many ticks.
++constexpr uint32_t kCameraCatchUpTicks = 4;
++// The game moving an object without blending it, during a tick (scripts,
++// cinematics, the main menu):
++// - sub_82390F60, a unit's custom animation started without interpolation
++//   (cinematic shots start every actor's animation this way, 8230169C): the
++//   branch that zeroes the animation interpolator, reached only from
++//   82391090; r31 = the unit's handle.
++// - sub_82361278, a scenery animation started, right after the animation
++//   was set (fall-through only); r28 = the object's handle.
++// - sub_822BB210, object_teleport / object_set_facing and the volume
++//   teleports (entry); r3 = the object's handle.
++// - ai_teleport (sub_82509C90, called only from 822C5FF4) and cs_teleport
++//   (sub_825135B8, from 822D2D58 and 822D2DFC), which place an actor's top
++//   object with object_set_position directly: the three `bl`s (reached by
++//   fall-through only), r3 = the handle.
++constexpr uint32_t kUnitAnimationCut = 0x823910A4;
++constexpr uint32_t kSceneryAnimationStart = 0x8236139C;
++constexpr uint32_t kObjectTeleport = 0x822BB210;
++constexpr uint32_t kAiTeleport = 0x82509E84;
++constexpr uint32_t kAiTeleportVehicle = 0x82509FD4;
++constexpr uint32_t kCommandScriptTeleport = 0x825137D0;
+ // A scripted camera jumping further or turning more than this in one tick is
+ // a cut; show it as is. Scripted cuts also set the new command byte or change
+ // the mode's parameters, so this is a safety net: generous enough for fast
+@@ -146,6 +200,14 @@ constexpr uint32_t kObjectUp = 0x6C;
+ // Bipeds: crouch amount (0-1, moved per tick by sub_82390550), which sets
+ // the first-person eye height.
+ constexpr uint32_t kBipedCrouch = 0x370;
++// Units: the aiming vector (unit+0x1A8), and bipeds: the eye's offset in the
++// aiming frame (+0x4B4, moved toward the head marker by at most 0.01 per
++// axis per tick, sub_82345300). Both change only in ticks; the first-person
++// camera (sub_822026E8 -> sub_8209A938 -> sub_823456F8) moves the eye by
++// them toward the head when looking down, every frame, around the blended
++// root node.
++constexpr uint32_t kUnitAiming = 0x1A8;
++constexpr uint32_t kBipedEyeOffset = 0x4B4;
+ constexpr uint32_t kObjectNodeMatricesSize = 0x13A;    // bytes
+ constexpr uint32_t kObjectNodeMatricesOffset = 0x13C;  // from the object
+ constexpr uint32_t kMatrixSize = 0x34;                 // real_matrix4x3
+@@ -168,6 +230,17 @@ constexpr uint32_t kPlayerControlUnit = 0x0;
+ constexpr uint32_t kPlayerControlYaw = 0xC;
+ constexpr uint32_t kPlayerControlPitch = 0x10;
+ constexpr uint32_t kNoUnit = 0xFFFFFFFF;
++// player_control's per-player update (sub_822147B0, r28 = the local player,
++// r29 = its live state), when the unit asks for its facing to be taken over
++// (unit+0x448 bit 0: a melee lunge turning toward its target each tick,
++// 820E6800, among others): the live yaw and pitch are set from the unit's
++// aiming vector (82215090-82215118, reached by fall-through only; yaw in
++// [0, 2 pi), pitch in [-pi, pi)), once in the first frame after the tick,
++// and the view turned by the whole tick's turn at once. The view now takes
++// that turn over the tick, as the blended objects do.
++constexpr uint32_t kFacingTakenOver = 0x82215090;
++constexpr uint32_t kFacingTakenOverDone = 0x82215110;
++constexpr float kTwoPi = 6.28318531f;
+ constexpr uint32_t kNoObject = 0xFFFFFFFF;
+ // Parent chains are short (a rider, its seat's vehicle, a turret).
+ constexpr uint32_t kMaxParentDepth = 8;
+@@ -192,10 +265,27 @@ constexpr uint32_t kFpSlotCameraNode = 0x1178;
+ constexpr uint32_t kFpMaxNodes = 64;
+ // Matrices of a pose: the nodes, then the camera node.
+ constexpr uint32_t kFpPoseMatrices = kFpMaxNodes + 1;
+-// A first-person node jumping further or turning more than this in one tick
+-// is an animation cut; show it as is.
++// The slot's first-person animation state (its main channel, P+0x2C, +4;
++// sub_82474178 compares it at 82474B80).
++constexpr uint32_t kFpSlotAnimationState = 0x30;
++// The game blends almost every change of first-person animation state
++// itself (from a frozen copy of the last pose, sub_82474C60): melee states
++// over 0.133 s, grenade throws and the way back to idle over 0.267 s. A
++// pose is drawn as is (whole: its matrices are absolute, in camera space)
++// when a matrix moves further or turns more than the cut limits in a tick
++// the state changed in (the few states the game starts without a blend,
++// 824747D8), or more than the bound in any tick. Within one state the pose
++// is continuous, however fast: melee and throws turn the weapon tens of
++// degrees a tick, which a 60 degree limit alone would snap.
+ constexpr float kFpSnapDistance = 0.5f;
+-constexpr float kFpSnapCosine = 0.5f;  // 60 degrees
++constexpr float kFpCutCosine = 0.5f;       // 60 degrees
++constexpr float kFpBoundCosine = -0.866f;  // 150 degrees
++// Per local player: the weight (s16, 1/8192) of the render-time hand IK that
++// puts the left hand on the weapon's marker (sub_82477600 reads it every
++// frame, 824776B0). Only the tick changes it, fading it out and in around the
++// first-person animations that let go of the weapon (melee, grenade throws);
++// the tick's own update (820D72A0) and the slot setup read it back.
++constexpr uint32_t kFpUserHandIkWeight = 0x23B4;
+ 
+ struct ObjectTransform {
+   Vector3 position;
+@@ -204,6 +294,12 @@ struct ObjectTransform {
+   float crouch = 0.0f;  // bipeds only
+ };
+ 
++// What the first-person eye is placed from (bipeds).
++struct UnitAim {
++  Vector3 aiming;
++  Vector3 eye_offset;
++};
++
+ struct ObjectSnapshot {
+   uint16_t salt = 0;
+   uint32_t address = 0;
+@@ -221,6 +317,12 @@ struct ObjectSnapshot {
+   std::vector<Matrix4x3> previous_nodes;
+   std::vector<Matrix4x3> current_nodes;
+   std::vector<Matrix4x3> written_nodes;
++  // Bipeds. Blended with the object, but restored on their own: a change
++  // after our blend keeps the object blended.
++  UnitAim previous_aim;
++  UnitAim current_aim;
++  UnitAim written_aim;
++  bool aim_applied = false;
+   // The renderer rebuilds this object's nodes itself; it isn't blended.
+   bool render_animated = false;
+   // Node turns the renderer added on the first frame after the last tick
+@@ -259,6 +361,27 @@ struct PoseSnapshot {
+   std::array<Matrix4x3, kFpPoseMatrices> previous;
+   std::array<Matrix4x3, kFpPoseMatrices> current;
+   std::array<Matrix4x3, kFpPoseMatrices> written;
++  uint32_t animation_state = 0;
++};
++
++// Per local player, outside the weapon slots.
++struct FpUserSnapshot {
++  uint32_t unit = kNoUnit;
++  bool has_previous = false;
++  bool applied = false;
++  uint16_t previous_ik = 0;
++  uint16_t current_ik = 0;
++  uint16_t written_ik = 0;
++};
++
++// The scripted camera as a tick left it: what it plays.
++struct TickCamera {
++  bool valid = false;
++  int16_t mode = 0;
++  std::array<uint32_t, 12> key = {};
++  uint32_t shot_ticks = 0;
++  uint32_t cinematic_scene = 0;
++  uint32_t cinematic_shot = 0;
+ };
+ 
+ // Only the game's main thread runs ticks and the main loop.
+@@ -271,7 +394,14 @@ struct InterpolationState {
+   std::array<ObjectSnapshot, kMaxObjects> objects;
+   uint32_t first_person = 0;
+   std::array<PoseSnapshot, kLocalPlayers * kFpSlots> poses;
++  std::array<FpUserSnapshot, kLocalPlayers> fp_users;
+   ScriptedCameraSnapshot scripted_camera;
++  TickCamera tick_camera;
++  // Whether the last tick cut to another scripted camera, and the objects
++  // the game moved without blending in the tick running now.
++  bool have_cut_tick = false;
++  uint32_t cut_tick = 0;
++  std::vector<uint32_t> unblended_objects;
+ };
+ InterpolationState* state = nullptr;
+ // Whether the simulation is running: game_update, or a tick from another
+@@ -406,6 +536,31 @@ ObjectTransform BlendTransform(const ObjectTransform& a,
+   return r;
+ }
+ 
++UnitAim LoadAim(cpu::ppc::PPCContext* ctx, uint32_t object) {
++  return {LoadVector3(ctx, object + kUnitAiming),
++          LoadVector3(ctx, object + kBipedEyeOffset)};
++}
++void StoreAim(cpu::ppc::PPCContext* ctx, uint32_t object, const UnitAim& aim) {
++  StoreVector3(ctx, object + kUnitAiming, aim.aiming);
++  StoreVector3(ctx, object + kBipedEyeOffset, aim.eye_offset);
++}
++
++UnitAim BlendAim(const UnitAim& a, const UnitAim& b, float t) {
++  UnitAim r;
++  r.eye_offset = Lerp(a.eye_offset, b.eye_offset, t);
++  r.aiming = b.aiming;
++  if (!SameBits(a.aiming, b.aiming) && IsUnitVector(a.aiming) &&
++      IsUnitVector(b.aiming)) {
++    const Vector3 v = Lerp(a.aiming, b.aiming, t);
++    const float length_squared = Dot(v, v);
++    if (length_squared > 1e-6f) {
++      const float inv = 1.0f / std::sqrt(length_squared);
++      r.aiming = {v.x * inv, v.y * inv, v.z * inv};
++    }
++  }
++  return r;
++}
++
+ std::vector<Matrix4x3>& LoadNodes(cpu::ppc::PPCContext* ctx, uint32_t nodes,
+                                   uint32_t count, std::vector<Matrix4x3>& out) {
+   out.resize(count);
+@@ -425,7 +580,44 @@ bool StillValid(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
+          LoadU16(ctx, o.address + kObjectNodeMatricesOffset) == o.nodes_offset;
+ }
+ 
+-void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
++// The object a handle (salt << 16 | index) refers to, or 0.
++uint32_t ObjectFromHandle(cpu::ppc::PPCContext* ctx, uint32_t data,
++                          uint32_t handle) {
++  const uint32_t index = handle & 0xFFFF;
++  if (handle == kNoObject || index >= state->high_water_mark) {
++    return 0;
++  }
++  const uint32_t header = data + index * kObjectHeaderSize;
++  if (LoadU16(ctx, header + kObjectHeaderSalt) != handle >> 16) {
++    return 0;
++  }
++  return LoadU32(ctx, header + kObjectHeaderAddress);
++}
++
++// Whether the object at `index`, or one it is attached to (a held weapon, a
++// rider), is in `handles`.
++bool AttachedToAny(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
++                   const std::vector<uint32_t>& handles) {
++  const ObjectSnapshot& o = state->objects[index];
++  uint32_t handle = (uint32_t(o.salt) << 16) | index;
++  for (uint32_t depth = 0; depth < kMaxParentDepth; ++depth) {
++    if (std::find(handles.begin(), handles.end(), handle) != handles.end()) {
++      return true;
++    }
++    const uint32_t object = ObjectFromHandle(ctx, data, handle);
++    if (!object) {
++      return false;
++    }
++    handle = LoadU32(ctx, object + kObjectParent);
++    if (handle == kNoObject) {
++      return false;
++    }
++  }
++  return false;
++}
++
++// cut: the tick cut to another camera; nothing is blended into it.
++void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive, bool cut) {
+   const uint32_t array = TlsSlot(ctx, kTlsObjectDataArray);
+   if (!array) {
+     return;
+@@ -489,6 +681,12 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+     o.type = LoadU8(ctx, header + kObjectHeaderType);
+     o.biped = o.type == kObjectTypeBiped;
+     o.current = LoadTransform(ctx, address, o.biped);
++    if (o.biped) {
++      if (same_object) {
++        o.previous_aim = o.current_aim;
++      }
++      o.current_aim = LoadAim(ctx, address);
++    }
+ 
+     // Position is relative to the parent for attached objects (held weapons,
+     // passengers); the root node is in world space, so check both.
+@@ -504,24 +702,35 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+     if (same_object && !within_reach) {
+       stats().teleports++;
+     }
+-    o.has_previous = within_reach;
+-    o.moved = o.has_previous && (!SameBits(o.previous, o.current) ||
+-                                 !SameBits(o.previous_nodes, o.current_nodes));
+-  }
+-}
+-
+-// The object a handle (salt << 16 | index) refers to, or 0.
+-uint32_t ObjectFromHandle(cpu::ppc::PPCContext* ctx, uint32_t data,
+-                          uint32_t handle) {
+-  const uint32_t index = handle & 0xFFFF;
+-  if (handle == kNoObject || index >= state->high_water_mark) {
+-    return 0;
+-  }
+-  const uint32_t header = data + index * kObjectHeaderSize;
+-  if (LoadU16(ctx, header + kObjectHeaderSalt) != handle >> 16) {
+-    return 0;
++    if (within_reach && cut && node_count) {
++      Stats& s = stats();
++      s.cut_objects++;
++      const float move = std::sqrt(DistanceSquared(
++          o.previous_nodes[0].position, o.current_nodes[0].position));
++      float largest = s.cut_largest_move.load();
++      while (move > largest &&
++             !s.cut_largest_move.compare_exchange_weak(largest, move)) {
++      }
++    }
++    o.has_previous = within_reach && !cut;
++    o.moved = o.has_previous &&
++              (!SameBits(o.previous, o.current) ||
++               !SameBits(o.previous_nodes, o.current_nodes) ||
++               (o.biped && !SameBits(o.previous_aim, o.current_aim)));
++  }
++
++  // What the game moved without blending it, and what is attached to that.
++  if (!state->unblended_objects.empty()) {
++    const std::vector<uint32_t>& handles = state->unblended_objects;
++    for (uint32_t i = 0; i < high_water_mark; ++i) {
++      ObjectSnapshot& o = state->objects[i];
++      if (o.has_previous && AttachedToAny(ctx, data, i, handles)) {
++        o.has_previous = false;
++        o.moved = false;
++        stats().unblended_by_game++;
++      }
++    }
+   }
+-  return LoadU32(ctx, header + kObjectHeaderAddress);
+ }
+ 
+ // Index of the object at the top of handle's parent chain (the vehicle a
+@@ -576,6 +785,16 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+         !StillValid(ctx, data, i, o)) {
+       continue;
+     }
++    // Only over the tick's own state: something placed it since (the main
++    // menu's player model is turned every frame, outside the ticks; a
++    // checkpoint load), and that is shown as is until the next tick.
++    if (!SameBits(LoadTransform(ctx, o.address, o.biped), o.current) ||
++        (o.node_count && !SameBits(LoadMatrix(ctx, o.address + o.nodes_offset),
++                                   o.current_nodes[0]))) {
++      o.has_previous = false;
++      stats().placed_between_ticks++;
++      continue;
++    }
+     o.written_nodes.resize(o.node_count);
+     for (uint32_t n = 0; n < o.node_count; ++n) {
+       o.written_nodes[n] =
+@@ -591,6 +810,11 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+     }
+     StoreTransform(ctx, o.address, o.written, o.biped);
+     o.applied = true;
++    if (o.biped && SameBits(LoadAim(ctx, o.address), o.current_aim)) {
++      o.written_aim = BlendAim(o.previous_aim, o.current_aim, alpha);
++      StoreAim(ctx, o.address, o.written_aim);
++      o.aim_applied = true;
++    }
+     stats().blended_objects++;
+   }
+ }
+@@ -609,8 +833,16 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+     }
+     o.applied = false;
+     if (!StillValid(ctx, data, i, o)) {
++      o.aim_applied = false;
+       continue;
+     }
++    if (o.aim_applied) {
++      // Unless something else set it since.
++      o.aim_applied = false;
++      if (SameBits(LoadAim(ctx, o.address), o.written_aim)) {
++        StoreAim(ctx, o.address, o.current_aim);
++      }
++    }
+     const uint32_t nodes = o.address + o.nodes_offset;
+     if (!SameBits(LoadTransform(ctx, o.address, o.biped), o.written) ||
+         !SameBits(LoadNodes(ctx, nodes, o.node_count, guest_nodes),
+@@ -678,6 +910,18 @@ void OnRenderNodesUpdated(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ // First-person weapons.
+ 
++enum class FpSnap { kAnimation, kAny, kOff };
++FpSnap FpSnapMode() {
++  const std::string& mode = cvars::halo3_fp_snap;
++  if (mode == "any") {
++    return FpSnap::kAny;
++  }
++  if (mode == "off") {
++    return FpSnap::kOff;
++  }
++  return FpSnap::kAnimation;
++}
++
+ uint32_t FpSlotAddress(uint32_t first_person, uint32_t pose_index) {
+   const uint32_t user = pose_index / kFpSlots;
+   const uint32_t slot = pose_index % kFpSlots;
+@@ -734,6 +978,9 @@ void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx, bool consecutive) {
+       p.has_previous = false;
+       p.applied = false;
+     }
++    for (auto& u : state->fp_users) {
++      u = FpUserSnapshot();
++    }
+     state->first_person = first_person;
+   }
+   if (!first_person) {
+@@ -763,7 +1010,14 @@ void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx, bool consecutive) {
+         camera_node_index,
+         flags & 0x1F,
+     };
+-    const bool same_pose = consecutive && p.valid && key == p.key;
++    const bool key_changed = p.valid && key != p.key;
++    const bool same_pose = consecutive && p.valid && !key_changed;
++    if (consecutive && key_changed) {
++      stats().fp_pose_changes++;
++    }
++    const uint32_t animation_state = LoadU32(ctx, slot + kFpSlotAnimationState);
++    const bool state_changed = animation_state != p.animation_state;
++    p.animation_state = animation_state;
+     if (same_pose) {
+       p.previous = p.current;
+     }
+@@ -773,23 +1027,72 @@ void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx, bool consecutive) {
+     p.camera_node = camera_node_index != kNoUnit && (flags & 0x10) != 0;
+     LoadPose(ctx, slot, p, p.current);
+ 
+-    bool jumped = false;
+     bool moved = false;
++    bool snap = false;
+     if (same_pose) {
++      // The furthest move and the largest turn of any matrix (NaN counts as
++      // a jump).
++      float distance_squared = 0.0f;
++      float cosine = 1.0f;
++      bool nan = false;
+       ForEachPoseMatrix(p, [&](uint32_t n) {
+         const Matrix4x3& a = p.previous[n];
+         const Matrix4x3& b = p.current[n];
+-        jumped = jumped ||
+-                 DistanceSquared(a.position, b.position) >
+-                     kFpSnapDistance * kFpSnapDistance ||
+-                 Dot(a.forward, b.forward) < kFpSnapCosine ||
+-                 Dot(a.up, b.up) < kFpSnapCosine;
++        const float d = DistanceSquared(a.position, b.position);
++        const float c = std::min(Dot(a.forward, b.forward), Dot(a.up, b.up));
++        nan = nan || !(d == d) || !(c == c);
++        distance_squared = std::max(distance_squared, d);
++        cosine = std::min(cosine, c);
+         moved = moved || !SameBits(a, b);
+       });
++      const bool jumped_far =
++          nan || distance_squared > kFpSnapDistance * kFpSnapDistance;
++      const bool over_cut = jumped_far || cosine < kFpCutCosine;
++      const bool over_bound = jumped_far || cosine < kFpBoundCosine;
++      switch (FpSnapMode()) {
++        case FpSnap::kAny:
++          snap = over_cut;
++          break;
++        case FpSnap::kOff:
++          snap = nan;
++          break;
++        default:
++          snap = over_bound || (state_changed && over_cut);
++          break;
++      }
++      Stats& s = stats();
++      if (over_cut) {
++        s.fp_over_60_degrees++;
++      }
++      if (snap) {
++        s.fp_snaps++;
++      }
++      if (!nan) {
++        const uint32_t degrees = static_cast<uint32_t>(
++            std::acos(std::clamp(cosine, -1.0f, 1.0f)) * 57.29578f + 0.5f);
++        uint32_t worst = s.fp_worst_turn_degrees.load();
++        while (degrees > worst &&
++               !s.fp_worst_turn_degrees.compare_exchange_weak(worst, degrees)) {
++        }
++      }
+     }
+-    p.has_previous = same_pose && !jumped;
++    p.has_previous = same_pose && !snap;
+     p.moved = p.has_previous && moved;
+   }
++  // The hand IK blends with the weapon pose it holds (slot 0): not across a
++  // weapon change, where the slot setup puts the hand back on at once.
++  for (uint32_t u = 0; u < kLocalPlayers; ++u) {
++    FpUserSnapshot& f = state->fp_users[u];
++    const uint32_t user = first_person + u * kFpUserSize;
++    const uint32_t unit = LoadU32(ctx, user + kFpUserUnit);
++    const uint16_t ik = LoadU16(ctx, user + kFpUserHandIkWeight);
++    f.applied = false;
++    f.has_previous = consecutive && unit != kNoUnit && unit == f.unit &&
++                     state->poses[u * kFpSlots].has_previous;
++    f.previous_ik = f.current_ik;
++    f.current_ik = ik;
++    f.unit = unit;
++  }
+ }
+ 
+ void BlendFirstPerson(cpu::ppc::PPCContext* ctx, float alpha) {
+@@ -815,6 +1118,21 @@ void BlendFirstPerson(cpu::ppc::PPCContext* ctx, float alpha) {
+     p.applied = true;
+     stats().blended_poses++;
+   }
++  for (uint32_t u = 0; u < kLocalPlayers; ++u) {
++    FpUserSnapshot& f = state->fp_users[u];
++    const uint32_t address =
++        state->first_person + u * kFpUserSize + kFpUserHandIkWeight;
++    if (!f.has_previous || f.applied || f.previous_ik == f.current_ik ||
++        LoadU16(ctx, address) != f.current_ik) {
++      continue;
++    }
++    const float a = static_cast<int16_t>(f.previous_ik);
++    const float b = static_cast<int16_t>(f.current_ik);
++    f.written_ik = static_cast<uint16_t>(
++        static_cast<int16_t>(std::lround(a + (b - a) * alpha)));
++    xe::store_and_swap<uint16_t>(ctx->TranslateVirtual(address), f.written_ik);
++    f.applied = true;
++  }
+ }
+ 
+ void RestoreFirstPerson(cpu::ppc::PPCContext* ctx) {
+@@ -837,6 +1155,20 @@ void RestoreFirstPerson(cpu::ppc::PPCContext* ctx) {
+     }
+     StorePose(ctx, slot, p, p.current);
+   }
++  for (uint32_t u = 0; u < kLocalPlayers; ++u) {
++    FpUserSnapshot& f = state->fp_users[u];
++    if (!f.applied) {
++      continue;
++    }
++    f.applied = false;
++    const uint32_t address =
++        state->first_person + u * kFpUserSize + kFpUserHandIkWeight;
++    if (LoadU16(ctx, address) != f.written_ik) {
++      f.has_previous = false;
++      continue;
++    }
++    xe::store_and_swap<uint16_t>(ctx->TranslateVirtual(address), f.current_ik);
++  }
+ }
+ 
+ // Camera facing.
+@@ -863,6 +1195,103 @@ void RestoreExactFacing(cpu::ppc::PPCContext* ctx) {
+   }
+ }
+ 
++// A facing the game took over, per local player: before and after, and the
++// tick it followed. Main thread only.
++struct FacingTakeover {
++  bool pending = false;
++  bool active = false;
++  uint32_t tick = 0;
++  float yaw_before = 0.0f;
++  float pitch_before = 0.0f;
++  float yaw_after = 0.0f;
++  float pitch_after = 0.0f;
++};
++std::array<FacingTakeover, kLocalPlayers> facing_takeovers;
++
++// The live state of local player r28, if r29 is it.
++uint32_t TakeoverPlayer(cpu::ppc::PPCContext* ctx, uint32_t* live) {
++  const uint32_t u = static_cast<uint32_t>(ctx->r[28]);
++  const uint32_t controls = TlsSlot(ctx, kTlsPlayerControl);
++  if (u >= kLocalPlayers || !controls ||
++      static_cast<uint32_t>(ctx->r[29]) !=
++          controls + kPlayerControlLive + u * kPlayerControlLiveSize) {
++    return kLocalPlayers;
++  }
++  *live = static_cast<uint32_t>(ctx->r[29]);
++  return u;
++}
++
++void OnFacingTakenOver(cpu::ppc::PPCContext* ctx, void*) {
++  if (!OnMainThread(ctx)) {
++    return;
++  }
++  stats().facing_takeovers++;
++  uint32_t live = 0;
++  const uint32_t u = TakeoverPlayer(ctx, &live);
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  if (u >= kLocalPlayers || InGameUpdate(ctx) || !time_globals) {
++    return;
++  }
++  FacingTakeover& t = facing_takeovers[u];
++  t.pending = true;
++  t.active = false;
++  t.tick = ElapsedTicks(ctx, time_globals);
++  t.yaw_before = LoadF32(ctx, live + kPlayerControlYaw);
++  t.pitch_before = LoadF32(ctx, live + kPlayerControlPitch);
++}
++
++void OnFacingTakenOverDone(cpu::ppc::PPCContext* ctx, void*) {
++  uint32_t live = 0;
++  const uint32_t u = TakeoverPlayer(ctx, &live);
++  if (!OnMainThread(ctx) || u >= kLocalPlayers ||
++      !facing_takeovers[u].pending) {
++    return;
++  }
++  FacingTakeover& t = facing_takeovers[u];
++  t.pending = false;
++  t.yaw_after = LoadF32(ctx, live + kPlayerControlYaw);
++  t.pitch_after = LoadF32(ctx, live + kPlayerControlPitch);
++  t.active = std::isfinite(t.yaw_before) && std::isfinite(t.pitch_before) &&
++             std::isfinite(t.yaw_after) && std::isfinite(t.pitch_after);
++}
++
++// After RestoreExactFacing: until the next tick, the drawn facing takes the
++// turn a takeover made gradually (plus the mouse's turn since).
++void BlendFacingTakeovers(cpu::ppc::PPCContext* ctx, float alpha) {
++  const uint32_t controls = TlsSlot(ctx, kTlsPlayerControl);
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  for (uint32_t u = 0; u < kLocalPlayers; ++u) {
++    FacingTakeover& t = facing_takeovers[u];
++    if (!t.active) {
++      continue;
++    }
++    if (!controls || !time_globals || alpha < 0.0f ||
++        ElapsedTicks(ctx, time_globals) != t.tick) {
++      t.active = false;
++      continue;
++    }
++    const uint32_t live =
++        controls + kPlayerControlLive + u * kPlayerControlLiveSize;
++    const uint32_t camera =
++        controls + kPlayerControlCamera + u * kPlayerControlCameraSize;
++    const uint32_t unit = LoadU32(ctx, live + kPlayerControlUnit);
++    if (unit == kNoUnit || unit != LoadU32(ctx, camera + kPlayerControlUnit)) {
++      continue;
++    }
++    float turn = std::remainder(t.yaw_after - t.yaw_before, kTwoPi);
++    float yaw = std::fmod(
++        LoadF32(ctx, live + kPlayerControlYaw) - (1.0f - alpha) * turn, kTwoPi);
++    if (yaw < 0.0f) {
++      yaw += kTwoPi;
++    }
++    const float pitch = LoadF32(ctx, live + kPlayerControlPitch) -
++                        (1.0f - alpha) * (t.pitch_after - t.pitch_before);
++    StoreF32(ctx, camera + kPlayerControlYaw, yaw);
++    StoreF32(ctx, camera + kPlayerControlPitch, pitch);
++    stats().facing_takeovers_blended++;
++  }
++}
++
+ // Stats: whether local player 0's vehicle (the top of its unit's parent
+ // chain) was blended in this frame.
+ void CountPlayerVehicle(cpu::ppc::PPCContext* ctx) {
+@@ -919,6 +1348,8 @@ void OnFollowingCameraCenter(cpu::ppc::PPCContext* ctx, void*) {
+       static_cast<uint32_t>(ctx->r[31]) + kFollowingCameraCenterPoint);
+ }
+ 
++void ShowTickAsIs(cpu::ppc::PPCContext* ctx);
++
+ CameraPose LoadCameraPose(cpu::ppc::PPCContext* ctx, uint32_t command) {
+   return {LoadVector3(ctx, command + kCameraCommandPosition),
+           LoadF32(ctx, command + kCameraCommandFov),
+@@ -933,6 +1364,21 @@ void StoreCameraPose(cpu::ppc::PPCContext* ctx, uint32_t command,
+   StoreVector3(ctx, command + kCameraCommandUp, pose.up);
+ }
+ 
++CameraPose BlendCameraPose(const CameraPose& a, const CameraPose& b, float t) {
++  CameraPose r;
++  r.position = Lerp(a.position, b.position, t);
++  r.fov = a.fov + (b.fov - a.fov) * t;
++  if (IsUnitVector(a.forward) && IsUnitVector(a.up) &&
++      IsUnitVector(b.forward) && IsUnitVector(b.up)) {
++    InterpolateOrientation(a.forward, a.up, b.forward, b.up, t, &r.forward,
++                           &r.up);
++  } else {
++    r.forward = b.forward;
++    r.up = b.up;
++  }
++  return r;
++}
++
+ bool IsCameraCut(const CameraPose& a, const CameraPose& b) {
+   return DistanceSquared(a.position, b.position) >
+              kCameraCutDistance * kCameraCutDistance ||
+@@ -979,12 +1425,13 @@ void OnScriptedCameraTail(cpu::ppc::PPCContext* ctx, void*) {
+     camera.valid = false;
+     return;
+   }
+-  const bool new_command =
+-      LoadU8(ctx, globals + kScriptedCameraNewCommand) != 0;
++  // (The globals' new-command byte isn't a cut on its own: the Cortana
++  // effect's texture camera sets it too, 824879DC. A shot set again is
++  // found at the tick, DetectScriptedCut.)
+   const uint32_t tick = ElapsedTicks(ctx, time_globals);
+   const std::array<uint32_t, 7> key = ScriptedCameraKey(ctx, globals, mode);
+   const CameraPose pose = LoadCameraPose(ctx, command);
+-  if (!camera.valid || new_command || key != camera.key) {
++  if (!camera.valid || key != camera.key) {
+     // A new camera (a cut the script made).
+     if (camera.valid) {
+       stats().scripted_camera_cuts++;
+@@ -998,15 +1445,31 @@ void OnScriptedCameraTail(cpu::ppc::PPCContext* ctx, void*) {
+   }
+   if (tick != camera.tick) {
+     // The first frame after a tick: the command holds the new tick's camera.
++    // After several ticks in one frame, blend from where the camera was a
++    // tick ago, as the objects do.
++    const uint32_t ticks = tick - camera.tick;
++    CameraPose previous = camera.current;
++    if (ticks > 1 && ticks <= kCameraCatchUpTicks) {
++      previous = BlendCameraPose(camera.current, pose,
++                                 float(ticks - 1) / float(ticks));
++    }
++    // (A jump is judged against what was shown, with one tick's limits.)
+     const bool jumped = IsCameraCut(camera.current, pose);
+-    const bool cut = tick != camera.tick + 1 || jumped;
++    // The tick's scripts cut to another camera (DetectScriptedCut), and the
++    // objects show the tick as is.
++    const bool scripted_cut = state->have_cut_tick && state->cut_tick == tick;
++    const bool cut = ticks > kCameraCatchUpTicks || jumped || scripted_cut;
+     if (cut) {
+       stats().scripted_camera_cuts++;
+     }
+     if (jumped) {
+       stats().scripted_camera_jumps++;
++      if (!scripted_cut) {
++        // Found only now: the objects were blended into this frame already.
++        ShowTickAsIs(ctx);
++      }
+     }
+-    camera.previous = camera.current;
++    camera.previous = previous;
+     camera.current = pose;
+     camera.has_previous = !cut;
+     camera.tick = tick;
+@@ -1024,25 +1487,84 @@ void OnScriptedCameraTail(cpu::ppc::PPCContext* ctx, void*) {
+   if (alpha < 0.0f) {
+     return;
+   }
+-  CameraPose blend;
+-  blend.position =
+-      Lerp(camera.previous.position, camera.current.position, alpha);
+-  blend.fov =
+-      camera.previous.fov + (camera.current.fov - camera.previous.fov) * alpha;
+-  if (IsUnitVector(camera.previous.forward) &&
+-      IsUnitVector(camera.previous.up) &&
+-      IsUnitVector(camera.current.forward) && IsUnitVector(camera.current.up)) {
+-    InterpolateOrientation(camera.previous.forward, camera.previous.up,
+-                           camera.current.forward, camera.current.up, alpha,
+-                           &blend.forward, &blend.up);
+-  } else {
+-    blend.forward = camera.current.forward;
+-    blend.up = camera.current.up;
+-  }
+-  StoreCameraPose(ctx, command, blend);
++  StoreCameraPose(ctx, command,
++                  BlendCameraPose(camera.previous, camera.current, alpha));
+   stats().scripted_camera_blends++;
+ }
+ 
++// Whether the tick that just ran cut to another scripted camera: read from
++// the camera's globals, which the scripts set (in the same tick as they
++// re-stage the actors for the new shot) before the objects update and the
++// camera's own update (game_tick: 820A3BEC, 820A3C34, 820A3E24). A new
++// camera point (mode 1) set without a move, another camera animation (mode
++// 3), another cinematic shot or the same one set again (mode 5), the
++// cinematic's own shot, or another mode: all but a camera transition (mode
++// 2) or a point the observer moves to, which start from the camera as it
++// was.
++bool DetectScriptedCut(cpu::ppc::PPCContext* ctx) {
++  TickCamera& last = state->tick_camera;
++  const uint32_t globals = TlsSlot(ctx, kTlsScriptedCamera);
++  if (!globals) {
++    last.valid = false;
++    return false;
++  }
++  TickCamera now;
++  now.valid = true;
++  now.mode = static_cast<int16_t>(LoadU16(ctx, globals + kScriptedCameraMode));
++  auto word = [&](uint32_t offset) { return LoadU32(ctx, globals + offset); };
++  now.key[0] = static_cast<uint16_t>(now.mode);
++  switch (now.mode) {
++    case 1:
++      for (uint32_t i = 0; i < 9; ++i) {
++        now.key[1 + i] = word(kScriptedCameraPoint + i * 4);
++      }
++      now.key[10] = word(kScriptedCameraPointObject);
++      break;
++    case 3:
++    case 5: {
++      const std::array<uint32_t, 7> key =
++          ScriptedCameraKey(ctx, globals, now.mode);
++      std::copy(key.begin(), key.end(), now.key.begin());
++      if (now.mode == 5) {
++        now.shot_ticks = word(kScriptedCameraShotTicks);
++      }
++      break;
++    }
++    default:
++      break;
++  }
++  const uint32_t cinematic = TlsSlot(ctx, kTlsCinematic);
++  if (cinematic) {
++    now.cinematic_scene = LoadU32(ctx, cinematic + kCinematicScene);
++    now.cinematic_shot = LoadU32(ctx, cinematic + kCinematicShot);
++  }
++  bool cut = false;
++  if (last.valid) {
++    Stats& s = stats();
++    if (now.mode != last.mode || now.key != last.key) {
++      if (now.mode == 1 && word(kScriptedCameraPointTransition) != 0) {
++        s.cuts_skipped_camera_moves++;
++      } else if (now.mode != 2) {
++        cut = true;
++        (now.mode != last.mode ? s.cuts_by_camera_mode : s.cuts_by_camera)++;
++      }
++    } else if (now.mode == 5 &&
++               (now.shot_ticks < last.shot_ticks ||
++                (now.shot_ticks == 1 && last.shot_ticks != 0))) {
++      // Set again: counted from 0 again, to 1 by the end of the tick.
++      cut = true;
++      s.cuts_by_camera++;
++    }
++    if (!cut && (now.cinematic_scene != last.cinematic_scene ||
++                 now.cinematic_shot != last.cinematic_shot)) {
++      cut = true;
++      s.cuts_by_cinematic++;
++    }
++  }
++  last = now;
++  return cut;
++}
++
+ // Hooks.
+ 
+ void Restore(cpu::ppc::PPCContext* ctx) {
+@@ -1053,14 +1575,85 @@ void Restore(cpu::ppc::PPCContext* ctx) {
+   RestoreFirstPerson(ctx);
+ }
+ 
++// Everything shows the tick as is from now to the next tick: a cut found
++// only once the frame was blended (the camera jumped). Before the observer,
++// the first-person frame and the frame's publication read the objects.
++void ShowTickAsIs(cpu::ppc::PPCContext* ctx) {
++  Restore(ctx);
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    state->objects[i].has_previous = false;
++  }
++  for (auto& p : state->poses) {
++    p.has_previous = false;
++  }
++  for (auto& u : state->fp_users) {
++    u.has_previous = false;
++  }
++  stats().cuts_after_blend++;
++}
++
+ void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
+   in_game_update = true;
+   // Normally already done at the start of the frame.
+   Restore(ctx);
+ }
+ 
++// At a tick's start (our restore has run): objects placed since the last
++// snapshot (the main menu's player model, turned by the UI every frame
++// before the ticks) are drawn as the tick leaves them, not blended from the
++// last snapshot.
++void FindObjectsPlacedBetweenTicks(cpu::ppc::PPCContext* ctx) {
++  if (!state->object_array ||
++      TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
++    return;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    const ObjectSnapshot& o = state->objects[i];
++    if (!o.salt || !StillValid(ctx, data, i, o)) {
++      continue;
++    }
++    if (!SameBits(LoadTransform(ctx, o.address, o.biped), o.current) ||
++        (o.node_count && !SameBits(LoadMatrix(ctx, o.address + o.nodes_offset),
++                                   o.current_nodes[0]))) {
++      state->unblended_objects.push_back((uint32_t(o.salt) << 16) | i);
++      stats().placed_between_ticks++;
++    }
++  }
++}
++
+ void OnGameTickEntry(cpu::ppc::PPCContext* ctx, void*) {
+   in_game_update = true;
++  if (state) {
++    state->unblended_objects.clear();
++    // (Only where the UI places objects: the main menu.)
++    const uint32_t options = TlsSlot(ctx, kTlsGameOptions);
++    if (Enabled() && state->have_tick && options &&
++        LoadU32(ctx, options + kGameOptionsMode) == kGameModeMainMenu) {
++      FindObjectsPlacedBetweenTicks(ctx);
++    }
++  }
++}
++
++// The game moved an object without blending it in this tick.
++void MarkUnblended(cpu::ppc::PPCContext* ctx, uint32_t handle) {
++  if (!state || handle == kNoObject || !InGameUpdate(ctx)) {
++    return;
++  }
++  if (std::find(state->unblended_objects.begin(),
++                state->unblended_objects.end(),
++                handle) == state->unblended_objects.end()) {
++    state->unblended_objects.push_back(handle);
++  }
++}
++void OnUnitAnimationCut(cpu::ppc::PPCContext* ctx, void*) {
++  MarkUnblended(ctx, static_cast<uint32_t>(ctx->r[31]));
++}
++void OnSceneryAnimationStart(cpu::ppc::PPCContext* ctx, void*) {
++  MarkUnblended(ctx, static_cast<uint32_t>(ctx->r[28]));
++}
++void OnObjectTeleport(cpu::ppc::PPCContext* ctx, void*) {
++  MarkUnblended(ctx, static_cast<uint32_t>(ctx->r[3]));
+ }
+ 
+ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+@@ -1069,6 +1662,7 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+   if (!Enabled()) {
+     if (state) {
+       state->have_tick = false;
++      state->unblended_objects.clear();
+     }
+     return;
+   }
+@@ -1090,8 +1684,15 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+   }
+   state->have_tick = true;
+   state->tick = tick;
+-  SnapshotObjects(ctx, consecutive);
+-  SnapshotFirstPerson(ctx, consecutive);
++  const bool cut = DetectScriptedCut(ctx);
++  state->have_cut_tick = cut;
++  state->cut_tick = tick;
++  if (cut) {
++    stats().cut_ticks++;
++  }
++  SnapshotObjects(ctx, consecutive, cut);
++  SnapshotFirstPerson(ctx, consecutive && !cut);
++  state->unblended_objects.clear();
+ }
+ 
+ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+@@ -1112,6 +1713,7 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+   }
+   BlendObjects(ctx, alpha);
+   BlendFirstPerson(ctx, alpha);
++  BlendFacingTakeovers(ctx, alpha);
+   if (cvars::halo3_log_stats) {
+     CountPlayerVehicle(ctx);
+   }
+@@ -1129,6 +1731,7 @@ void InstallInterpolation(KernelState* kernel_state) {
+   // A relaunch starts from a clean slate.
+   delete state;
+   state = nullptr;
++  facing_takeovers = {};
+   auto& hooks = cpu::GuestHooks::Get();
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kGameUpdateEntry, OnGameUpdateEntry);
+@@ -1141,6 +1744,14 @@ void InstallInterpolation(KernelState* kernel_state) {
+   hooks.Add(processor, kDriverCameraFocus, OnDriverCameraFocus);
+   hooks.Add(processor, kFollowingCameraCenter, OnFollowingCameraCenter);
+   hooks.Add(processor, kScriptedCameraTail, OnScriptedCameraTail);
++  hooks.Add(processor, kUnitAnimationCut, OnUnitAnimationCut);
++  hooks.Add(processor, kSceneryAnimationStart, OnSceneryAnimationStart);
++  hooks.Add(processor, kObjectTeleport, OnObjectTeleport);
++  hooks.Add(processor, kAiTeleport, OnObjectTeleport);
++  hooks.Add(processor, kAiTeleportVehicle, OnObjectTeleport);
++  hooks.Add(processor, kCommandScriptTeleport, OnObjectTeleport);
++  hooks.Add(processor, kFacingTakenOver, OnFacingTakenOver);
++  hooks.Add(processor, kFacingTakenOverDone, OnFacingTakenOverDone);
+ }
+ 
+ }  // namespace halo3

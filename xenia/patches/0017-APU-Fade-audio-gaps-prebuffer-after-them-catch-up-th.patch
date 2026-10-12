@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [APU] Fade audio gaps, prebuffer after them, catch up; thread
+ priorities
+
+When the game's audio falls behind (loads, shader compilation), the XAudio2
+voice runs dry and plays silence until the next frame arrives, then
+restarts at full level with one frame of margin, so it keeps running dry:
+the output is chopped into hard-edged fragments, heard as a buzz or
+screech.
+
+- XAudio2 (drivers of AudioSystem clients, apu_prebuffer_frames > 0): when
+  a processing pass reports bytes required, queue a fade out made of the
+  last frame played backwards under a raised cosine (apu_fade_ms, 3 ms), so
+  the output continues from its last sample down to zero. Then hold new
+  frames until apu_prebuffer_frames (3) are there and fade the first in.
+  Only XAudio2's report of a short pass counts as running dry, not an
+  empty queue (the last frame can end exactly with a pass). The XAudio2
+  thread only try-locks against SubmitFrame and skips the fade if a frame
+  was submitted meanwhile; a short pass during a submit is only counted.
+  Fade outs alternate between two buffers and don't release the client
+  semaphore. The frequency ratio is set only when it changes. Media player
+  drivers are unchanged.
+- AudioSystem: the pump cadence never runs ahead, so every late pump
+  lowered the output queue until it ran dry. After each pump, while the
+  driver's queue is below apu_prebuffer_frames, request up to
+  apu_max_catchup_frames (2) more frames at once, from a token per regular
+  pump; the cadence is unchanged.
+- apu_raise_thread_priority (default on): the XMA decoder thread runs at
+  priority 24 like the Audio Worker (host highest), and guest threads based
+  at priority 15 or higher (Halo 3: AUDIO, XAudio2's and the Waves
+  library's threads) get the host's highest priority instead of normal; the
+  guest-visible priority is unchanged.
+- thread_priority_floor_normal (Kernel, default on): no thread runs below
+  the host's normal priority. Xenia maps the guest priority 0 that Halo 3
+  gives its RENDER, ASYNC_IO and NET_DEBUG threads to the host's lowest,
+  where they starve behind shader compilation on every core while holding
+  locks (the global critical region among them) that audio and drawing
+  wait for. Before April 2026 Xenia ran every guest thread at normal.
+- Counters (audio_stats.h, header only): regular and catch-up pumps, late
+  and slow pumps with the slowest, runs dry with and without a fade,
+  resumes, and the fewest frames queued; Halo 3's stats log them.
+---
+ src/xenia/apu/apu_flags.cc                    |  26 +-
+ src/xenia/apu/apu_flags.h                     |   6 +-
+ src/xenia/apu/audio_driver.h                  |   3 +
+ src/xenia/apu/audio_stats.h                   |  49 ++++
+ src/xenia/apu/audio_system.cc                 |  53 +++-
+ src/xenia/apu/audio_system.h                  |   2 +
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.cc | 250 +++++++++++++++---
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.h  |  40 +++
+ src/xenia/apu/xaudio2/xaudio2_audio_system.cc |   8 +
+ src/xenia/apu/xma_decoder.cc                  |   6 +
+ src/xenia/kernel/title/halo3/halo3.cc         |  12 +
+ src/xenia/kernel/xthread.cc                   |  38 ++-
+ 12 files changed, 449 insertions(+), 44 deletions(-)
+ create mode 100644 src/xenia/apu/audio_stats.h
+
+diff --git a/src/xenia/apu/apu_flags.cc b/src/xenia/apu/apu_flags.cc
+index 1be7bf5..6e02965 100644
+--- a/src/xenia/apu/apu_flags.cc
++++ b/src/xenia/apu/apu_flags.cc
+@@ -9,4 +9,28 @@
+ 
+ #include "xenia/apu/apu_flags.h"
+ 
+-DEFINE_bool(mute, false, "Mutes all audio output.", "APU")
++DEFINE_bool(mute, false, "Mutes all audio output.", "APU");
++
++DEFINE_int32(apu_prebuffer_frames, 3,
++             "When audio output runs dry (the game's audio fell behind), fade "
++             "the last samples out instead of cutting off, and resume, with "
++             "a fade in, only once this many 5.3 ms frames are queued again. "
++             "Turns stutter into fewer, softer gaps. 0 restores the original "
++             "behaviour. XAudio2 only.",
++             "APU");
++DEFINE_double(apu_fade_ms, 3.0,
++              "Length of the fade out and fade in around an audio gap, in "
++              "milliseconds (at most 5.3).",
++              "APU");
++DEFINE_int32(apu_max_catchup_frames, 2,
++             "After the audio worker was late, request up to this many extra "
++             "frames from the game right away while the output queue is "
++             "below apu_prebuffer_frames, instead of letting the queue run "
++             "dry later. 0 disables it.",
++             "APU");
++DEFINE_bool(apu_raise_thread_priority, true,
++            "Run the XMA decoder, and guest threads that ask for priority 15 "
++            "or higher (in games usually the audio threads), at the host's "
++            "highest thread priority, so audio keeps up while shaders "
++            "compile or the game loads.",
++            "APU");
+diff --git a/src/xenia/apu/apu_flags.h b/src/xenia/apu/apu_flags.h
+index d48a32d..61166ca 100644
+--- a/src/xenia/apu/apu_flags.h
++++ b/src/xenia/apu/apu_flags.h
+@@ -11,6 +11,10 @@
+ #define XENIA_APU_APU_FLAGS_H_
+ 
+ #include "xenia/base/cvar.h"
+-DECLARE_bool(mute)
++DECLARE_bool(mute);
++DECLARE_int32(apu_prebuffer_frames);
++DECLARE_double(apu_fade_ms);
++DECLARE_int32(apu_max_catchup_frames);
++DECLARE_bool(apu_raise_thread_priority);
+ 
+ #endif  // XENIA_APU_APU_FLAGS_H_
+diff --git a/src/xenia/apu/audio_driver.h b/src/xenia/apu/audio_driver.h
+index c7a4101..b3db4c7 100644
+--- a/src/xenia/apu/audio_driver.h
++++ b/src/xenia/apu/audio_driver.h
+@@ -34,6 +34,9 @@ class AudioDriver {
+   virtual void Pause() = 0;
+   virtual void Resume() = 0;
+   virtual void SetVolume(float volume) = 0;
++  // Frames submitted and not played yet, or UINT32_MAX if the driver doesn't
++  // know.
++  virtual uint32_t QueuedFrames() { return UINT32_MAX; }
+ };
+ 
+ }  // namespace apu
+diff --git a/src/xenia/apu/audio_stats.h b/src/xenia/apu/audio_stats.h
+new file mode 100644
+index 0000000..1ad0917
+--- /dev/null
++++ b/src/xenia/apu/audio_stats.h
+@@ -0,0 +1,49 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_APU_AUDIO_STATS_H_
++#define XENIA_APU_AUDIO_STATS_H_
++
++#include <atomic>
++#include <cstdint>
++
++namespace xe {
++namespace apu {
++
++// Counters for the audio output path, for titles that log performance
++// statistics; readers exchange them with 0. Header only, so any library can
++// read them without linking the audio code.
++struct AudioStats {
++  // AudioSystem worker: guest audio callbacks run on the regular cadence and
++  // as catch-up after a late one, callbacks that started more than 1 ms late,
++  // and callbacks that took longer than a frame (5.3 ms), with the longest.
++  std::atomic<uint32_t> pumps{0};
++  std::atomic<uint32_t> catchup_pumps{0};
++  std::atomic<uint32_t> late_pumps{0};
++  std::atomic<uint32_t> slow_pumps{0};
++  std::atomic<uint32_t> slowest_pump_us{0};
++  // Output (XAudio2 with apu_prebuffer_frames): times it ran dry with a fade
++  // out, passes that started short while a frame was being submitted (no
++  // fade out; the frame may still have been in time), and resumes after
++  // prebuffering; the fewest frames queued after a frame was submitted.
++  std::atomic<uint32_t> underruns{0};
++  std::atomic<uint32_t> hard_underruns{0};
++  std::atomic<uint32_t> resumes{0};
++  std::atomic<uint32_t> min_queued_frames{UINT32_MAX};
++};
++
++inline AudioStats& audio_stats() {
++  static AudioStats stats;
++  return stats;
++}
++
++}  // namespace apu
++}  // namespace xe
++
++#endif  // XENIA_APU_AUDIO_STATS_H_
+diff --git a/src/xenia/apu/audio_system.cc b/src/xenia/apu/audio_system.cc
+index fb66ee9..d97c78f 100644
+--- a/src/xenia/apu/audio_system.cc
++++ b/src/xenia/apu/audio_system.cc
+@@ -9,10 +9,13 @@
+ 
+ #include "xenia/apu/audio_system.h"
+ 
++#include <algorithm>
++#include <chrono>
+ #include <limits>
+ 
+ #include "xenia/apu/apu_flags.h"
+ #include "xenia/apu/audio_driver.h"
++#include "xenia/apu/audio_stats.h"
+ #include "xenia/apu/xma_decoder.h"
+ #include "xenia/base/assert.h"
+ #include "xenia/base/byte_stream.h"
+@@ -184,8 +187,54 @@ void AudioSystem::WorkerThreadMain() {
+ 
+       SCOPE_profile_cpu_i("apu", "xe::apu::AudioSystem->client_callback");
+       uint64_t args[] = {client_callback_arg};
+-      processor_->Execute(worker_thread_->thread_state(), client_callback, args,
+-                          xe::countof(args));
++      AudioStats& stats = audio_stats();
++      const auto pump = [&]() {
++        const auto pump_start = std::chrono::steady_clock::now();
++        processor_->Execute(worker_thread_->thread_state(), client_callback,
++                            args, xe::countof(args));
++        const uint64_t pump_us =
++            uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
++                         std::chrono::steady_clock::now() - pump_start)
++                         .count());
++        if (pump_us > kAudioPumpInterval) {
++          stats.slow_pumps.fetch_add(1, std::memory_order_relaxed);
++          uint32_t slowest =
++              stats.slowest_pump_us.load(std::memory_order_relaxed);
++          while (pump_us > slowest &&
++                 !stats.slowest_pump_us.compare_exchange_weak(
++                     slowest, uint32_t(pump_us), std::memory_order_relaxed)) {
++          }
++        }
++      };
++      const uint64_t pump_start_us = static_cast<uint64_t>(
++          std::chrono::duration_cast<std::chrono::microseconds>(
++              std::chrono::steady_clock::now().time_since_epoch())
++              .count());
++      if (pump_start_us > earliest_pump_us + 1000) {
++        stats.late_pumps.fetch_add(1, std::memory_order_relaxed);
++      }
++      stats.pumps.fetch_add(1, std::memory_order_relaxed);
++      pump();
++
++      // The cadence never runs ahead of itself, so each late pump lowers the
++      // output queue for good, until it runs dry. While the queue is below
++      // the prebuffer target, request a few extra frames right away; this
++      // only refills it, it doesn't move the cadence.
++      auto& client = clients_[client_index];
++      const uint32_t max_catchup =
++          uint32_t(std::max(cvars::apu_max_catchup_frames, 0));
++      client.catchup_tokens = std::min(client.catchup_tokens + 1, max_catchup);
++      const uint32_t target =
++          uint32_t(std::max(cvars::apu_prebuffer_frames, 0));
++      while (client.catchup_tokens && client.driver &&
++             client.driver->QueuedFrames() < target &&
++             xe::threading::Wait(client_semaphores_[client_index].get(), false,
++                                 std::chrono::milliseconds(0)) ==
++                 xe::threading::WaitResult::kSuccess) {
++        --client.catchup_tokens;
++        stats.catchup_pumps.fetch_add(1, std::memory_order_relaxed);
++        pump();
++      }
+     }
+   }
+   worker_running_ = false;
+diff --git a/src/xenia/apu/audio_system.h b/src/xenia/apu/audio_system.h
+index 1a715e4..5cd68ae 100644
+--- a/src/xenia/apu/audio_system.h
++++ b/src/xenia/apu/audio_system.h
+@@ -90,6 +90,8 @@ class AudioSystem {
+     uint32_t wrapped_callback_arg;
+     bool in_use;
+     std::mutex lock;
++    // Extra pumps allowed to refill the output queue after a late one.
++    uint32_t catchup_tokens = 0;
+   } clients_[kMaximumClientCount];
+ 
+   int FindFreeClient();
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+index 5332b1b..8b8d360 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+@@ -9,7 +9,11 @@
+ 
+ #include "xenia/apu/xaudio2/xaudio2_audio_driver.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include "xenia/apu/apu_flags.h"
++#include "xenia/apu/audio_stats.h"
+ #include "xenia/apu/conversion.h"
+ #include "xenia/apu/xaudio2/xaudio2_api.h"
+ #include "xenia/base/assert.h"
+@@ -24,23 +28,21 @@ namespace xaudio2 {
+ 
+ class XAudio2AudioDriver::VoiceCallback : public api::IXAudio2VoiceCallback {
+  public:
+-  explicit VoiceCallback(xe::threading::Semaphore* semaphore)
+-      : semaphore_(semaphore) {}
++  explicit VoiceCallback(XAudio2AudioDriver* driver) : driver_(driver) {}
+   ~VoiceCallback() {}
+ 
+   void OnStreamEnd() noexcept {}
+   void OnVoiceProcessingPassEnd() noexcept {}
+-  void OnVoiceProcessingPassStart(uint32_t samples_required) noexcept {}
+-  void OnBufferEnd(void* context) noexcept {
+-    auto ret = semaphore_->Release(1, nullptr);
+-    assert_true(ret);
++  void OnVoiceProcessingPassStart(uint32_t bytes_required) noexcept {
++    driver_->OnVoiceProcessingPassStart(bytes_required);
+   }
++  void OnBufferEnd(void* context) noexcept { driver_->OnBufferEnd(context); }
+   void OnBufferStart(void* context) noexcept {}
+   void OnLoopEnd(void* context) noexcept {}
+   void OnVoiceError(void* context, HRESULT result) noexcept {}
+ 
+  private:
+-  xe::threading::Semaphore* semaphore_ = nullptr;
++  XAudio2AudioDriver* driver_ = nullptr;
+ };
+ 
+ XAudio2AudioDriver::XAudio2AudioDriver(xe::threading::Semaphore* semaphore,
+@@ -68,7 +70,7 @@ XAudio2AudioDriver::XAudio2AudioDriver(xe::threading::Semaphore* semaphore,
+ XAudio2AudioDriver::~XAudio2AudioDriver() = default;
+ 
+ bool XAudio2AudioDriver::Initialize() {
+-  voice_callback_ = new VoiceCallback(semaphore_);
++  voice_callback_ = new VoiceCallback(this);
+ 
+   // Load the XAudio2 DLL dynamically. Needed both for 2.7 and for
+   // differentiating between 2.8 and later versions. Windows 8.1 SDK references
+@@ -202,38 +204,34 @@ bool XAudio2AudioDriver::InitializeObjects(Objects& objects) {
+   return true;
+ }
+ 
+-void XAudio2AudioDriver::SubmitFrame(float* frame) {
+-  HRESULT hr;
+-
+-  api::XAUDIO2_VOICE_STATE state;
+-  if (api_minor_version_ >= 8) {
+-    objects_.api_2_8.pcm_voice->GetState(&state,
+-                                         api::XE_XAUDIO2_VOICE_NOSAMPLESPLAYED);
+-  } else {
+-    objects_.api_2_7.pcm_voice->GetState(&state);
+-  }
+-  assert_true(state.BuffersQueued < frame_count_);
+-
+-  auto output_frame = reinterpret_cast<float*>(frames_[current_frame_]);
++void XAudio2AudioDriver::EnableUnderrunSmoothing(uint32_t prebuffer_frames,
++                                                 uint32_t fade_samples) {
++  smoothing_ = prebuffer_frames != 0;
++  prebuffer_frames_ = std::min(prebuffer_frames, frame_count_ / 2);
++  fade_samples_ = std::min(fade_samples, channel_samples_);
++}
+ 
+-  if (need_format_conversion_) {
+-    // Convert planar big endian samples into interleaved little endian.
+-    conversion::sequential_6_BE_to_interleaved_6_LE(output_frame, frame,
+-                                                    channel_samples_);
+-  } else {
+-    memcpy(output_frame, frame, frame_size_);
++uint32_t XAudio2AudioDriver::QueuedFrames() {
++  if (!smoothing_) {
++    return UINT32_MAX;
+   }
++  std::lock_guard<std::mutex> lock(smoothing_mutex_);
++  return queued_frames_.load(std::memory_order_acquire) + held_count_;
++}
+ 
++bool XAudio2AudioDriver::SubmitBuffer(const float* samples,
++                                      uint32_t sample_frames, void* context) {
+   api::XAUDIO2_BUFFER buffer;
+   buffer.Flags = 0;
+-  buffer.pAudioData = reinterpret_cast<BYTE*>(output_frame);
+-  buffer.AudioBytes = frame_size_;
++  buffer.pAudioData = reinterpret_cast<const BYTE*>(samples);
++  buffer.AudioBytes = UINT32(sizeof(float) * frame_channels_ * sample_frames);
+   buffer.PlayBegin = 0;
+-  buffer.PlayLength = channel_samples_;
++  buffer.PlayLength = sample_frames;
+   buffer.LoopBegin = api::XE_XAUDIO2_NO_LOOP_REGION;
+   buffer.LoopLength = 0;
+   buffer.LoopCount = 0;
+-  buffer.pContext = 0;
++  buffer.pContext = context;
++  HRESULT hr;
+   if (api_minor_version_ >= 8) {
+     hr = objects_.api_2_8.pcm_voice->SubmitSourceBuffer(&buffer);
+   } else {
+@@ -241,18 +239,196 @@ void XAudio2AudioDriver::SubmitFrame(float* frame) {
+   }
+   if (FAILED(hr)) {
+     XELOGE("SubmitSourceBuffer failed with 0x{:08X}", hr);
++    return false;
++  }
++  return true;
++}
++
++void XAudio2AudioDriver::OnBufferEnd(void* context) {
++  // Fade outs (context set) don't hold a frame of the semaphore.
++  if (context) {
++    return;
++  }
++  if (smoothing_) {
++    queued_frames_.fetch_sub(1, std::memory_order_acq_rel);
++  }
++  auto ret = semaphore_->Release(1, nullptr);
++  assert_true(ret);
++}
++
++void XAudio2AudioDriver::OnVoiceProcessingPassStart(uint32_t bytes_required) {
++  // A non-zero count means the queued frames don't cover this pass. Anything
++  // submitted after this returns is too late for it, so queue a fade out
++  // that continues from the last sample instead of the output cutting off.
++  if (!smoothing_ || !bytes_required || !fade_samples_) {
++    return;
++  }
++  const uint32_t frames_submitted =
++      frames_submitted_.load(std::memory_order_acquire);
++  // Never wait here. If SubmitFrame holds the lock, a frame is arriving now,
++  // which may still be in time for this pass; if not, the pass ends early
++  // without a fade, as without smoothing.
++  std::unique_lock<std::mutex> lock(smoothing_mutex_, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    audio_stats().hard_underruns.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  if (!playing_ || last_frame_ >= frame_count_ ||
++      frames_submitted_.load(std::memory_order_acquire) != frames_submitted) {
++    // Already dry, or a frame was submitted while this waited for the lock.
+     return;
+   }
++  // The last frame played backwards from its last sample, under a raised
++  // cosine: no step at the join and none at the end.
++  const float* last = frames_[last_frame_];
++  float* fade_out = fade_out_[fade_out_next_];
++  fade_out_next_ ^= 1;
++  for (uint32_t i = 0; i < fade_samples_; ++i) {
++    const float gain = 0.5f * (1.0f + std::cos(3.14159265f * float(i + 1) /
++                                               float(fade_samples_ + 1)));
++    const float* source = last + (channel_samples_ - 1 - i) * frame_channels_;
++    float* target = fade_out + i * frame_channels_;
++    for (uint32_t c = 0; c < frame_channels_; ++c) {
++      target[c] = source[c] * gain;
++    }
++  }
++  SubmitBuffer(fade_out, fade_samples_, fade_out);
++  playing_ = false;
++  audio_stats().underruns.fetch_add(1, std::memory_order_relaxed);
++}
++
++void XAudio2AudioDriver::SubmitFrame(float* frame) {
++  if (!smoothing_) {
++    HRESULT hr;
++
++    api::XAUDIO2_VOICE_STATE state;
++    if (api_minor_version_ >= 8) {
++      objects_.api_2_8.pcm_voice->GetState(
++          &state, api::XE_XAUDIO2_VOICE_NOSAMPLESPLAYED);
++    } else {
++      objects_.api_2_7.pcm_voice->GetState(&state);
++    }
++    assert_true(state.BuffersQueued < frame_count_);
+ 
++    auto output_frame = reinterpret_cast<float*>(frames_[current_frame_]);
++
++    if (need_format_conversion_) {
++      // Convert planar big endian samples into interleaved little endian.
++      conversion::sequential_6_BE_to_interleaved_6_LE(output_frame, frame,
++                                                      channel_samples_);
++    } else {
++      memcpy(output_frame, frame, frame_size_);
++    }
++
++    api::XAUDIO2_BUFFER buffer;
++    buffer.Flags = 0;
++    buffer.pAudioData = reinterpret_cast<BYTE*>(output_frame);
++    buffer.AudioBytes = frame_size_;
++    buffer.PlayBegin = 0;
++    buffer.PlayLength = channel_samples_;
++    buffer.LoopBegin = api::XE_XAUDIO2_NO_LOOP_REGION;
++    buffer.LoopLength = 0;
++    buffer.LoopCount = 0;
++    buffer.pContext = 0;
++    if (api_minor_version_ >= 8) {
++      hr = objects_.api_2_8.pcm_voice->SubmitSourceBuffer(&buffer);
++    } else {
++      hr = objects_.api_2_7.pcm_voice->SubmitSourceBuffer(&buffer);
++    }
++    if (FAILED(hr)) {
++      XELOGE("SubmitSourceBuffer failed with 0x{:08X}", hr);
++      return;
++    }
++
++    current_frame_ = (current_frame_ + 1) % frame_count_;
++
++    // Update playback ratio to our time scalar.
++    // This will keep audio in sync with the game clock.
++    float frequency_ratio = static_cast<float>(xe::Clock::guest_time_scalar());
++    if (api_minor_version_ >= 8) {
++      objects_.api_2_8.pcm_voice->SetFrequencyRatio(frequency_ratio);
++    } else {
++      objects_.api_2_7.pcm_voice->SetFrequencyRatio(frequency_ratio);
++    }
++    return;
++  }
++
++  AudioStats& stats = audio_stats();
++  std::lock_guard<std::mutex> lock(smoothing_mutex_);
++  // The semaphore keeps the frames in flight, held ones included, at most
++  // frame_count_, so this slot has finished playing.
++  const uint32_t index = current_frame_;
+   current_frame_ = (current_frame_ + 1) % frame_count_;
++  float* output_frame = frames_[index];
++  if (need_format_conversion_) {
++    // Convert planar big endian samples into interleaved little endian.
++    conversion::sequential_6_BE_to_interleaved_6_LE(output_frame, frame,
++                                                    channel_samples_);
++  } else {
++    memcpy(output_frame, frame, frame_size_);
++  }
+ 
+-  // Update playback ratio to our time scalar.
+-  // This will keep audio in sync with the game clock.
+-  float frequency_ratio = static_cast<float>(xe::Clock::guest_time_scalar());
+-  if (api_minor_version_ >= 8) {
+-    objects_.api_2_8.pcm_voice->SetFrequencyRatio(frequency_ratio);
++  // An empty queue alone doesn't mean the output ran dry: the last frame
++  // can end exactly with a pass, and this one may be in time for the next.
++  // XAudio2's thread decides that when a pass starts short.
++  if (playing_) {
++    if (SubmitBuffer(output_frame, channel_samples_, nullptr)) {
++      queued_frames_.fetch_add(1, std::memory_order_acq_rel);
++      frames_submitted_.fetch_add(1, std::memory_order_acq_rel);
++      last_frame_ = index;
++    } else {
++      semaphore_->Release(1, nullptr);
++    }
+   } else {
+-    objects_.api_2_7.pcm_voice->SetFrequencyRatio(frequency_ratio);
++    if (!held_count_) {
++      held_first_ = index;
++    }
++    ++held_count_;
++    if (held_count_ >= prebuffer_frames_) {
++      // Fade the first held frame in with the rising half of the raised
++      // cosine.
++      float* first = frames_[held_first_];
++      for (uint32_t i = 0; i < fade_samples_; ++i) {
++        const float gain = 0.5f * (1.0f - std::cos(3.14159265f * float(i + 1) /
++                                                   float(fade_samples_ + 1)));
++        float* target = first + i * frame_channels_;
++        for (uint32_t c = 0; c < frame_channels_; ++c) {
++          target[c] *= gain;
++        }
++      }
++      for (uint32_t i = 0; i < held_count_; ++i) {
++        const uint32_t held = (held_first_ + i) % frame_count_;
++        if (SubmitBuffer(frames_[held], channel_samples_, nullptr)) {
++          queued_frames_.fetch_add(1, std::memory_order_acq_rel);
++          frames_submitted_.fetch_add(1, std::memory_order_acq_rel);
++          last_frame_ = held;
++        } else {
++          semaphore_->Release(1, nullptr);
++        }
++      }
++      held_count_ = 0;
++      playing_ = true;
++      stats.resumes.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++  const uint32_t queued =
++      queued_frames_.load(std::memory_order_relaxed) + held_count_;
++  uint32_t min_queued = stats.min_queued_frames.load(std::memory_order_relaxed);
++  while (queued < min_queued &&
++         !stats.min_queued_frames.compare_exchange_weak(
++             min_queued, queued, std::memory_order_relaxed)) {
++  }
++
++  // Keep audio in sync with the game clock.
++  const float frequency_ratio =
++      static_cast<float>(xe::Clock::guest_time_scalar());
++  if (frequency_ratio != frequency_ratio_) {
++    frequency_ratio_ = frequency_ratio;
++    if (api_minor_version_ >= 8) {
++      objects_.api_2_8.pcm_voice->SetFrequencyRatio(frequency_ratio);
++    } else {
++      objects_.api_2_7.pcm_voice->SetFrequencyRatio(frequency_ratio);
++    }
+   }
+ }
+ 
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+index f7382bd..4e5f2b8 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+@@ -10,6 +10,7 @@
+ #ifndef XENIA_APU_XAUDIO2_XAUDIO2_AUDIO_DRIVER_H_
+ #define XENIA_APU_XAUDIO2_XAUDIO2_AUDIO_DRIVER_H_
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <mutex>
+ #include <thread>
+@@ -47,6 +48,14 @@ class XAudio2AudioDriver : public AudioDriver {
+   void Resume() override;
+   void SetVolume(float volume) override;
+   void Shutdown() override;
++  uint32_t QueuedFrames() override;
++
++  // Before Initialize: when the output runs dry, play a short fade out of the
++  // last samples instead of a hard cut, then hold new frames until
++  // prebuffer_frames are queued and fade them in. Only for drivers fed at the
++  // output rate by AudioSystem.
++  void EnableUnderrunSmoothing(uint32_t prebuffer_frames,
++                               uint32_t fade_samples);
+ 
+  private:
+   // First CPU (2.8 default). XAUDIO2_ANY_PROCESSOR (2.7 default) steals too
+@@ -64,6 +73,12 @@ class XAudio2AudioDriver : public AudioDriver {
+ 
+   void MTAThread();
+ 
++  bool SubmitBuffer(const float* samples, uint32_t sample_frames,
++                    void* context);
++  // XAudio2's thread.
++  void OnVoiceProcessingPassStart(uint32_t bytes_required);
++  void OnBufferEnd(void* context);
++
+   void* xaudio2_module_ = nullptr;
+   // clang-format off
+   HRESULT (__stdcall* xaudio2_create_)(
+@@ -110,6 +125,31 @@ class XAudio2AudioDriver : public AudioDriver {
+ 
+   float frames_[frame_count_][kFrameSamplesMax];
+   uint32_t current_frame_ = 0;
++
++  // Underrun smoothing, set up before Initialize.
++  bool smoothing_ = false;
++  uint32_t prebuffer_frames_ = 0;
++  uint32_t fade_samples_ = 0;
++  // Guards the state below between SubmitFrame and XAudio2's thread, which
++  // only ever try-locks it.
++  std::mutex smoothing_mutex_;
++  // Playing: frames are submitted as they come. Dry: the output ran out (or
++  // hasn't started); frames are held until prebuffer_frames_ are there.
++  bool playing_ = false;
++  // Frames converted into frames_ but not submitted yet, from held_first_.
++  uint32_t held_first_ = 0;
++  uint32_t held_count_ = 0;
++  // The frames_ index of the last frame submitted, for the fade out.
++  uint32_t last_frame_ = UINT32_MAX;
++  // Frames submitted and not finished playing (fade outs not counted).
++  std::atomic<uint32_t> queued_frames_{0};
++  // Frames submitted, so XAudio2's thread can tell one arrived while it
++  // waited for the lock.
++  std::atomic<uint32_t> frames_submitted_{0};
++  // Alternated, so a fade out is never rewritten while still queued.
++  float fade_out_[2][kFrameSamplesMax];
++  uint32_t fade_out_next_ = 0;
++  float frequency_ratio_ = 0.0f;
+ };
+ 
+ }  // namespace xaudio2
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_system.cc b/src/xenia/apu/xaudio2/xaudio2_audio_system.cc
+index 0984805..959b2b3 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_system.cc
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_system.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "xenia/apu/xaudio2/xaudio2_audio_system.h"
+ 
++#include <algorithm>
++
+ #include "xenia/apu/apu_flags.h"
+ #include "xenia/apu/xaudio2/xaudio2_audio_driver.h"
+ 
+@@ -33,6 +35,12 @@ X_STATUS XAudio2AudioSystem::CreateDriver(size_t index,
+                                           AudioDriver** out_driver) {
+   assert_not_null(out_driver);
+   auto driver = std::make_unique<XAudio2AudioDriver>(semaphore);
++  if (cvars::apu_prebuffer_frames > 0) {
++    const double fade_samples = std::clamp(cvars::apu_fade_ms, 0.0, 10.0) *
++                                (AudioDriver::kFrameFrequencyDefault / 1000.0);
++    driver->EnableUnderrunSmoothing(uint32_t(cvars::apu_prebuffer_frames),
++                                    uint32_t(fade_samples));
++  }
+   if (!driver->Initialize()) {
+     driver->Shutdown();
+     return X_STATUS_UNSUCCESSFUL;
+diff --git a/src/xenia/apu/xma_decoder.cc b/src/xenia/apu/xma_decoder.cc
+index ca06f8c..a57a039 100644
+--- a/src/xenia/apu/xma_decoder.cc
++++ b/src/xenia/apu/xma_decoder.cc
+@@ -9,6 +9,8 @@
+ 
+ #include "xenia/apu/xma_decoder.h"
+ 
++#include "xenia/apu/apu_flags.h"
++
+ #include "xenia/apu/xma_context.h"
+ #include "xenia/apu/xma_context_fake.h"
+ #include "xenia/apu/xma_context_master.h"
+@@ -188,6 +190,10 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
+   worker_thread_->set_name("XMA Decoder");
+   worker_thread_->set_can_debugger_suspend(true);
+   worker_thread_->Create();
++  if (cvars::use_dedicated_xma_thread && cvars::apu_raise_thread_priority) {
++    // Guest audio waits for every decode, so it is on the audio path.
++    worker_thread_->SetPriority(24);
++  }
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 0268d72..0ef2bdf 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++#include "xenia/apu/audio_stats.h"
+ #include "xenia/base/byte_order.h"
+ #include "xenia/base/clock.h"
+ #include "xenia/base/logging.h"
+@@ -140,6 +141,17 @@ void LogStats() {
+       double(s.cap_sleep_us.exchange(0)) / 1000.0,
+       double(s.cap_spin_us.exchange(0)) / 1000.0,
+       per(s.cap_late_us.exchange(0), cap_waits));
++  apu::AudioStats& a = apu::audio_stats();
++  const uint32_t min_queued = a.min_queued_frames.exchange(UINT32_MAX);
++  XELOGI(
++      "Halo 3 audio: {} frames requested and {} more to catch up, {} late, {} "
++      "slow (slowest {:.1f} ms); output ran dry {} times with a fade ({} "
++      "without), resumed {} times; fewest frames queued {}",
++      a.pumps.exchange(0), a.catchup_pumps.exchange(0),
++      a.late_pumps.exchange(0), a.slow_pumps.exchange(0),
++      a.slowest_pump_us.exchange(0) / 1000.0, a.underruns.exchange(0),
++      a.hard_underruns.exchange(0), a.resumes.exchange(0),
++      min_queued == UINT32_MAX ? 0 : min_queued);
+   // The GPU command processor thread, in percent of the interval. Executing
+   // includes the swaps, which include the presents, and the waits for the
+   // host GPU and for guest memory (WAIT_REG_MEM).
+diff --git a/src/xenia/kernel/xthread.cc b/src/xenia/kernel/xthread.cc
+index 7164390..4dde861 100644
+--- a/src/xenia/kernel/xthread.cc
++++ b/src/xenia/kernel/xthread.cc
+@@ -27,6 +27,14 @@
+ 
+ DEFINE_bool(ignore_thread_priorities, false,
+             "Ignores game-specified thread priorities.", "Kernel");
++DEFINE_bool(thread_priority_floor_normal, true,
++            "Run threads that ask for a low priority (in Halo 3 the render "
++            "and file streaming threads) at the host's normal priority rather "
++            "than below it. Otherwise, while shaders compile on every core, "
++            "they can stall holding a lock that audio or drawing waits for. "
++            "Has no effect with ignore_thread_priorities.",
++            "Kernel");
++DECLARE_bool(apu_raise_thread_priority);
+ UPDATE_from_bool(ignore_thread_priorities, 2026, 4, 9, 12, true);
+ DEFINE_bool(ignore_thread_affinities, true,
+             "Ignores game-specified thread affinities.", "Kernel");
+@@ -707,6 +715,23 @@ static int32_t GuestPriorityToHost(int32_t guest_priority) {
+   }
+ }
+ 
++// The host priority for a thread at guest_priority whose base priority is
++// base_priority. Guest threads based at 15 or higher (in games usually the
++// audio threads, which Xenon runs ahead of nearly everything) would otherwise
++// run at the host's normal priority, level with shader compilation and
++// loading; apu_raise_thread_priority gives them the host's highest.
++// thread_priority_floor_normal keeps every thread at least at normal.
++static int32_t HostPriority(int32_t guest_priority, int32_t base_priority) {
++  if (cvars::apu_raise_thread_priority && base_priority >= 15) {
++    return xe::threading::ThreadPriority::kHighest;
++  }
++  const int32_t host_priority = GuestPriorityToHost(guest_priority);
++  if (cvars::thread_priority_floor_normal) {
++    return std::max(host_priority, xe::threading::ThreadPriority::kNormal);
++  }
++  return host_priority;
++}
++
+ void XThread::SetPriority(int32_t increment) {
+   // Clamp to valid Xenon priority range.  Negative values can arrive via
+   // KeSetBasePriorityThread (signed offset from process base).
+@@ -718,7 +743,14 @@ void XThread::SetPriority(int32_t increment) {
+   base_priority_ = clamped;
+   quantum_start_ms_ = Clock::QueryHostUptimeMillis();
+   if (!cvars::ignore_thread_priorities) {
+-    thread_->set_priority(GuestPriorityToHost(clamped));
++    const int32_t host_priority = HostPriority(clamped, base_priority_);
++    if (is_guest_thread() && host_priority != GuestPriorityToHost(clamped)) {
++      XELOGI(
++          "Thread {} (guest priority {}) runs at host priority {} instead "
++          "of {}",
++          thread_name_, clamped, host_priority, GuestPriorityToHost(clamped));
++    }
++    thread_->set_priority(host_priority);
+   }
+ }
+ 
+@@ -760,7 +792,7 @@ void XThread::CheckQuantumAndDecay() {
+     if (is_guest_thread()) {
+       guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(new_priority);
+     }
+-    thread_->set_priority(GuestPriorityToHost(new_priority));
++    thread_->set_priority(HostPriority(new_priority, base_priority_));
+   }
+   quantum_start_ms_ = now;
+ }
+@@ -814,7 +846,7 @@ void XThread::BoostOnWake(int32_t increment) {
+       if (is_guest_thread()) {
+         guest_object<X_KTHREAD>()->priority = static_cast<uint8_t>(priority_);
+       }
+-      thread_->set_priority(GuestPriorityToHost(priority_));
++      thread_->set_priority(HostPriority(priority_, base_priority_));
+     }
+   }
+ 

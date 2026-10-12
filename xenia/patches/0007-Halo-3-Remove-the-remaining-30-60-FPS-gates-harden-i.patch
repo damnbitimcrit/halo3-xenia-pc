@@ -1,0 +1,525 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Remove the remaining 30/60 FPS gates, harden
+ interpolation
+
+Frame rate:
+- The outer main loop (sub_821A9790) waited for a vblank whenever none had
+  happened since its previous pass, capping the loop at the guest vblank
+  rate (60 Hz). That wait is skipped now (821A9810).
+- In a game, a loop pass only rendered if a tick ran, so at most 30 frames
+  per second were drawn. Every pass now gets render reason 0x100, as in the
+  menus (821A9524).
+- Loading screens, drawn by the render thread while 82948F68 is 1, keep
+  the original pacing.
+- The frame-rate cap now waits at the start of the main loop body, before
+  input is read, instead of after it.
+
+Interpolation:
+- The real state is restored at the start of the frame, so checkpoint
+  saves, loads and map changes in the main loop body never see blended
+  poses (the game_update entry restore stays as a fallback).
+- Snapshots are only blended if no tick ran unseen between them (elapsed
+  tick counter), so loads, reverts and ticks run by other drivers start
+  over instead of blending stale poses into new objects.
+- Object validity also checks the node block size and offset, teleports
+  are also detected on the world-space root node (attached objects), and a
+  blend factor of 0 draws the previous tick instead of the last one.
+
+The main loop body entry hook is shared: pacing, then restore, then mouse
+input.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        |  18 ++++
+ src/xenia/kernel/title/halo3/halo3.h         |  11 ++
+ src/xenia/kernel/title/halo3/halo3_frame.cc  |  60 +++++++++--
+ src/xenia/kernel/title/halo3/halo3_input.cc  |  20 ++--
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 104 +++++++++++++------
+ 5 files changed, 161 insertions(+), 52 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 7e049ed..336a35d 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -10,6 +10,8 @@
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
+ #include "xenia/base/logging.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/kernel/kernel_state.h"
+ 
+ DEFINE_bool(halo3_unlock_framerate, false,
+             "Halo 3: remove the 30 FPS cap. The simulation keeps running at "
+@@ -25,12 +27,28 @@ namespace xe {
+ namespace kernel {
+ namespace title {
+ namespace halo3 {
++namespace {
++
++// Main loop body (sub_821A8ED8) entry: once per frame, before input is read
++// and before the simulation runs.
++constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
++
++void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
++  // Wait first so input is sampled as late as possible.
++  OnPacingFrameStart(ctx);
++  OnInterpolationFrameStart(ctx);
++  OnInputFrameStart(ctx);
++}
++
++}  // namespace
+ 
+ void Install(KernelState* kernel_state, UserModule* module) {
+   XELOGI("Halo 3 (TU0) detected; installing hooks");
+   InstallFramePacing(kernel_state);
+   InstallInterpolation(kernel_state);
+   InstallInput(kernel_state);
++  cpu::GuestHooks::Get().Add(kernel_state->processor(), kMainLoopBodyEntry,
++                             OnMainLoopBodyEntry);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 541acb8..acd7e6a 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -13,6 +13,7 @@
+ #include <cstdint>
+ 
+ #include "xenia/base/cvar.h"
++#include "xenia/cpu/ppc/ppc_context.h"
+ 
+ DECLARE_bool(halo3_unlock_framerate);
+ DECLARE_int32(halo3_framerate_limit);
+@@ -32,12 +33,22 @@ constexpr uint64_t kModuleHash = 0x19EB90F06A070ED6ull;
+ 
+ void Install(KernelState* kernel_state, UserModule* module);
+ 
++// Each title file installs its own hooks. The start of the main loop body
++// (once per frame, before input and the simulation) is shared, so halo3.cc
++// hooks it and calls the On*FrameStart functions in order.
++
+ // halo3_frame.cc
+ void InstallFramePacing(KernelState* kernel_state);
++// Waits for the frame-rate cap.
++void OnPacingFrameStart(cpu::ppc::PPCContext* ctx);
+ // halo3_interp.cc
+ void InstallInterpolation(KernelState* kernel_state);
++// Puts the real simulation state back over the previous frame's blend.
++void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx);
+ // halo3_input.cc
+ void InstallInput(KernelState* kernel_state);
++// Takes the mouse motion for this frame.
++void OnInputFrameStart(cpu::ppc::PPCContext* ctx);
+ 
+ }  // namespace halo3
+ }  // namespace title
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index d913c8f..6125781 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -17,14 +17,23 @@
+ // elapsed time: game_time_update (820983E0) converts dt into whole 30 Hz ticks
+ // and carries the fraction in game_time_globals+0x14.
+ //
+-// To unlock the frame rate we skip both vblank waits and feed
+-// main_time_update's result from the host clock instead of the vblank
+-// counter, so dt stays exact at any frame rate and the simulation speed is
+-// unchanged. Everything is decided per frame from cvars, because the per-game
+-// config is only loaded after the title module (and these hooks) are set up.
++// Two more gates hold gameplay at 30 / 60 FPS: the outer main loop
++// (sub_821A9790) waits for a vblank whenever none has happened since its
++// previous pass, and a pass only renders if the frame has a reason to
++// (TLS[0xD0] flags); in a game that is only when a tick ran.
++//
++// To unlock the frame rate we skip the three vblank waits, render on every
++// pass, and feed main_time_update's result from the host clock instead of the
++// vblank counter, so dt stays exact at any frame rate and the simulation
++// speed is unchanged. The frame-rate cap is a host-side wait at the start of
++// the frame, before input is read. Loading screens, drawn by the render
++// thread, keep the original pacing. Everything is decided per frame from
++// cvars, because the per-game config is only loaded after the title module
++// (and these hooks) are set up.
+ 
+ #include <cstdint>
+ 
++#include "xenia/base/byte_order.h"
+ #include "xenia/base/clock.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/threading.h"
+@@ -46,6 +55,14 @@ constexpr uint32_t kMainTimeWaitBranch = 0x8208870C;
+ constexpr uint32_t kMainTimeDtComputed = 0x820887B0;
+ // Present (821924C0): `beq cr6, present`, taken when throttling is disabled.
+ constexpr uint32_t kPresentWaitBranch = 0x821924EC;
++// Main loop (sub_821A9790): `bne cr6, no_wait` after testing the never-set
++// debug byte 828A1EF3; taken skips the wait for the next vblank.
++constexpr uint32_t kOuterLoopWaitBranch = 0x821A9810;
++// sub_821A9558: `bne cr6` after `bl sub_82088800`; not taken sets render
++// reason 0x100 (as in menus), so the pass renders even without a new tick.
++constexpr uint32_t kRenderReasonBranch = 0x821A9524;
++// 1 while the render thread draws a loading screen, 0 in game and menus.
++constexpr uint32_t kRenderThreadModeAddress = 0x82948F68;
+ 
+ // Only the game's main thread runs main_time_update.
+ struct FramePacer {
+@@ -81,12 +98,24 @@ void WaitForFrameDeadline(uint64_t frequency) {
+   pacer.deadline += period;
+ }
+ 
+-// Runs right before a `beq cr6` that skips a vblank wait: force it taken.
+-void SkipVblankWait(cpu::ppc::PPCContext* ctx, void*) {
+-  if (cvars::halo3_unlock_framerate) {
++bool Unlocked(cpu::ppc::PPCContext* ctx) {
++  return cvars::halo3_unlock_framerate &&
++         !xe::load_and_swap<uint32_t>(
++             ctx->TranslateVirtual(kRenderThreadModeAddress));
++}
++
++// Run right before a conditional branch on CR6[EQ] to pick its direction:
++// ForceEqual takes a `beq` / falls through a `bne`, ForceNotEqual the reverse.
++void ForceEqual(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked(ctx)) {
+     ctx->cr6.cr6_none_equal = 1;  // CR6[EQ]
+   }
+ }
++void ForceNotEqual(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked(ctx)) {
++    ctx->cr6.cr6_none_equal = 0;
++  }
++}
+ 
+ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+   if (!cvars::halo3_unlock_framerate) {
+@@ -94,7 +123,6 @@ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+     return;
+   }
+   const uint64_t frequency = Clock::guest_tick_frequency();
+-  WaitForFrameDeadline(frequency);
+   const uint64_t now = Clock::QueryGuestTickCount();
+   double dt = 0.0;
+   if (pacer.last_ticks) {
+@@ -106,12 +134,22 @@ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ }  // namespace
+ 
++void OnPacingFrameStart(cpu::ppc::PPCContext* ctx) {
++  if (Unlocked(ctx)) {
++    WaitForFrameDeadline(Clock::guest_tick_frequency());
++  } else {
++    pacer.deadline = 0;
++  }
++}
++
+ void InstallFramePacing(KernelState* kernel_state) {
+   auto& hooks = cpu::GuestHooks::Get();
+   auto processor = kernel_state->processor();
+-  hooks.Add(processor, kMainTimeWaitBranch, SkipVblankWait);
++  hooks.Add(processor, kMainTimeWaitBranch, ForceEqual);
+   hooks.Add(processor, kMainTimeDtComputed, OnMainTimeDtComputed);
+-  hooks.Add(processor, kPresentWaitBranch, SkipVblankWait);
++  hooks.Add(processor, kPresentWaitBranch, ForceEqual);
++  hooks.Add(processor, kOuterLoopWaitBranch, ForceNotEqual);
++  hooks.Add(processor, kRenderReasonBranch, ForceEqual);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3_input.cc b/src/xenia/kernel/title/halo3/halo3_input.cc
+index 9e4a9ac..31a8120 100644
+--- a/src/xenia/kernel/title/halo3/halo3_input.cc
++++ b/src/xenia/kernel/title/halo3/halo3_input.cc
+@@ -55,9 +55,6 @@ namespace title {
+ namespace halo3 {
+ namespace {
+ 
+-// main loop body (sub_821A8ED8) entry: once per frame, before input and
+-// player_control_update.
+-constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
+ // sub_82211EA8, right after "fdivs f0, f29(=1.0), f1(=magnification)" for a
+ // zoomed player: f0 = 1 / magnification. r25 = local player index.
+ constexpr uint32_t kZoomScaleComputed = 0x822125E4;
+@@ -71,7 +68,7 @@ constexpr double kRadiansPerCount = 0.001;
+ // The keyboard and mouse drive local player 0.
+ constexpr uint64_t kMouseLocalPlayer = 0;
+ 
+-// Only touched by the game's main thread, which runs all three hooks.
++// Only touched by the game's main thread, which runs all of these hooks.
+ struct FrameMouse {
+   int32_t dx = 0;
+   int32_t dy = 0;
+@@ -79,13 +76,6 @@ struct FrameMouse {
+   float zoom_scale = 1.0f;
+ } frame_mouse;
+ 
+-void OnMainLoopBody(cpu::ppc::PPCContext* ctx, void*) {
+-  // Motion that the previous frame didn't consume (no player, loading) is
+-  // dropped so it can't turn the view all at once later.
+-  hid::MouseInput::TakeMotion(&frame_mouse.dx, &frame_mouse.dy);
+-  frame_mouse.zoom_scale = 1.0f;
+-}
+-
+ void OnZoomScaleComputed(cpu::ppc::PPCContext* ctx, void*) {
+   if (ctx->r[25] != kMouseLocalPlayer) {
+     return;
+@@ -120,10 +110,16 @@ void OnActionBuilt(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ }  // namespace
+ 
++void OnInputFrameStart(cpu::ppc::PPCContext* ctx) {
++  // Motion that the previous frame didn't consume (no player, loading) is
++  // dropped so it can't turn the view all at once later.
++  hid::MouseInput::TakeMotion(&frame_mouse.dx, &frame_mouse.dy);
++  frame_mouse.zoom_scale = 1.0f;
++}
++
+ void InstallInput(KernelState* kernel_state) {
+   auto& hooks = cpu::GuestHooks::Get();
+   auto* processor = kernel_state->processor();
+-  hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBody);
+   hooks.Add(processor, kZoomScaleComputed, OnZoomScaleComputed);
+   hooks.Add(processor, kActionBuilt, OnActionBuilt);
+ }
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index c9be0cf..66feafc 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -20,8 +20,11 @@
+ // weighted by the fraction of a tick that has elapsed since the last one
+ // (game_time_globals + 0x14). The camera, the first-person view and the
+ // renderer then see smooth motion. Before the next tick runs, the real state
+-// is written back so the simulation never sees blended values. If something
+-// changed a value in between (a respawn, say), its value is kept instead.
++// is written back at the start of the next frame, before the simulation (or a
++// checkpoint save) can see blended values. If something changed a value in
++// between (a respawn, say), its value is kept instead. Snapshots are only
++// blended when they come from two consecutive ticks, so a checkpoint load,
++// revert or map change starts over.
+ //
+ // The ticks also replace the cameras' copy of each player's facing with the
+ // facing quantized for the simulation (13-bit yaw, 12-bit pitch), while frames
+@@ -66,6 +69,7 @@ constexpr uint32_t kTlsPlayerControl = 0x78;
+ constexpr uint32_t kTlsObjectDataArray = 0xA8;
+ constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
+ constexpr uint32_t kTlsFirstPerson = 0x2D8;
++constexpr uint32_t kGameTimeElapsedTicks = 0x0C;
+ constexpr uint32_t kGameTimeTicksLeftover = 0x14;
+ 
+ // s_data_array.
+@@ -137,6 +141,8 @@ struct ObjectTransform {
+ struct ObjectSnapshot {
+   uint16_t salt = 0;
+   uint32_t address = 0;
++  uint16_t nodes_size = 0;
++  uint16_t nodes_offset = 0;
+   uint32_t node_count = 0;
+   bool has_previous = false;
+   bool moved = false;
+@@ -166,6 +172,9 @@ struct PoseSnapshot {
+ 
+ // Only the game's main thread runs ticks and the main loop.
+ struct InterpolationState {
++  // game_time_globals elapsed ticks at the last snapshot.
++  bool have_tick = false;
++  uint32_t tick = 0;
+   uint32_t object_array = 0;
+   uint32_t high_water_mark = 0;
+   std::array<ObjectSnapshot, kMaxObjects> objects;
+@@ -239,15 +248,21 @@ bool Enabled() {
+   return cvars::halo3_unlock_framerate && cvars::halo3_interpolation;
+ }
+ 
+-// Fraction of a tick elapsed since the last one, or 0 to draw the last tick.
++uint32_t ElapsedTicks(cpu::ppc::PPCContext* ctx, uint32_t time_globals) {
++  return LoadU32(ctx, time_globals + kGameTimeElapsedTicks);
++}
++
++// Fraction of a tick elapsed since the last one (0 draws the previous tick,
++// 1 the last one), or a negative value if there is nothing to blend.
+ float BlendFactor(cpu::ppc::PPCContext* ctx) {
+   const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
+-  if (!time_globals) {
+-    return 0.0f;
++  if (!time_globals || !state->have_tick ||
++      ElapsedTicks(ctx, time_globals) != state->tick) {
++    return -1.0f;  // a tick ran that we didn't see
+   }
+   const float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
+-  if (!(alpha > 0.0f)) {
+-    return 0.0f;  // also rejects NaN
++  if (!(alpha >= 0.0f)) {
++    return -1.0f;  // also rejects NaN
+   }
+   return std::min(alpha, 1.0f);
+ }
+@@ -287,10 +302,6 @@ ObjectTransform BlendTransform(const ObjectTransform& a,
+   return r;
+ }
+ 
+-uint32_t ObjectNodes(cpu::ppc::PPCContext* ctx, uint32_t object) {
+-  return object + LoadU16(ctx, object + kObjectNodeMatricesOffset);
+-}
+-
+ std::vector<Matrix4x3>& LoadNodes(cpu::ppc::PPCContext* ctx, uint32_t nodes,
+                                   uint32_t count, std::vector<Matrix4x3>& out) {
+   out.resize(count);
+@@ -305,10 +316,12 @@ bool StillValid(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
+                 const ObjectSnapshot& o) {
+   const uint32_t header = data + index * kObjectHeaderSize;
+   return LoadU16(ctx, header + kObjectHeaderSalt) == o.salt &&
+-         LoadU32(ctx, header + kObjectHeaderAddress) == o.address;
++         LoadU32(ctx, header + kObjectHeaderAddress) == o.address &&
++         LoadU16(ctx, o.address + kObjectNodeMatricesSize) == o.nodes_size &&
++         LoadU16(ctx, o.address + kObjectNodeMatricesOffset) == o.nodes_offset;
+ }
+ 
+-void SnapshotObjects(cpu::ppc::PPCContext* ctx) {
++void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+   const uint32_t array = TlsSlot(ctx, kTlsObjectDataArray);
+   if (!array) {
+     return;
+@@ -344,26 +357,38 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx) {
+       o.has_previous = false;
+       continue;
+     }
+-    const uint32_t node_count = std::min<uint32_t>(
+-        LoadU16(ctx, address + kObjectNodeMatricesSize) / kMatrixSize,
+-        kMaxNodes);
++    const uint16_t nodes_size = LoadU16(ctx, address + kObjectNodeMatricesSize);
++    const uint16_t nodes_offset =
++        LoadU16(ctx, address + kObjectNodeMatricesOffset);
++    const uint32_t node_count =
++        std::min<uint32_t>(nodes_size / kMatrixSize, kMaxNodes);
+ 
+     const bool same_object =
+-        salt == o.salt && address == o.address && node_count == o.node_count;
++        consecutive && salt == o.salt && address == o.address &&
++        nodes_size == o.nodes_size && nodes_offset == o.nodes_offset;
+     if (same_object) {
+       std::swap(o.previous_nodes, o.current_nodes);
+       o.previous = o.current;
+     } else {
+       o.salt = salt;
+       o.address = address;
++      o.nodes_size = nodes_size;
++      o.nodes_offset = nodes_offset;
+       o.node_count = node_count;
+     }
+-    LoadNodes(ctx, ObjectNodes(ctx, address), node_count, o.current_nodes);
++    LoadNodes(ctx, address + nodes_offset, node_count, o.current_nodes);
+     o.current = LoadTransform(ctx, address);
+ 
+-    o.has_previous = same_object &&
+-                     DistanceSquared(o.previous.position, o.current.position) <=
+-                         kTeleportDistance * kTeleportDistance;
++    // Position is relative to the parent for attached objects (held weapons,
++    // passengers); the root node is in world space, so check both.
++    const float teleport_squared = kTeleportDistance * kTeleportDistance;
++    o.has_previous =
++        same_object &&
++        DistanceSquared(o.previous.position, o.current.position) <=
++            teleport_squared &&
++        (!node_count ||
++         DistanceSquared(o.previous_nodes[0].position,
++                         o.current_nodes[0].position) <= teleport_squared);
+     o.moved = o.has_previous && (!SameBits(o.previous, o.current) ||
+                                  !SameBits(o.previous_nodes, o.current_nodes));
+   }
+@@ -387,7 +412,7 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+           Interpolate(o.previous_nodes[n], o.current_nodes[n], alpha);
+     }
+     o.written = BlendTransform(o.previous, o.current, alpha);
+-    const uint32_t nodes = ObjectNodes(ctx, o.address);
++    const uint32_t nodes = o.address + o.nodes_offset;
+     for (uint32_t n = 0; n < o.node_count; ++n) {
+       StoreMatrix(ctx, nodes + n * kMatrixSize, o.written_nodes[n]);
+     }
+@@ -412,7 +437,7 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+     if (!StillValid(ctx, data, i, o)) {
+       continue;
+     }
+-    const uint32_t nodes = ObjectNodes(ctx, o.address);
++    const uint32_t nodes = o.address + o.nodes_offset;
+     if (!SameBits(LoadTransform(ctx, o.address), o.written) ||
+         !SameBits(LoadNodes(ctx, nodes, o.node_count, guest_nodes),
+                   o.written_nodes)) {
+@@ -479,7 +504,7 @@ bool GuestPoseIs(cpu::ppc::PPCContext* ctx, uint32_t slot,
+   return same;
+ }
+ 
+-void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx) {
++void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx, bool consecutive) {
+   const uint32_t first_person = TlsSlot(ctx, kTlsFirstPerson);
+   if (first_person != state->first_person) {
+     for (auto& p : state->poses) {
+@@ -516,7 +541,7 @@ void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx) {
+         camera_node_index,
+         flags & 0x1F,
+     };
+-    const bool same_pose = p.valid && key == p.key;
++    const bool same_pose = consecutive && p.valid && key == p.key;
+     if (same_pose) {
+       p.previous = p.current;
+     }
+@@ -617,7 +642,7 @@ void RestoreExactFacing(cpu::ppc::PPCContext* ctx) {
+ 
+ // Hooks.
+ 
+-void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
++void Restore(cpu::ppc::PPCContext* ctx) {
+   if (!state) {
+     return;
+   }
+@@ -625,15 +650,34 @@ void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
+   RestoreFirstPerson(ctx);
+ }
+ 
++void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
++  // Normally already done at the start of the frame.
++  Restore(ctx);
++}
++
+ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+   if (!Enabled()) {
++    if (state) {
++      state->have_tick = false;
++    }
+     return;
+   }
+   if (!state) {
+     state = new InterpolationState();
+   }
+-  SnapshotObjects(ctx);
+-  SnapshotFirstPerson(ctx);
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  if (!time_globals) {
++    state->have_tick = false;
++    return;
++  }
++  const uint32_t tick = ElapsedTicks(ctx, time_globals);
++  // game_tick only counts ticks in which game time advanced (820A3E48).
++  const bool consecutive =
++      state->have_tick && (tick == state->tick || tick == state->tick + 1);
++  state->have_tick = true;
++  state->tick = tick;
++  SnapshotObjects(ctx, consecutive);
++  SnapshotFirstPerson(ctx, consecutive);
+ }
+ 
+ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+@@ -647,7 +691,7 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+     return;
+   }
+   const float alpha = BlendFactor(ctx);
+-  if (alpha <= 0.0f) {
++  if (alpha < 0.0f) {
+     return;
+   }
+   BlendObjects(ctx, alpha);
+@@ -656,6 +700,8 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ }  // namespace
+ 
++void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx) { Restore(ctx); }
++
+ void InstallInterpolation(KernelState* kernel_state) {
+   // A relaunch starts from a clean slate.
+   delete state;

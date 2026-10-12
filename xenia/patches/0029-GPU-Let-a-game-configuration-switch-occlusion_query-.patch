@@ -1,0 +1,156 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Let a game configuration switch occlusion_query (fast,
+ fast-alt)
+
+occlusion_query is read when the GPU command thread starts, before a
+title's per-game configuration loads, so a value there was ignored
+without a word. After each game configuration load, a callback now
+passes the mode to the GPU thread, which switches at its next swap
+between fast and fast-alt: they differ only in the guess written for
+each new report, so reports in flight are unaffected. Other changes
+(fake, strict) still need the main configuration, and are logged.
+
+Halo 3 needs fast-alt: it uses occlusion queries only for lens flare
+brightness, and fast's guess of one visible sample for hidden reports
+kept small flares of objects behind walls drawn for as long as the
+objects existed.
+---
+ src/xenia/gpu/command_processor.cc | 64 ++++++++++++++++++++++++++++++
+ src/xenia/gpu/command_processor.h  | 11 +++++
+ 2 files changed, 75 insertions(+)
+
+diff --git a/src/xenia/gpu/command_processor.cc b/src/xenia/gpu/command_processor.cc
+index 4b8373c..bf6efa4 100644
+--- a/src/xenia/gpu/command_processor.cc
++++ b/src/xenia/gpu/command_processor.cc
+@@ -15,6 +15,7 @@
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/profiling.h"
++#include "xenia/emulator.h"
+ #include "xenia/gpu/gpu_flags.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/graphics_system.h"
+@@ -215,6 +216,26 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
+   assert_not_null(write_ptr_index_event_);
+ }
+ 
++// occlusion_query is read when the GPU thread starts, before a title's
++// per-game configuration loads, so a value there would be ignored. After each
++// load, this passes the mode to the GPU thread, which switches at its next
++// swap where that's safe.
++class CommandProcessor::ZPDModeConfigCallback
++    : public Emulator::GameConfigLoadCallback {
++ public:
++  ZPDModeConfigCallback(Emulator& emulator, CommandProcessor& command_processor)
++      : Emulator::GameConfigLoadCallback(emulator),
++        command_processor_(command_processor) {}
++
++  void PostGameConfigLoad() override {
++    command_processor_.requested_zpd_mode_.store(int32_t(GetZPDMode()),
++                                                 std::memory_order_release);
++  }
++
++ private:
++  CommandProcessor& command_processor_;
++};
++
+ CommandProcessor::~CommandProcessor() = default;
+ 
+ bool CommandProcessor::Initialize() {
+@@ -237,6 +258,11 @@ bool CommandProcessor::Initialize() {
+     }
+   }
+ 
++  if (kernel_state_ && kernel_state_->emulator()) {
++    zpd_mode_config_callback_ = std::make_unique<ZPDModeConfigCallback>(
++        *kernel_state_->emulator(), *this);
++  }
++
+   worker_running_ = true;
+   worker_thread_ =
+       kernel::object_ref<kernel::XHostThread>(new kernel::XHostThread(
+@@ -1358,6 +1384,44 @@ void CommandProcessor::PrepareZPDForWait() {
+   PumpPendingRetire();
+ }
+ 
++void CommandProcessor::ApplyRequestedZPDMode() {
++  const int32_t requested =
++      requested_zpd_mode_.exchange(-1, std::memory_order_acquire);
++  if (requested < 0 || ZPDMode(requested) == zpd_mode_) {
++    return;
++  }
++  const ZPDMode mode = ZPDMode(requested);
++  const auto mode_name = [](ZPDMode zpd_mode) {
++    switch (zpd_mode) {
++      case ZPDMode::kFake:
++        return "fake";
++      case ZPDMode::kFastAlt:
++        return "fast-alt";
++      case ZPDMode::kStrict:
++        return "strict";
++      default:
++        return "fast";
++    }
++  };
++  // fast and fast-alt differ only in the guess written for each new report
++  // (QueueZPDReport), so they can be switched with reports in flight. The
++  // others query and await reports differently.
++  const auto is_fast = [](ZPDMode zpd_mode) {
++    return zpd_mode == ZPDMode::kFast || zpd_mode == ZPDMode::kFastAlt;
++  };
++  if (is_fast(zpd_mode_) && is_fast(mode)) {
++    XELOGI("occlusion_query: {} from the game configuration",
++           mode_name(mode));
++    zpd_mode_ = mode;
++    return;
++  }
++  XELOGW(
++      "occlusion_query: {} can't replace {} after Xenia has started; only "
++      "fast and fast-alt work in a game configuration, set it in the main "
++      "configuration instead",
++      mode_name(mode), mode_name(zpd_mode_));
++}
++
+ void CommandProcessor::PumpPendingRetire() {
+   bool rebase_needed = false;
+   while (!zpd_reports_.empty()) {
+diff --git a/src/xenia/gpu/command_processor.h b/src/xenia/gpu/command_processor.h
+index 2161db1..da35909 100644
+--- a/src/xenia/gpu/command_processor.h
++++ b/src/xenia/gpu/command_processor.h
+@@ -396,7 +396,11 @@ class CommandProcessor {
+   void EndZPDFrame() {
+     CloseQuerySegment();
+     active_segment_.segment_pending_begin = false;
++    ApplyRequestedZPDMode();
+   }
++  // Switches to the occlusion_query mode of a per-game configuration loaded
++  // after this thread has read the setting, where that's safe at any time.
++  void ApplyRequestedZPDMode();
+   // Splits the open segment when the draw scale or hybrid query Total counting
+   // changes so each segment normalizes with one scale and counts one set of
+   // draws, and when the VIZ ID or survey state changes. Also opens a pending
+@@ -543,6 +547,9 @@ class CommandProcessor {
+   RegisterFile* XE_RESTRICT register_file_ = nullptr;
+ 
+   ZPDMode zpd_mode_ = ZPDMode::kFast;
++  // The occlusion_query mode after a game configuration load (a ZPDMode), or
++  // -1, for ApplyRequestedZPDMode on this thread.
++  std::atomic<int32_t> requested_zpd_mode_{-1};
+ 
+   ReportHandle zpd_next_report_handle_ = 1;
+   // The report the next event will end. No handle means nothing is measuring.
+@@ -632,6 +639,10 @@ class CommandProcessor {
+   SwapPostEffect swap_post_effect_actual_ = SwapPostEffect::kNone;
+ 
+  private:
++  // Passes occlusion_query from per-game configuration to this thread.
++  class ZPDModeConfigCallback;
++  std::unique_ptr<ZPDModeConfigCallback> zpd_mode_config_callback_;
++
+   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
+   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
+   uint32_t gamma_ramp_rw_component_ = 0;

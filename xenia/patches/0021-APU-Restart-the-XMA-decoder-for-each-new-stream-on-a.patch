@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [APU] Restart the XMA decoder for each new stream on a
+ context
+
+Sounds occasionally start with a pop or click while the output never runs
+dry, so the output path delivers a gapless stream; the likelier source is
+the decoder.
+
+Each XMA context keeps one FFmpeg codec context for its whole life, across
+the game's Clear (which it sends right after every XMACreateContext) and
+Release, and only reopens it when the sample rate or channel count changes.
+FFmpeg's XMA (WMA Pro) decoder keeps the second half of each frame's inverse
+MDCT (and the block length) to overlap with the next frame, and has no
+flush. So the first frame of a new sound on a reused context contains the
+windowed tail of whatever that context played last.
+
+Halo 3 rarely uses Clear or Release for a new sound, though: its XAudio
+flushes a voice (sub_82138F38) by zeroing the context's work buffer, where
+the hardware keeps its decoder state, and resetting the input and output
+offsets, then submits the next sound on the same context. XmaContextNew
+also kept the undelivered subframes of the frame it was outputting (up to
+7 blocks, about 9 ms) and wrote them at the start of the next sound.
+
+- XmaContextNew: Clear and Release set reset_codec_; the next decode
+  reopens the codec, as it already does for a format change.
+- Work() writes a mark into the first word of the context's work buffer
+  and treats a mark the game has overwritten like a clear: it drops the
+  pending subframes and loop state and reopens the codec.
+- xma_reset_decoder_per_stream (APU, default true) to compare. The old and
+  master decoders share the codec behaviour and are unchanged.
+---
+ src/xenia/apu/apu_flags.cc       |  7 +++++
+ src/xenia/apu/apu_flags.h        |  1 +
+ src/xenia/apu/xma_context_new.cc | 45 +++++++++++++++++++++++++++++++-
+ src/xenia/apu/xma_context_new.h  | 10 +++++++
+ 4 files changed, 62 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/apu/apu_flags.cc b/src/xenia/apu/apu_flags.cc
+index c54a5bf..afe7d3f 100644
+--- a/src/xenia/apu/apu_flags.cc
++++ b/src/xenia/apu/apu_flags.cc
+@@ -55,3 +55,10 @@ DEFINE_int32(apu_max_queued_frames, 8,
+              "for output, so the audio delay stays bounded however long the "
+              "session. 0 disables it. XAudio2 with apu_prebuffer_frames only.",
+              "APU");
++DEFINE_bool(xma_reset_decoder_per_stream, true,
++            "Restart an XMA context's decoder whenever the game clears or "
++            "releases the context, or zeroes its work buffer to start a new "
++            "stream (the new decoder only). Otherwise the rest of the "
++            "previous sound's last frame and the decoder's overlap from it "
++            "play at the start of the next one, which can click.",
++            "APU");
+diff --git a/src/xenia/apu/apu_flags.h b/src/xenia/apu/apu_flags.h
+index 81b8a1b..ccdf7b1 100644
+--- a/src/xenia/apu/apu_flags.h
++++ b/src/xenia/apu/apu_flags.h
+@@ -19,5 +19,6 @@ DECLARE_bool(apu_raise_thread_priority);
+ DECLARE_bool(apu_exact_pump_interval);
+ DECLARE_int32(apu_target_queued_frames);
+ DECLARE_int32(apu_max_queued_frames);
++DECLARE_bool(xma_reset_decoder_per_stream);
+ 
+ #endif  // XENIA_APU_APU_FLAGS_H_
+diff --git a/src/xenia/apu/xma_context_new.cc b/src/xenia/apu/xma_context_new.cc
+index 1f3dcc5..3fee9c6 100644
+--- a/src/xenia/apu/xma_context_new.cc
++++ b/src/xenia/apu/xma_context_new.cc
+@@ -8,8 +8,10 @@
+ */
+ 
+ #include "xenia/apu/xma_context_new.h"
++#include "xenia/apu/apu_flags.h"
+ #include "xenia/apu/xma_helpers.h"
+ 
++#include "xenia/base/byte_order.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/platform.h"
+ #include "xenia/base/profiling.h"
+@@ -122,6 +124,10 @@ bool XmaContextNew::Work() {
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
+ 
++  if (cvars::xma_reset_decoder_per_stream) {
++    CheckWorkBufferResetLocked(data);
++  }
++
+   if (!data.output_buffer_valid) {
+     return true;
+   }
+@@ -268,6 +274,35 @@ void XmaContextNew::ClearLocked(XMA_CONTEXT_DATA* data) {
+   current_frame_remaining_subframes_ = 0;
+   loop_frame_output_limit_ = 0;
+   loop_start_skip_pending_ = false;
++  reset_codec_ = true;
++  work_buffer_marked_ = false;
++}
++
++void XmaContextNew::CheckWorkBufferResetLocked(const XMA_CONTEXT_DATA& data) {
++  // The hardware keeps a context's decoder state (the frame being output, the
++  // overlap with the next frame) in its work buffer. Titles may start a new
++  // stream on a context without the clear register by zeroing that buffer
++  // along with the offsets: Halo 3's XAudio does that to flush a voice
++  // (sub_82138F38 in its default.xex). Xenia keeps the state here instead, so
++  // the rest of a cut-off sound's frame and its overlap would play at the
++  // start of the next sound. Mark the work buffer, and treat a mark that has
++  // been overwritten as a clear.
++  if (!data.work_buffer_ptr) {
++    work_buffer_marked_ = false;
++    return;
++  }
++  auto mark = reinterpret_cast<xe::be<uint32_t>*>(
++      memory()->TranslatePhysical(data.work_buffer_ptr));
++  if (work_buffer_marked_ && *mark != kWorkBufferMark) {
++    XELOGAPU("XmaContext {}: Work buffer reset, {} subframes dropped", id(),
++             current_frame_remaining_subframes_);
++    current_frame_remaining_subframes_ = 0;
++    loop_frame_output_limit_ = 0;
++    loop_start_skip_pending_ = false;
++    reset_codec_ = true;
++  }
++  *mark = kWorkBufferMark;
++  work_buffer_marked_ = true;
+ }
+ 
+ void XmaContextNew::Disable() { set_is_enabled(false); }
+@@ -280,6 +315,8 @@ void XmaContextNew::Release() {
+   set_is_allocated(false);
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));  // Zero it.
++  reset_codec_ = true;
++  work_buffer_marked_ = false;
+ }
+ 
+ int XmaContextNew::GetSampleRate(int id) {
+@@ -917,7 +954,13 @@ int XmaContextNew::PrepareDecoder(int sample_rate, bool is_two_channel) {
+ 
+   // Re-initialize the context with new sample rate and channels.
+   uint32_t channels = is_two_channel ? 2 : 1;
+-  if (av_context_->sample_rate != sample_rate ||
++  // A new stream on a reused context: FFmpeg's XMA (WMA Pro) decoder keeps
++  // the second half of each frame's inverse MDCT to overlap with the next
++  // frame and has no flush, so without a reopen the previous sound's tail
++  // leaks into the first samples of the new one.
++  const bool new_stream = reset_codec_ && cvars::xma_reset_decoder_per_stream;
++  reset_codec_ = false;
++  if (new_stream || av_context_->sample_rate != sample_rate ||
+       av_context_->ch_layout.nb_channels != (int)channels) {
+     XELOGAPU("XmaContext {}: Codec reinit: rate {} -> {}, channels {} -> {}",
+              id(), av_context_->sample_rate, sample_rate,
+diff --git a/src/xenia/apu/xma_context_new.h b/src/xenia/apu/xma_context_new.h
+index 603ce7f..54dc0c0 100644
+--- a/src/xenia/apu/xma_context_new.h
++++ b/src/xenia/apu/xma_context_new.h
+@@ -105,6 +105,8 @@ class XmaContextNew : public XmaContext {
+   static uint32_t GetCurrentInputBufferSize(XMA_CONTEXT_DATA* data);
+ 
+   void Decode(XMA_CONTEXT_DATA* data);
++  // A new stream started by zeroing the work buffer (see the .cc file).
++  void CheckWorkBufferResetLocked(const XMA_CONTEXT_DATA& data);
+   void Consume(RingBuffer* XE_RESTRICT output_rb,
+                const XMA_CONTEXT_DATA* const XE_RESTRICT data);
+ 
+@@ -138,6 +140,14 @@ class XmaContextNew : public XmaContext {
+   // When true, the next decoded frame should skip leading subframes per
+   // loop_subframe_skip (loop start adjustment).
+   bool loop_start_skip_pending_ = false;
++  // Set when the game clears or releases the context (or zeroes its work
++  // buffer): the next decode reopens the codec, so no overlap or block length
++  // state from the previous stream carries into the new one.
++  bool reset_codec_ = true;
++  // Written to the first word of the context's work buffer by Work(); found
++  // overwritten, the game has reset the context through the work buffer.
++  static constexpr uint32_t kWorkBufferMark = 0x584D4157;  // 'XMAW'
++  bool work_buffer_marked_ = false;
+ };
+ 
+ }  // namespace apu

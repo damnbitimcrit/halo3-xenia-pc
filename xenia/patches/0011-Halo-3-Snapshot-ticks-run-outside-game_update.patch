@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Snapshot ticks run outside game_update
+
+game_tick has two more callers than game_update: the simulation and
+network catch-up loops (sub_823BD538, sub_823BDB40), which the main loop
+body runs before game_update. Their ticks weren't snapshotted, so the
+tick-continuity check stopped blending around them, which would affect
+every frame wherever the game drives its ticks through them. They are
+snapshotted now, and "the simulation is running" (used to keep tick time
+inputs from adding a stale tick fraction) is set on game_tick entry and
+cleared after every tick, whichever loop runs it.
+---
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index af63a74..99f3618 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -58,8 +58,15 @@ namespace {
+ 
+ // game_update (820A3918): entry, before any tick runs.
+ constexpr uint32_t kGameUpdateEntry = 0x820A3918;
+-// game_update: `addi r31, r31, 1` right after each `bl game_tick`.
++// game_tick (sub_820A39F0) entry.
++constexpr uint32_t kGameTickEntry = 0x820A39F0;
++// The instruction right after each of the three `bl game_tick`: in
++// game_update, and in the simulation (sub_823BD538) and network
++// (sub_823BDB40) catch-up loops, which the main loop body runs before
++// game_update.
+ constexpr uint32_t kAfterGameTick = 0x820A3964;
++constexpr uint32_t kAfterSimulationTick = 0x823BD574;
++constexpr uint32_t kAfterNetworkTick = 0x823BDC58;
+ // main loop body: first instruction after `bl game_update`, before the
+ // director, observer and first-person frame updates and rendering.
+ constexpr uint32_t kAfterGameUpdate = 0x821A91C4;
+@@ -196,7 +203,8 @@ struct InterpolationState {
+   std::array<PoseSnapshot, kLocalPlayers * kFpSlots> poses;
+ };
+ InterpolationState* state = nullptr;
+-// Read by the render thread too (loading screens).
++// Whether the simulation is running: game_update, or a tick from another
++// driver. Read by the render thread too (loading screens).
+ std::atomic<bool> in_game_update{false};
+ 
+ uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
+@@ -724,7 +732,12 @@ void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
+   Restore(ctx);
+ }
+ 
++void OnGameTickEntry(cpu::ppc::PPCContext* ctx, void*) {
++  in_game_update = true;
++}
++
+ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
++  in_game_update = false;
+   stats().ticks++;
+   if (!Enabled()) {
+     if (state) {
+@@ -782,7 +795,10 @@ void InstallInterpolation(KernelState* kernel_state) {
+   auto& hooks = cpu::GuestHooks::Get();
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kGameUpdateEntry, OnGameUpdateEntry);
++  hooks.Add(processor, kGameTickEntry, OnGameTickEntry);
+   hooks.Add(processor, kAfterGameTick, OnAfterGameTick);
++  hooks.Add(processor, kAfterSimulationTick, OnAfterGameTick);
++  hooks.Add(processor, kAfterNetworkTick, OnAfterGameTick);
+   hooks.Add(processor, kAfterGameUpdate, OnAfterGameUpdate);
+   hooks.Add(processor, kRenderNodesUpdated, OnRenderNodesUpdated);
+ }

@@ -1,0 +1,648 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Let title code read GPU-written memory back into guest
+ memory
+
+Unless readback_memexport is on, what shaders write with memory export
+never reaches guest memory, and readback_memexport waits for the GPU at
+every export. Some games read such results on the CPU only at known
+moments, after waiting for a fence themselves (Halo 3: the image of a
+Theater screenshot, its effect storages when it saves the game state).
+
+guest_readback.h (header-only, so title code can use it without linking
+the GPU code): a guest thread names up to 8 physical ranges and blocks
+while the command processor thread copies the bytes whose host GPU copy
+is newer than guest memory into guest memory. Those bytes are
+SharedMemory::ForEachGpuNewerPart: pages last written by the GPU with no
+CPU write since, and elsewhere the memory export results
+memexport_keep_gpu_data keeps. Right after a load, nothing.
+
+The command processor thread polls the request with one relaxed atomic
+load at the top of its loop, in its idle spin and in WAIT_REG_MEM's
+poll, all after the packet the guest waited for, and takes it with
+try_lock (it waits for the requester only to finish, for a few stores),
+and the idle spin rechecks the ring, not the flag, before executing.
+D3D12 and Vulkan open a submission, copy the parts to the readback
+buffer, await all queue operations, then copy into guest memory through
+the physical view (which has no write watches, so nothing is
+invalidated) under the global lock, skipping any part the CPU wrote
+since. A request the thread doesn't take in time is withdrawn and
+changes nothing; a taken one always finishes before the requester
+returns, so guest memory never changes behind the title's back (Halo 3
+hashes its save right after). Requests from the command processor thread
+itself (guest interrupt callbacks) are refused.
+
+Meant for memory export targets: a resolve at a draw resolution scale
+above 1 isn't in the shared memory copy, and the command processor
+writes fences and occlusion query results to guest memory directly, so
+ranges with those must not be requested.
+
+Also: D3D12 refuses the copy if the submission couldn't be ended, and
+Vulkan destroys a replaced readback buffer only once the submissions
+that may copy to it have completed.
+
+No cost unless a title asks: no cvar, nothing changes in IssueDraw, the
+uploads or the per-frame paths.
+---
+ src/xenia/gpu/command_processor.cc            |  53 +++++++-
+ src/xenia/gpu/command_processor.h             |  14 ++
+ .../gpu/d3d12/d3d12_command_processor.cc      |  81 ++++++++++++
+ src/xenia/gpu/d3d12/d3d12_command_processor.h |   4 +
+ src/xenia/gpu/guest_readback.h                | 122 ++++++++++++++++++
+ .../gpu/pm4_command_processor_implement.h     |   2 +
+ src/xenia/gpu/shared_memory.h                 |  60 +++++++++
+ .../gpu/vulkan/vulkan_command_processor.cc    | 101 ++++++++++++++-
+ .../gpu/vulkan/vulkan_command_processor.h     |   4 +
+ 9 files changed, 437 insertions(+), 4 deletions(-)
+ create mode 100644 src/xenia/gpu/guest_readback.h
+
+diff --git a/src/xenia/gpu/command_processor.cc b/src/xenia/gpu/command_processor.cc
+index bf6efa4..730a55a 100644
+--- a/src/xenia/gpu/command_processor.cc
++++ b/src/xenia/gpu/command_processor.cc
+@@ -19,6 +19,7 @@
+ #include "xenia/gpu/gpu_flags.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/graphics_system.h"
++#include "xenia/gpu/guest_readback.h"
+ #include "xenia/gpu/packet_disassembler.h"
+ #include "xenia/gpu/sampler_info.h"
+ #include "xenia/gpu/texture_info.h"
+@@ -394,11 +395,53 @@ void CommandProcessor::SetDesiredSwapPostEffect(
+   });
+ }
+ 
++void CommandProcessor::ServiceGuestReadback() {
++  GuestReadback& readback = guest_readback();
++  if (!readback.pending.load(std::memory_order_acquire)) {
++    return;
++  }
++  uint32_t starts[GuestReadback::kMaxRanges];
++  uint32_t lengths[GuestReadback::kMaxRanges];
++  uint32_t count;
++  {
++    // The requester holds the mutex only for a few stores between its waits:
++    // don't wait for it here, poll again instead (finishing below waits for
++    // those stores at most).
++    std::unique_lock<std::mutex> lock(readback.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) {
++      return;
++    }
++    readback.pending.store(false, std::memory_order_relaxed);
++    if (readback.state != GuestReadback::State::kPending) {
++      return;
++    }
++    readback.state = GuestReadback::State::kRunning;
++    count = readback.count;
++    std::copy_n(readback.starts, count, starts);
++    std::copy_n(readback.lengths, count, lengths);
++  }
++  GpuProfileZone profile_zone(GpuProfileBucket::kSync);
++  const uint64_t start_ticks = Clock::QueryHostTickCount();
++  uint32_t bytes = 0;
++  const bool succeeded = ReadbackToGuestMemory(starts, lengths, count, bytes);
++  const uint64_t service_us = (Clock::QueryHostTickCount() - start_ticks) *
++                              1000000 / Clock::QueryHostTickFrequency();
++  {
++    std::lock_guard<std::mutex> lock(readback.mutex);
++    readback.succeeded = succeeded;
++    readback.bytes = bytes;
++    readback.service_us = service_us;
++    readback.state = GuestReadback::State::kDone;
++  }
++  readback.changed.notify_all();
++}
++
+ void CommandProcessor::WorkerThreadMain() {
+   if (!SetupContext()) {
+     xe::FatalError("Unable to setup command processor internal state");
+     return;
+   }
++  guest_readback_service_thread = true;
+ 
+   while (worker_running_) {
+     while (!pending_fns_.empty()) {
+@@ -407,6 +450,10 @@ void CommandProcessor::WorkerThreadMain() {
+       fn();
+     }
+ 
++    // A guest thread waiting for GPU-written data: everything before what it
++    // waited for has been executed.
++    ServiceGuestReadback();
++
+     uint32_t write_ptr_index = write_ptr_index_.load();
+     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+       SCOPE_profile_cpu_i("gpu", "xe::gpu::CommandProcessor::Stall");
+@@ -434,13 +481,17 @@ void CommandProcessor::WorkerThreadMain() {
+         loop_count++;
+         write_ptr_index = write_ptr_index_.load();
+       } while (worker_running_ && pending_fns_.empty() &&
++               !guest_readback().pending.load(std::memory_order_relaxed) &&
+                (write_ptr_index == 0xBAADF00D ||
+                 read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+       GpuProfileLap(GpuProfileBucket::kStream);
+       gpu_thread_stats().idle_ticks.fetch_add(
+           Clock::QueryHostTickCount() - idle_start, std::memory_order_relaxed);
+-      if (!worker_running_ || !pending_fns_.empty()) {
++      // The ring, not the readback flag: a guest thread withdrawing a request
++      // it timed out on clears the flag at any time.
++      if (!worker_running_ || !pending_fns_.empty() ||
++          write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
+         continue;
+       }
+     }
+diff --git a/src/xenia/gpu/command_processor.h b/src/xenia/gpu/command_processor.h
+index da35909..d7db1fb 100644
+--- a/src/xenia/gpu/command_processor.h
++++ b/src/xenia/gpu/command_processor.h
+@@ -294,6 +294,20 @@ class CommandProcessor {
+   virtual void PrepareForWait();
+   virtual void ReturnFromWait();
+ 
++  // Takes a guest thread's request (guest_readback.h) and runs it. This
++  // thread only; cheap when none is pending.
++  void ServiceGuestReadback();
++  // Copies the bytes of the physical ranges whose host GPU copy is newer than
++  // guest memory (SharedMemory::ForEachGpuNewerPart) into guest memory,
++  // waiting for the host GPU. bytes: copied. Returns false if it couldn't,
++  // with guest memory unchanged.
++  virtual bool ReadbackToGuestMemory(const uint32_t* starts,
++                                     const uint32_t* lengths, uint32_t count,
++                                     uint32_t& bytes) {
++    bytes = 0;
++    return false;
++  }
++
+   virtual void PollCompletedSubmission() {}
+ 
+   // Used by strict ZPD to distinguish normal in flight latency from a
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.cc b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+index f7c6fc0..7d501ed 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.cc
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+@@ -3360,6 +3360,87 @@ void D3D12CommandProcessor::InitializeTrace() {
+   }
+ }
+ 
++bool D3D12CommandProcessor::ReadbackToGuestMemory(const uint32_t* starts,
++                                                  const uint32_t* lengths,
++                                                  uint32_t count,
++                                                  uint32_t& bytes) {
++  bytes = 0;
++  std::vector<std::pair<uint32_t, uint32_t>>& parts = guest_readback_parts_;
++  parts.clear();
++  uint64_t total_length = 0;
++  {
++    auto global_lock = global_critical_region::Acquire();
++    for (uint32_t i = 0; i < count; ++i) {
++      shared_memory_->ForEachGpuNewerPart(
++          starts[i], lengths[i],
++          [&](uint32_t part_start, uint32_t part_length) {
++            parts.emplace_back(part_start, part_length);
++            total_length += part_length;
++          });
++    }
++  }
++  if (!total_length) {
++    return true;
++  }
++  if (total_length > SharedMemory::kBufferSize) {
++    return false;
++  }
++  // d3d12_submit_on_primary_buffer_end has usually ended the submission, and
++  // commands recorded outside one would be dropped.
++  if (!BeginSubmission(false)) {
++    return false;
++  }
++  ID3D12Resource* readback_buffer =
++      RequestReadbackBuffer(uint32_t(total_length));
++  if (!readback_buffer) {
++    return false;
++  }
++  // Also commits the UAV writes of memory export draws.
++  shared_memory_->UseAsCopySource();
++  SubmitBarriers();
++  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
++  uint32_t readback_offset = 0;
++  for (const std::pair<uint32_t, uint32_t>& part : parts) {
++    deferred_command_list_.D3DCopyBufferRegion(readback_buffer, readback_offset,
++                                               shared_memory_buffer, part.first,
++                                               part.second);
++    readback_offset += part.second;
++  }
++  // Ends the submission, drains the submission thread and awaits the GPU. If
++  // ending it failed, the copies haven't been submitted.
++  if (!AwaitAllQueueOperationsCompletion() || submission_open_) {
++    return false;
++  }
++  D3D12_RANGE read_range;
++  read_range.Begin = 0;
++  read_range.End = SIZE_T(total_length);
++  void* mapping;
++  if (FAILED(readback_buffer->Map(0, &read_range, &mapping))) {
++    return false;
++  }
++  {
++    // Guest writes invalidate pages under this lock (their access violations
++    // wait for it): a part the CPU wrote since the copy is skipped. The
++    // physical view has no write watches, so nothing is invalidated, and the
++    // pages stay valid with the same data as guest memory now.
++    auto global_lock = global_critical_region::Acquire();
++    const uint8_t* part_bytes = static_cast<const uint8_t*>(mapping);
++    for (const std::pair<uint32_t, uint32_t>& part : parts) {
++      shared_memory_->ForEachGpuNewerPart(
++          part.first, part.second,
++          [&](uint32_t copy_start, uint32_t copy_length) {
++            std::memcpy(memory_->TranslatePhysical(copy_start),
++                        part_bytes + (copy_start - part.first), copy_length);
++            bytes += copy_length;
++          });
++      part_bytes += part.second;
++    }
++  }
++  D3D12_RANGE written_range = {};
++  readback_buffer->Unmap(0, &written_range);
++  return true;
++}
++
+ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.h b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+index 5fd2ea4..9e17beb 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.h
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+@@ -351,6 +351,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   void FlushSmallReadbackCopies();
+   void PumpSmallReadbacks();
+   void InitializeTrace() override;
++  bool ReadbackToGuestMemory(const uint32_t* starts, const uint32_t* lengths,
++                             uint32_t count, uint32_t& bytes) override;
+ 
+  private:
+   static constexpr uint32_t kQueueFrames = 3;
+@@ -884,6 +886,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   // Simple single buffer for memexport (always syncs, no double-buffering)
+   ID3D12Resource* memexport_readback_buffer_ = nullptr;
+   uint32_t memexport_readback_buffer_size_ = 0;
++  // ReadbackToGuestMemory's parts (start, length), kept allocated.
++  std::vector<std::pair<uint32_t, uint32_t>> guest_readback_parts_;
+ 
+   // Resolve downscale compute shader for scaled resolution readback,
+   // reversing the scaled resolve buffer packing back to 1x on the GPU.
+diff --git a/src/xenia/gpu/guest_readback.h b/src/xenia/gpu/guest_readback.h
+new file mode 100644
+index 0000000..ab3e653
+--- /dev/null
++++ b/src/xenia/gpu/guest_readback.h
+@@ -0,0 +1,122 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_GPU_GUEST_READBACK_H_
++#define XENIA_GPU_GUEST_READBACK_H_
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <cstdint>
++#include <mutex>
++
++namespace xe {
++namespace gpu {
++
++// A guest thread's request that the GPU command processor thread copy what
++// the host GPU wrote into guest memory, for ranges title code knows the CPU is
++// about to read. With readback_memexport off, memory export results otherwise
++// never reach guest memory. Meant for memory export targets: not for ranges
++// with destinations of resolves at a draw resolution scale above 1 (their
++// shared memory copy is older) or words the command processor writes itself
++// (fences, occlusion query results). One request at a time. Header-only, so
++// title code can make it without linking the GPU code.
++struct GuestReadback {
++  static constexpr uint32_t kMaxRanges = 8;
++  enum class State : uint32_t { kIdle, kPending, kRunning, kDone };
++  std::mutex mutex;
++  std::condition_variable changed;
++  // Under mutex.
++  State state = State::kIdle;
++  uint32_t count = 0;
++  uint32_t starts[kMaxRanges] = {};
++  uint32_t lengths[kMaxRanges] = {};
++  bool succeeded = false;
++  uint32_t bytes = 0;
++  uint64_t service_us = 0;
++  // Whether a request may be pending: polled by the command processor thread
++  // without the mutex.
++  std::atomic<bool> pending{false};
++};
++
++inline GuestReadback& guest_readback() {
++  static GuestReadback readback;
++  return readback;
++}
++
++// Set on the command processor thread, which takes the requests: a request
++// made there (by a guest interrupt callback) would wait for itself.
++inline thread_local bool guest_readback_service_thread = false;
++
++enum class GuestReadbackResult { kCopied, kFailed, kNotTaken };
++
++struct GuestReadbackOutcome {
++  GuestReadbackResult result = GuestReadbackResult::kNotTaken;
++  // Copied into guest memory.
++  uint32_t bytes = 0;
++  // On the command processor thread.
++  uint64_t service_us = 0;
++};
++
++// Guest threads only. Copies the bytes of the physical ranges
++// [start, start + length) whose host GPU copy is newer than guest memory,
++// after everything the command processor has executed so far, waiting for the
++// host GPU. If the command processor thread doesn't take the request within
++// timeout, it is withdrawn and guest memory stays as it is. Once taken, it is
++// always finished before this returns, so guest memory never changes after
++// this returns.
++inline GuestReadbackOutcome RequestGuestReadback(
++    const uint32_t* starts, const uint32_t* lengths, uint32_t count,
++    std::chrono::milliseconds timeout) {
++  using State = GuestReadback::State;
++  GuestReadbackOutcome outcome;
++  if (guest_readback_service_thread) {
++    return outcome;
++  }
++  GuestReadback& readback = guest_readback();
++  count = std::min(count, GuestReadback::kMaxRanges);
++  std::unique_lock<std::mutex> lock(readback.mutex);
++  if (!readback.changed.wait_for(lock, timeout, [&readback] {
++        return readback.state == State::kIdle;
++      })) {
++    return outcome;
++  }
++  readback.count = count;
++  std::copy_n(starts, count, readback.starts);
++  std::copy_n(lengths, count, readback.lengths);
++  readback.state = State::kPending;
++  readback.pending.store(true, std::memory_order_release);
++  if (!readback.changed.wait_for(lock, timeout, [&readback] {
++        return readback.state == State::kDone;
++      })) {
++    if (readback.state == State::kPending) {
++      // Not taken: withdraw it.
++      readback.pending.store(false, std::memory_order_relaxed);
++      readback.state = State::kIdle;
++      readback.changed.notify_all();
++      return outcome;
++    }
++    // Taken: only host GPU work is left, which no guest thread holds up.
++    readback.changed.wait(
++        lock, [&readback] { return readback.state == State::kDone; });
++  }
++  outcome.result = readback.succeeded ? GuestReadbackResult::kCopied
++                                      : GuestReadbackResult::kFailed;
++  outcome.bytes = readback.bytes;
++  outcome.service_us = readback.service_us;
++  readback.state = State::kIdle;
++  readback.changed.notify_all();
++  return outcome;
++}
++
++}  // namespace gpu
++}  // namespace xe
++
++#endif  // XENIA_GPU_GUEST_READBACK_H_
+diff --git a/src/xenia/gpu/pm4_command_processor_implement.h b/src/xenia/gpu/pm4_command_processor_implement.h
+index f429207..3f53762 100644
+--- a/src/xenia/gpu/pm4_command_processor_implement.h
++++ b/src/xenia/gpu/pm4_command_processor_implement.h
+@@ -766,6 +766,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+           gpu_thread_profiler->Lap(GpuProfileBucket::kSync);
+         }
+       }
++      // A guest thread waiting for a readback may be what this waits for.
++      ServiceGuestReadback();
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+diff --git a/src/xenia/gpu/shared_memory.h b/src/xenia/gpu/shared_memory.h
+index 19b66ad..c9b9022 100644
+--- a/src/xenia/gpu/shared_memory.h
++++ b/src/xenia/gpu/shared_memory.h
+@@ -86,6 +86,66 @@ class SharedMemory {
+   // Whether every page in the range was last written by the GPU (a resolve or
+   // memory export) with no CPU write since. Hold the global critical region.
+   bool IsRangeValidAndGpuWritten(uint32_t start, uint32_t length) const;
++  // Calls part(start, length) for the bytes of [start, start + length) whose
++  // copy here is newer than guest memory, merging adjacent ones: pages last
++  // written by the GPU (a resolve or memory export) with no CPU write since,
++  // and elsewhere the memory export results memexport_keep_gpu_data keeps.
++  // Everywhere else guest memory is as new or newer, except in pages of
++  // resolves at a draw resolution scale above 1 (written to the scaled resolve
++  // buffer, not here) and words the command processor writes to guest memory
++  // directly (fences, occlusion query results). Hold the global critical
++  // region across the call and whatever relies on its result.
++  template <typename PartFunction>
++  void ForEachGpuNewerPart(uint32_t start, uint32_t length,
++                           PartFunction&& part) const {
++    if (!length || start >= kBufferSize) {
++      return;
++    }
++    const uint32_t end = start + std::min(length, kBufferSize - start);
++    uint32_t part_start = 0, part_end = 0;
++    const auto add = [&](uint32_t add_start, uint32_t add_end) {
++      if (part_end > part_start && part_end == add_start) {
++        part_end = add_end;
++        return;
++      }
++      if (part_end > part_start) {
++        part(part_start, part_end - part_start);
++      }
++      part_start = add_start;
++      part_end = add_end;
++    };
++    // The first kept range ending after start.
++    auto kept_it = std::upper_bound(
++        memexport_kept_ranges_.cbegin(), memexport_kept_ranges_.cend(), start,
++        [](uint32_t value, const std::pair<uint32_t, uint32_t>& range) {
++          return value < range.second;
++        });
++    for (uint32_t position = start; position < end;) {
++      const uint32_t page = position >> page_size_log2_;
++      const uint32_t page_end = std::min(end, (page + 1) << page_size_log2_);
++      if (system_page_flags_valid_and_gpu_written_[page >> 6] &
++          (uint64_t(1) << (page & 63))) {
++        add(position, page_end);
++      } else {
++        for (; kept_it != memexport_kept_ranges_.cend() &&
++               kept_it->first < page_end;
++             ++kept_it) {
++          const uint32_t kept_start = std::max(position, kept_it->first);
++          const uint32_t kept_end = std::min(page_end, kept_it->second);
++          if (kept_start < kept_end) {
++            add(kept_start, kept_end);
++          }
++          if (kept_it->second > page_end) {
++            break;
++          }
++        }
++      }
++      position = page_end;
++    }
++    if (part_end > part_start) {
++      part(part_start, part_end - part_start);
++    }
++  }
+ 
+   void TryFindUploadRange(const uint32_t& block_first,
+                           const uint32_t& block_last,
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.cc b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+index ac309c3..2bf1875 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.cc
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+@@ -3682,10 +3682,13 @@ VkBuffer VulkanCommandProcessor::RequestReadbackBuffer(uint32_t size) {
+       return VK_NULL_HANDLE;
+     }
+ 
+-    // Destroy old buffer if it exists.
++    // Destroy the old buffer once the submissions that may copy to it have
++    // completed (a failed await may have left a copy in the open one).
+     if (memexport_readback_buffer_ != VK_NULL_HANDLE) {
+-      dfn.vkDestroyBuffer(device, memexport_readback_buffer_, nullptr);
+-      dfn.vkFreeMemory(device, memexport_readback_buffer_memory_, nullptr);
++      destroy_buffers_.emplace_back(GetCurrentSubmission(),
++                                    memexport_readback_buffer_);
++      destroy_memory_.emplace_back(GetCurrentSubmission(),
++                                   memexport_readback_buffer_memory_);
+     }
+ 
+     memexport_readback_buffer_ = new_buffer;
+@@ -4211,6 +4214,98 @@ void VulkanCommandProcessor::InitializeTrace() {
+   }
+ }
+ 
++bool VulkanCommandProcessor::ReadbackToGuestMemory(const uint32_t* starts,
++                                                   const uint32_t* lengths,
++                                                   uint32_t count,
++                                                   uint32_t& bytes) {
++  bytes = 0;
++  std::vector<std::pair<uint32_t, uint32_t>>& parts = guest_readback_parts_;
++  parts.clear();
++  uint64_t total_length = 0;
++  {
++    auto global_lock = global_critical_region::Acquire();
++    for (uint32_t i = 0; i < count; ++i) {
++      shared_memory_->ForEachGpuNewerPart(
++          starts[i], lengths[i],
++          [&](uint32_t part_start, uint32_t part_length) {
++            parts.emplace_back(part_start, part_length);
++            total_length += part_length;
++          });
++    }
++  }
++  if (!total_length) {
++    return true;
++  }
++  if (total_length > SharedMemory::kBufferSize) {
++    return false;
++  }
++  if (!BeginSubmission(false)) {
++    return false;
++  }
++  VkBuffer readback_buffer = RequestReadbackBuffer(uint32_t(total_length));
++  if (readback_buffer == VK_NULL_HANDLE) {
++    return false;
++  }
++  // Unlike the readback_memexport copy in IssueDraw: commit the shader writes
++  // and leave the render pass before the copy, then make the copy visible to
++  // the host (as VulkanSharedMemory::InitializeTraceSubmitDownloads does).
++  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++  SubmitBarriers(true);
++  VkBufferCopy* regions = deferred_command_buffer_.CmdCopyBufferEmplace(
++      shared_memory_->buffer(), readback_buffer, uint32_t(parts.size()));
++  VkDeviceSize readback_offset = 0;
++  for (size_t i = 0; i < parts.size(); ++i) {
++    regions[i].srcOffset = parts[i].first;
++    regions[i].dstOffset = readback_offset;
++    regions[i].size = parts[i].second;
++    readback_offset += parts[i].second;
++  }
++  PushBufferMemoryBarrier(
++      readback_buffer, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
++      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++      VK_ACCESS_HOST_READ_BIT);
++  SubmitBarriers(true);
++  if (!AwaitAllQueueOperationsCompletion()) {
++    return false;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  void* mapping;
++  if (dfn.vkMapMemory(device, memexport_readback_buffer_memory_, 0,
++                      VK_WHOLE_SIZE, 0, &mapping) != VK_SUCCESS) {
++    return false;
++  }
++  // Readback memory prefers HOST_CACHED, which may not be coherent.
++  VkMappedMemoryRange mapped_range;
++  mapped_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++  mapped_range.pNext = nullptr;
++  mapped_range.memory = memexport_readback_buffer_memory_;
++  mapped_range.offset = 0;
++  mapped_range.size = VK_WHOLE_SIZE;
++  dfn.vkInvalidateMappedMemoryRanges(device, 1, &mapped_range);
++  {
++    // Guest writes invalidate pages under this lock (their access violations
++    // wait for it): a part the CPU wrote since the copy is skipped. The
++    // physical view has no write watches, so nothing is invalidated, and the
++    // pages stay valid with the same data as guest memory now.
++    auto global_lock = global_critical_region::Acquire();
++    const uint8_t* part_bytes = static_cast<const uint8_t*>(mapping);
++    for (const std::pair<uint32_t, uint32_t>& part : parts) {
++      shared_memory_->ForEachGpuNewerPart(
++          part.first, part.second,
++          [&](uint32_t copy_start, uint32_t copy_length) {
++            std::memcpy(memory_->TranslatePhysical(copy_start),
++                        part_bytes + (copy_start - part.first), copy_length);
++            bytes += copy_length;
++          });
++      part_bytes += part.second;
++    }
++  }
++  dfn.vkUnmapMemory(device, memexport_readback_buffer_memory_);
++  return true;
++}
++
+ void VulkanCommandProcessor::PollCompletedSubmission() {
+   // Strict ZPD can skip unnecessary work here that can wait for the next full
+   // CheckSubmissionCompletionAndDeviceLoss and it's not needed for retirement.
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.h b/src/xenia/gpu/vulkan/vulkan_command_processor.h
+index dc63a3c..7cea5bd 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.h
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.h
+@@ -291,6 +291,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
+   bool IssueCopy() override;
+ 
+   void InitializeTrace() override;
++  bool ReadbackToGuestMemory(const uint32_t* starts, const uint32_t* lengths,
++                             uint32_t count, uint32_t& bytes) override;
+ 
+  private:
+   struct CommandBuffer {
+@@ -866,6 +868,8 @@ class VulkanCommandProcessor final : public CommandProcessor {
+   VkBuffer memexport_readback_buffer_ = VK_NULL_HANDLE;
+   VkDeviceMemory memexport_readback_buffer_memory_ = VK_NULL_HANDLE;
+   uint32_t memexport_readback_buffer_size_ = 0;
++  // ReadbackToGuestMemory's parts (start, length), kept allocated.
++  std::vector<std::pair<uint32_t, uint32_t>> guest_readback_parts_;
+ 
+   // Resolve downscale compute pipeline for scaled resolution readback,
+   // reversing the scaled resolve buffer packing back to 1x on the GPU.

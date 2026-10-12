@@ -1,0 +1,710 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Smooth first-person weapons, object facing and the
+ camera
+
+- First-person weapon and arms poses (TLS[0x2D8], two slots per local
+  player) are rebuilt once per tick in camera space, outside the object
+  array. They are now snapshotted, blended and restored with the same hooks
+  as objects, which removes the 30 Hz stepping of weapon bob, sway, recoil
+  and reload animations.
+- Object forward/up (+0x60/+0x6C) are blended too: first-person vehicle
+  seats rotate the camera by them.
+- Each tick replaces the cameras' copy of the player facing with the
+  quantized simulation value, so frames alternated between quantized and
+  exact facing (a 30 Hz shimmer, worst when scoped). The exact facing is
+  copied back after the ticks; the game does the same copy itself before
+  the next tick.
+- Restoring after a frame no longer overwrites values that something else
+  changed since the blend (a respawn or a new unit); those are kept and the
+  object or pose starts over.
+---
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 526 ++++++++++++++++---
+ src/xenia/kernel/title/halo3/halo3_math.h    |  14 +
+ 2 files changed, 458 insertions(+), 82 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 967c2c5..c9be0cf 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -7,16 +7,26 @@
+  ******************************************************************************
+  */
+ 
+-// Render interpolation of objects.
++// Render interpolation.
+ //
+ // The simulation runs in 30 Hz ticks; with the frame rate unlocked several
+-// frames are drawn per tick. After every tick we snapshot each object's world
+-// space node matrices (what the renderer draws skinned and rigid models from)
+-// and position. Once a frame's ticks are done we write a blend of the last two
+-// snapshots into the objects, weighted by the fraction of a tick that has
+-// elapsed since the last one (game_time_globals + 0x14). The per-frame camera
+-// and the renderer then see smooth motion. Before the next tick runs, the
+-// real state is written back so the simulation never sees blended values.
++// frames are drawn per tick. After every tick we snapshot what the per-frame
++// camera and the renderer read from the simulation:
++// - every object's position, facing (forward and up) and world space node
++//   matrices;
++// - every local player's first-person weapon and arms pose: camera space node
++//   matrices and the animation's camera node, which live outside the objects.
++// Once a frame's ticks are done we write a blend of the last two snapshots,
++// weighted by the fraction of a tick that has elapsed since the last one
++// (game_time_globals + 0x14). The camera, the first-person view and the
++// renderer then see smooth motion. Before the next tick runs, the real state
++// is written back so the simulation never sees blended values. If something
++// changed a value in between (a respawn, say), its value is kept instead.
++//
++// The ticks also replace the cameras' copy of each player's facing with the
++// facing quantized for the simulation (13-bit yaw, 12-bit pitch), while frames
++// without a tick use the exact facing. The exact facing is put back after the
++// ticks so the view doesn't shimmer at 30 Hz.
+ 
+ #include <algorithm>
+ #include <array>
+@@ -32,8 +42,8 @@
+ #include "xenia/kernel/title/halo3/halo3_math.h"
+ 
+ DEFINE_bool(halo3_interpolation, true,
+-            "Halo 3: smooth object motion between 30 Hz simulation ticks when "
+-            "the frame rate is unlocked.",
++            "Halo 3: smooth object and first-person weapon motion between 30 "
++            "Hz simulation ticks when the frame rate is unlocked.",
+             "Halo3");
+ 
+ namespace xe {
+@@ -46,13 +56,16 @@ namespace {
+ constexpr uint32_t kGameUpdateEntry = 0x820A3918;
+ // game_update: `addi r31, r31, 1` right after each `bl game_tick`.
+ constexpr uint32_t kAfterGameTick = 0x820A3964;
+-// main loop body: first instruction after `bl game_update`.
++// main loop body: first instruction after `bl game_update`, before the
++// director, observer and first-person frame updates and rendering.
+ constexpr uint32_t kAfterGameUpdate = 0x821A91C4;
+ 
+ // Thread-local game globals are reached through r13 (KPCR); its first word is
+ // the TLS block holding pointers to every subsystem's globals.
++constexpr uint32_t kTlsPlayerControl = 0x78;
+ constexpr uint32_t kTlsObjectDataArray = 0xA8;
+ constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
++constexpr uint32_t kTlsFirstPerson = 0x2D8;
+ constexpr uint32_t kGameTimeTicksLeftover = 0x14;
+ 
+ // s_data_array.
+@@ -65,6 +78,8 @@ constexpr uint32_t kObjectHeaderSalt = 0x0;
+ constexpr uint32_t kObjectHeaderAddress = 0xC;
+ // Object data.
+ constexpr uint32_t kObjectPosition = 0x54;
++constexpr uint32_t kObjectForward = 0x60;
++constexpr uint32_t kObjectUp = 0x6C;
+ constexpr uint32_t kObjectNodeMatricesSize = 0x13A;    // bytes
+ constexpr uint32_t kObjectNodeMatricesOffset = 0x13C;  // from the object
+ constexpr uint32_t kMatrixSize = 0x34;                 // real_matrix4x3
+@@ -75,6 +90,50 @@ constexpr uint32_t kMaxNodes = 256;
+ // teleported; draw it where it is instead of sliding it across the map.
+ constexpr float kTeleportDistance = 4.0f;
+ 
++// Player control globals (TLS[0x78]). Each local player has the live state
++// updated every frame, S(u) = +0x10 + u * 0xEC, and the copy the cameras
++// read, E(u) = +0x3C0 + u * 0x6C. Both start with the unit, then the facing.
++constexpr uint32_t kLocalPlayers = 4;
++constexpr uint32_t kPlayerControlLive = 0x10;
++constexpr uint32_t kPlayerControlLiveSize = 0xEC;
++constexpr uint32_t kPlayerControlCamera = 0x3C0;
++constexpr uint32_t kPlayerControlCameraSize = 0x6C;
++constexpr uint32_t kPlayerControlUnit = 0x0;
++constexpr uint32_t kPlayerControlYaw = 0xC;
++constexpr uint32_t kPlayerControlPitch = 0x10;
++constexpr uint32_t kNoUnit = 0xFFFFFFFF;
++
++// First-person weapons (TLS[0x2D8]): per local player, two weapon slots (for
++// dual wielding) whose node matrices are rebuilt once per tick, in camera
++// space, and turned into world space at render time from the current camera.
++constexpr uint32_t kFpUserSize = 0x2430;
++constexpr uint32_t kFpUserUnit = 0x04;
++constexpr uint32_t kFpSlots = 2;
++constexpr uint32_t kFpFirstSlot = 0x30;
++constexpr uint32_t kFpSlotSize = 0x11BC;
++constexpr uint32_t kFpSlotFlags = 0x0;  // 0x1 active, 0x10 camera node valid
++constexpr uint32_t kFpSlotWeapon = 0x0C;
++constexpr uint32_t kFpSlotWeaponModel = 0x14;
++constexpr uint32_t kFpSlotArmsModel = 0x1C;
++constexpr uint32_t kFpSlotAnimation = 0xA8;
++constexpr uint32_t kFpSlotNodeCount = 0x46C;
++constexpr uint32_t kFpSlotNodes = 0x474;
++constexpr uint32_t kFpSlotCameraNodeIndex = 0x1174;
++constexpr uint32_t kFpSlotCameraNode = 0x1178;
++constexpr uint32_t kFpMaxNodes = 64;
++// Matrices of a pose: the nodes, then the camera node.
++constexpr uint32_t kFpPoseMatrices = kFpMaxNodes + 1;
++// A first-person node jumping further or turning more than this in one tick
++// is an animation cut; show it as is.
++constexpr float kFpSnapDistance = 0.5f;
++constexpr float kFpSnapCosine = 0.5f;  // 60 degrees
++
++struct ObjectTransform {
++  Vector3 position;
++  Vector3 forward;
++  Vector3 up;
++};
++
+ struct ObjectSnapshot {
+   uint16_t salt = 0;
+   uint32_t address = 0;
+@@ -82,10 +141,27 @@ struct ObjectSnapshot {
+   bool has_previous = false;
+   bool moved = false;
+   bool applied = false;
+-  Vector3 previous_position;
+-  Vector3 current_position;
++  ObjectTransform previous;
++  ObjectTransform current;
++  ObjectTransform written;
+   std::vector<Matrix4x3> previous_nodes;
+   std::vector<Matrix4x3> current_nodes;
++  std::vector<Matrix4x3> written_nodes;
++};
++
++struct PoseSnapshot {
++  // What the pose belongs to: unit, weapon, models, animation, node count,
++  // camera node index and slot flags. A change means a different pose.
++  std::array<uint32_t, 8> key = {};
++  bool valid = false;
++  bool has_previous = false;
++  bool moved = false;
++  bool applied = false;
++  uint32_t node_count = 0;
++  bool camera_node = false;
++  std::array<Matrix4x3, kFpPoseMatrices> previous;
++  std::array<Matrix4x3, kFpPoseMatrices> current;
++  std::array<Matrix4x3, kFpPoseMatrices> written;
+ };
+ 
+ // Only the game's main thread runs ticks and the main loop.
+@@ -93,12 +169,17 @@ struct InterpolationState {
+   uint32_t object_array = 0;
+   uint32_t high_water_mark = 0;
+   std::array<ObjectSnapshot, kMaxObjects> objects;
++  uint32_t first_person = 0;
++  std::array<PoseSnapshot, kLocalPlayers * kFpSlots> poses;
+ };
+ InterpolationState* state = nullptr;
+ 
+ uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
+   return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
+ }
++void StoreU32(cpu::ppc::PPCContext* ctx, uint32_t address, uint32_t value) {
++  xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(address), value);
++}
+ uint16_t LoadU16(cpu::ppc::PPCContext* ctx, uint32_t address) {
+   return xe::load_and_swap<uint16_t>(ctx->TranslateVirtual(address));
+ }
+@@ -138,6 +219,17 @@ void StoreMatrix(cpu::ppc::PPCContext* ctx, uint32_t address,
+   StoreVector3(ctx, address + 0x28, m.position);
+ }
+ 
++// Snapshots compare bit for bit: what we stored reads back unchanged.
++template <typename T>
++bool SameBits(const T& a, const T& b) {
++  return std::memcmp(&a, &b, sizeof(T)) == 0;
++}
++bool SameBits(const std::vector<Matrix4x3>& a,
++              const std::vector<Matrix4x3>& b) {
++  return a.size() == b.size() &&
++         std::memcmp(a.data(), b.data(), a.size() * sizeof(Matrix4x3)) == 0;
++}
++
+ uint32_t TlsSlot(cpu::ppc::PPCContext* ctx, uint32_t offset) {
+   const uint32_t tls = LoadU32(ctx, static_cast<uint32_t>(ctx->r[13]));
+   return tls ? LoadU32(ctx, tls + offset) : 0;
+@@ -147,6 +239,67 @@ bool Enabled() {
+   return cvars::halo3_unlock_framerate && cvars::halo3_interpolation;
+ }
+ 
++// Fraction of a tick elapsed since the last one, or 0 to draw the last tick.
++float BlendFactor(cpu::ppc::PPCContext* ctx) {
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  if (!time_globals) {
++    return 0.0f;
++  }
++  const float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
++  if (!(alpha > 0.0f)) {
++    return 0.0f;  // also rejects NaN
++  }
++  return std::min(alpha, 1.0f);
++}
++
++// Objects.
++
++ObjectTransform LoadTransform(cpu::ppc::PPCContext* ctx, uint32_t object) {
++  return {LoadVector3(ctx, object + kObjectPosition),
++          LoadVector3(ctx, object + kObjectForward),
++          LoadVector3(ctx, object + kObjectUp)};
++}
++void StoreTransform(cpu::ppc::PPCContext* ctx, uint32_t object,
++                    const ObjectTransform& t) {
++  StoreVector3(ctx, object + kObjectPosition, t.position);
++  StoreVector3(ctx, object + kObjectForward, t.forward);
++  StoreVector3(ctx, object + kObjectUp, t.up);
++}
++
++bool IsUnitVector(const Vector3& v) {
++  const float length_squared = Dot(v, v);
++  return length_squared > 0.98f && length_squared < 1.02f;
++}
++
++ObjectTransform BlendTransform(const ObjectTransform& a,
++                               const ObjectTransform& b, float t) {
++  ObjectTransform r;
++  r.position = Lerp(a.position, b.position, t);
++  const bool turned = !SameBits(a.forward, b.forward) || !SameBits(a.up, b.up);
++  if (turned && IsUnitVector(a.forward) && IsUnitVector(a.up) &&
++      IsUnitVector(b.forward) && IsUnitVector(b.up)) {
++    InterpolateOrientation(a.forward, a.up, b.forward, b.up, t, &r.forward,
++                           &r.up);
++  } else {
++    r.forward = b.forward;
++    r.up = b.up;
++  }
++  return r;
++}
++
++uint32_t ObjectNodes(cpu::ppc::PPCContext* ctx, uint32_t object) {
++  return object + LoadU16(ctx, object + kObjectNodeMatricesOffset);
++}
++
++std::vector<Matrix4x3>& LoadNodes(cpu::ppc::PPCContext* ctx, uint32_t nodes,
++                                  uint32_t count, std::vector<Matrix4x3>& out) {
++  out.resize(count);
++  for (uint32_t n = 0; n < count; ++n) {
++    out[n] = LoadMatrix(ctx, nodes + n * kMatrixSize);
++  }
++  return out;
++}
++
+ // Whether object slot i still holds the object we snapshotted.
+ bool StillValid(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
+                 const ObjectSnapshot& o) {
+@@ -155,39 +308,7 @@ bool StillValid(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
+          LoadU32(ctx, header + kObjectHeaderAddress) == o.address;
+ }
+ 
+-// Writes the real (last tick) state back over any blended values.
+-void Restore(cpu::ppc::PPCContext* ctx) {
+-  if (!state || !state->object_array) {
+-    return;
+-  }
+-  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
+-  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
+-    ObjectSnapshot& o = state->objects[i];
+-    if (!o.applied) {
+-      continue;
+-    }
+-    o.applied = false;
+-    if (!StillValid(ctx, data, i, o)) {
+-      continue;
+-    }
+-    const uint32_t nodes =
+-        o.address + LoadU16(ctx, o.address + kObjectNodeMatricesOffset);
+-    for (uint32_t n = 0; n < o.node_count; ++n) {
+-      StoreMatrix(ctx, nodes + n * kMatrixSize, o.current_nodes[n]);
+-    }
+-    StoreVector3(ctx, o.address + kObjectPosition, o.current_position);
+-  }
+-}
+-
+-void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) { Restore(ctx); }
+-
+-void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+-  if (!Enabled()) {
+-    return;
+-  }
+-  if (!state) {
+-    state = new InterpolationState();
+-  }
++void SnapshotObjects(cpu::ppc::PPCContext* ctx) {
+   const uint32_t array = TlsSlot(ctx, kTlsObjectDataArray);
+   if (!array) {
+     return;
+@@ -206,6 +327,7 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+   for (uint32_t i = high_water_mark; i < state->high_water_mark; ++i) {
+     state->objects[i].salt = 0;
+     state->objects[i].has_previous = false;
++    state->objects[i].applied = false;
+   }
+   state->high_water_mark = high_water_mark;
+ 
+@@ -225,71 +347,311 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+     const uint32_t node_count = std::min<uint32_t>(
+         LoadU16(ctx, address + kObjectNodeMatricesSize) / kMatrixSize,
+         kMaxNodes);
+-    const uint32_t nodes =
+-        address + LoadU16(ctx, address + kObjectNodeMatricesOffset);
+ 
+     const bool same_object =
+         salt == o.salt && address == o.address && node_count == o.node_count;
+     if (same_object) {
+       std::swap(o.previous_nodes, o.current_nodes);
+-      o.previous_position = o.current_position;
++      o.previous = o.current;
+     } else {
+       o.salt = salt;
+       o.address = address;
+       o.node_count = node_count;
+     }
+-    o.current_nodes.resize(node_count);
+-    for (uint32_t n = 0; n < node_count; ++n) {
+-      o.current_nodes[n] = LoadMatrix(ctx, nodes + n * kMatrixSize);
++    LoadNodes(ctx, ObjectNodes(ctx, address), node_count, o.current_nodes);
++    o.current = LoadTransform(ctx, address);
++
++    o.has_previous = same_object &&
++                     DistanceSquared(o.previous.position, o.current.position) <=
++                         kTeleportDistance * kTeleportDistance;
++    o.moved = o.has_previous && (!SameBits(o.previous, o.current) ||
++                                 !SameBits(o.previous_nodes, o.current_nodes));
++  }
++}
++
++void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
++  if (!state->object_array ||
++      TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
++    return;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    ObjectSnapshot& o = state->objects[i];
++    if (!o.has_previous || !o.moved || o.applied ||
++        !StillValid(ctx, data, i, o)) {
++      continue;
+     }
+-    o.current_position = LoadVector3(ctx, address + kObjectPosition);
++    o.written_nodes.resize(o.node_count);
++    for (uint32_t n = 0; n < o.node_count; ++n) {
++      o.written_nodes[n] =
++          Interpolate(o.previous_nodes[n], o.current_nodes[n], alpha);
++    }
++    o.written = BlendTransform(o.previous, o.current, alpha);
++    const uint32_t nodes = ObjectNodes(ctx, o.address);
++    for (uint32_t n = 0; n < o.node_count; ++n) {
++      StoreMatrix(ctx, nodes + n * kMatrixSize, o.written_nodes[n]);
++    }
++    StoreTransform(ctx, o.address, o.written);
++    o.applied = true;
++  }
++}
+ 
+-    o.has_previous = same_object;
+-    if (!same_object) {
+-      o.moved = false;
++void RestoreObjects(cpu::ppc::PPCContext* ctx) {
++  if (!state->object_array ||
++      TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
++    return;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  std::vector<Matrix4x3> guest_nodes;
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    ObjectSnapshot& o = state->objects[i];
++    if (!o.applied) {
+       continue;
+     }
+-    if (DistanceSquared(o.previous_position, o.current_position) >
+-        kTeleportDistance * kTeleportDistance) {
++    o.applied = false;
++    if (!StillValid(ctx, data, i, o)) {
++      continue;
++    }
++    const uint32_t nodes = ObjectNodes(ctx, o.address);
++    if (!SameBits(LoadTransform(ctx, o.address), o.written) ||
++        !SameBits(LoadNodes(ctx, nodes, o.node_count, guest_nodes),
++                  o.written_nodes)) {
++      // Changed since we blended it: keep that, and don't blend from the old
++      // state next tick.
++      o.salt = 0;
+       o.has_previous = false;
+-      o.moved = false;
+       continue;
+     }
+-    o.moved = std::memcmp(o.previous_nodes.data(), o.current_nodes.data(),
+-                          node_count * sizeof(Matrix4x3)) != 0;
++    for (uint32_t n = 0; n < o.node_count; ++n) {
++      StoreMatrix(ctx, nodes + n * kMatrixSize, o.current_nodes[n]);
++    }
++    StoreTransform(ctx, o.address, o.current);
+   }
+ }
+ 
+-void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+-  if (!state || !Enabled() || !state->object_array) {
++// First-person weapons.
++
++uint32_t FpSlotAddress(uint32_t first_person, uint32_t pose_index) {
++  const uint32_t user = pose_index / kFpSlots;
++  const uint32_t slot = pose_index % kFpSlots;
++  return first_person + user * kFpUserSize + kFpFirstSlot + slot * kFpSlotSize;
++}
++
++void LoadPose(cpu::ppc::PPCContext* ctx, uint32_t slot, const PoseSnapshot& p,
++              std::array<Matrix4x3, kFpPoseMatrices>& out) {
++  for (uint32_t n = 0; n < p.node_count; ++n) {
++    out[n] = LoadMatrix(ctx, slot + kFpSlotNodes + n * kMatrixSize);
++  }
++  if (p.camera_node) {
++    out[kFpMaxNodes] = LoadMatrix(ctx, slot + kFpSlotCameraNode);
++  }
++}
++
++void StorePose(cpu::ppc::PPCContext* ctx, uint32_t slot, const PoseSnapshot& p,
++               const std::array<Matrix4x3, kFpPoseMatrices>& pose) {
++  for (uint32_t n = 0; n < p.node_count; ++n) {
++    StoreMatrix(ctx, slot + kFpSlotNodes + n * kMatrixSize, pose[n]);
++  }
++  if (p.camera_node) {
++    StoreMatrix(ctx, slot + kFpSlotCameraNode, pose[kFpMaxNodes]);
++  }
++}
++
++// Calls fn(i) for every matrix of the pose that is in use.
++template <typename Fn>
++void ForEachPoseMatrix(const PoseSnapshot& p, Fn fn) {
++  for (uint32_t n = 0; n < p.node_count; ++n) {
++    fn(n);
++  }
++  if (p.camera_node) {
++    fn(kFpMaxNodes);
++  }
++}
++
++bool GuestPoseIs(cpu::ppc::PPCContext* ctx, uint32_t slot,
++                 const PoseSnapshot& p,
++                 const std::array<Matrix4x3, kFpPoseMatrices>& expected) {
++  std::array<Matrix4x3, kFpPoseMatrices> guest;
++  LoadPose(ctx, slot, p, guest);
++  bool same = true;
++  ForEachPoseMatrix(
++      p, [&](uint32_t i) { same = same && SameBits(guest[i], expected[i]); });
++  return same;
++}
++
++void SnapshotFirstPerson(cpu::ppc::PPCContext* ctx) {
++  const uint32_t first_person = TlsSlot(ctx, kTlsFirstPerson);
++  if (first_person != state->first_person) {
++    for (auto& p : state->poses) {
++      p.valid = false;
++      p.has_previous = false;
++      p.applied = false;
++    }
++    state->first_person = first_person;
++  }
++  if (!first_person) {
+     return;
+   }
+-  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
+-  if (!time_globals) {
++  for (uint32_t i = 0; i < state->poses.size(); ++i) {
++    PoseSnapshot& p = state->poses[i];
++    p.applied = false;
++    const uint32_t slot = FpSlotAddress(first_person, i);
++    const uint32_t user = slot - kFpFirstSlot - (i % kFpSlots) * kFpSlotSize;
++    const uint32_t flags = LoadU32(ctx, slot + kFpSlotFlags);
++    const uint32_t node_count = LoadU32(ctx, slot + kFpSlotNodeCount);
++    const uint32_t camera_node_index =
++        LoadU32(ctx, slot + kFpSlotCameraNodeIndex);
++    if (!(flags & 0x1) || node_count > kFpMaxNodes) {
++      p.valid = false;
++      p.has_previous = false;
++      continue;
++    }
++    const std::array<uint32_t, 8> key = {
++        LoadU32(ctx, user + kFpUserUnit),
++        LoadU32(ctx, slot + kFpSlotWeapon),
++        LoadU32(ctx, slot + kFpSlotWeaponModel),
++        LoadU32(ctx, slot + kFpSlotArmsModel),
++        LoadU32(ctx, slot + kFpSlotAnimation),
++        node_count,
++        camera_node_index,
++        flags & 0x1F,
++    };
++    const bool same_pose = p.valid && key == p.key;
++    if (same_pose) {
++      p.previous = p.current;
++    }
++    p.key = key;
++    p.valid = true;
++    p.node_count = node_count;
++    p.camera_node = camera_node_index != kNoUnit && (flags & 0x10) != 0;
++    LoadPose(ctx, slot, p, p.current);
++
++    bool jumped = false;
++    bool moved = false;
++    if (same_pose) {
++      ForEachPoseMatrix(p, [&](uint32_t n) {
++        const Matrix4x3& a = p.previous[n];
++        const Matrix4x3& b = p.current[n];
++        jumped = jumped ||
++                 DistanceSquared(a.position, b.position) >
++                     kFpSnapDistance * kFpSnapDistance ||
++                 Dot(a.forward, b.forward) < kFpSnapCosine ||
++                 Dot(a.up, b.up) < kFpSnapCosine;
++        moved = moved || !SameBits(a, b);
++      });
++    }
++    p.has_previous = same_pose && !jumped;
++    p.moved = p.has_previous && moved;
++  }
++}
++
++void BlendFirstPerson(cpu::ppc::PPCContext* ctx, float alpha) {
++  if (!state->first_person ||
++      TlsSlot(ctx, kTlsFirstPerson) != state->first_person) {
+     return;
+   }
+-  float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
+-  if (!(alpha > 0.0f)) {
+-    return;  // also rejects NaN
++  for (uint32_t i = 0; i < state->poses.size(); ++i) {
++    PoseSnapshot& p = state->poses[i];
++    if (!p.has_previous || !p.moved || p.applied) {
++      continue;
++    }
++    const uint32_t slot = FpSlotAddress(state->first_person, i);
++    // Only blend over the pose the last tick built.
++    if (!GuestPoseIs(ctx, slot, p, p.current)) {
++      p.has_previous = false;
++      continue;
++    }
++    ForEachPoseMatrix(p, [&](uint32_t n) {
++      p.written[n] = Interpolate(p.previous[n], p.current[n], alpha);
++    });
++    StorePose(ctx, slot, p, p.written);
++    p.applied = true;
+   }
+-  alpha = std::min(alpha, 1.0f);
+-  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
+-  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
+-    ObjectSnapshot& o = state->objects[i];
+-    if (!o.has_previous || !o.moved || o.applied ||
+-        !StillValid(ctx, data, i, o)) {
++}
++
++void RestoreFirstPerson(cpu::ppc::PPCContext* ctx) {
++  if (!state->first_person ||
++      TlsSlot(ctx, kTlsFirstPerson) != state->first_person) {
++    return;
++  }
++  for (uint32_t i = 0; i < state->poses.size(); ++i) {
++    PoseSnapshot& p = state->poses[i];
++    if (!p.applied) {
+       continue;
+     }
+-    const uint32_t nodes =
+-        o.address + LoadU16(ctx, o.address + kObjectNodeMatricesOffset);
+-    for (uint32_t n = 0; n < o.node_count; ++n) {
+-      StoreMatrix(ctx, nodes + n * kMatrixSize,
+-                  Interpolate(o.previous_nodes[n], o.current_nodes[n], alpha));
++    p.applied = false;
++    const uint32_t slot = FpSlotAddress(state->first_person, i);
++    if (!GuestPoseIs(ctx, slot, p, p.written)) {
++      // Rebuilt outside a tick (e.g. the player got a new unit).
++      p.valid = false;
++      p.has_previous = false;
++      continue;
+     }
+-    StoreVector3(ctx, o.address + kObjectPosition,
+-                 Lerp(o.previous_position, o.current_position, alpha));
+-    o.applied = true;
++    StorePose(ctx, slot, p, p.current);
++  }
++}
++
++// Camera facing.
++
++void RestoreExactFacing(cpu::ppc::PPCContext* ctx) {
++  const uint32_t controls = TlsSlot(ctx, kTlsPlayerControl);
++  if (!controls) {
++    return;
++  }
++  for (uint32_t u = 0; u < kLocalPlayers; ++u) {
++    const uint32_t live =
++        controls + kPlayerControlLive + u * kPlayerControlLiveSize;
++    const uint32_t camera =
++        controls + kPlayerControlCamera + u * kPlayerControlCameraSize;
++    const uint32_t unit = LoadU32(ctx, live + kPlayerControlUnit);
++    // Same check as the game's own per-frame copy (sub_82216E40).
++    if (unit == kNoUnit || unit != LoadU32(ctx, camera + kPlayerControlUnit)) {
++      continue;
++    }
++    StoreU32(ctx, camera + kPlayerControlYaw,
++             LoadU32(ctx, live + kPlayerControlYaw));
++    StoreU32(ctx, camera + kPlayerControlPitch,
++             LoadU32(ctx, live + kPlayerControlPitch));
++  }
++}
++
++// Hooks.
++
++void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
++  if (!state) {
++    return;
++  }
++  RestoreObjects(ctx);
++  RestoreFirstPerson(ctx);
++}
++
++void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Enabled()) {
++    return;
++  }
++  if (!state) {
++    state = new InterpolationState();
++  }
++  SnapshotObjects(ctx);
++  SnapshotFirstPerson(ctx);
++}
++
++void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_unlock_framerate) {
++    return;
++  }
++  // The simulation copies the exact facing back before its next tick
++  // (player_control_update), so this only affects what is drawn.
++  RestoreExactFacing(ctx);
++  if (!state || !Enabled()) {
++    return;
++  }
++  const float alpha = BlendFactor(ctx);
++  if (alpha <= 0.0f) {
++    return;
+   }
++  BlendObjects(ctx, alpha);
++  BlendFirstPerson(ctx, alpha);
+ }
+ 
+ }  // namespace
+diff --git a/src/xenia/kernel/title/halo3/halo3_math.h b/src/xenia/kernel/title/halo3/halo3_math.h
+index 46a3a3b..f2cd245 100644
+--- a/src/xenia/kernel/title/halo3/halo3_math.h
++++ b/src/xenia/kernel/title/halo3/halo3_math.h
+@@ -135,6 +135,20 @@ inline Matrix4x3 Interpolate(const Matrix4x3& a, const Matrix4x3& b, float t) {
+   return r;
+ }
+ 
++// Blends two orientations given as forward and up vectors (an object's
++// facing, left = up x forward). The results are orthonormal.
++inline void InterpolateOrientation(const Vector3& forward_a,
++                                   const Vector3& up_a,
++                                   const Vector3& forward_b,
++                                   const Vector3& up_b, float t,
++                                   Vector3* forward, Vector3* up) {
++  const Quaternion q =
++      Nlerp(QuaternionFromBasis(forward_a, Cross(up_a, forward_a), up_a),
++            QuaternionFromBasis(forward_b, Cross(up_b, forward_b), up_b), t);
++  Vector3 left;
++  BasisFromQuaternion(q, forward, &left, up);
++}
++
+ }  // namespace halo3
+ }  // namespace title
+ }  // namespace kernel

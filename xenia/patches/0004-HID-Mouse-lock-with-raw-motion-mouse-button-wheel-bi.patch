@@ -1,0 +1,1166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [HID] Mouse lock with raw motion, mouse button/wheel
+ bindings, analog keys
+
+- mouse_lock (Windows): clicking into the window hides the cursor, pins it to
+  the client area and forwards raw relative motion (WM_INPUT) to input
+  listeners through the new OnRawMouseMove. Switching windows releases it.
+  While it is on, Escape and double-click no longer leave or toggle
+  fullscreen; they are game input.
+- While the mouse is locked, the keyboard driver takes priority over
+  controllers for keyboard_user_index (InputDriver::TakesPriority), so a
+  connected gamepad doesn't take over the keyboard and mouse player.
+- Keyboard bindings accept mouse buttons (VK 0x01, 0x02, 0x04, 0x05, 0x06)
+  and the wheel as momentary keys 0x0A (up) and 0x0B (down).
+- Bindings are re-parsed when their cvars change, so per-game config
+  bindings take effect.
+- keyboard_analog_movement: with the Wooting Analog SDK installed, the left
+  stick follows how far its bound keys are pressed.
+- hid::MouseInput collects raw motion for title code that implements mouse
+  aiming.
+---
+ src/xenia/app/emulator_window.cc              |  11 +-
+ src/xenia/hid/input_driver.h                  |   4 +
+ src/xenia/hid/input_system.cc                 |  12 +
+ src/xenia/hid/input_system.h                  |   3 +
+ src/xenia/hid/keyboard/analog_keys.h          |  39 ++++
+ src/xenia/hid/keyboard/analog_keys_posix.cc   |  22 ++
+ src/xenia/hid/keyboard/analog_keys_win.cc     | 109 +++++++++
+ .../hid/keyboard/keyboard_input_driver.cc     | 211 ++++++++++++++++--
+ .../hid/keyboard/keyboard_input_driver.h      |  19 ++
+ src/xenia/hid/mouse_input.cc                  |  42 ++++
+ src/xenia/hid/mouse_input.h                   |  31 +++
+ src/xenia/ui/imgui_drawer.cc                  |  13 ++
+ src/xenia/ui/imgui_drawer.h                   |   5 +
+ src/xenia/ui/window.cc                        |  21 ++
+ src/xenia/ui/window.h                         |  10 +
+ src/xenia/ui/window_listener.h                |   4 +
+ src/xenia/ui/window_win.cc                    | 116 +++++++++-
+ src/xenia/ui/window_win.h                     |  17 ++
+ 18 files changed, 666 insertions(+), 23 deletions(-)
+ create mode 100644 src/xenia/hid/keyboard/analog_keys.h
+ create mode 100644 src/xenia/hid/keyboard/analog_keys_posix.cc
+ create mode 100644 src/xenia/hid/keyboard/analog_keys_win.cc
+ create mode 100644 src/xenia/hid/mouse_input.cc
+ create mode 100644 src/xenia/hid/mouse_input.h
+
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index fbd2f98..6aa7ba6 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -64,6 +64,8 @@ DECLARE_string(readback_resolve);
+ 
+ DECLARE_bool(readback_memexport);
+ 
++DECLARE_bool(mouse_lock);
++
+ DEFINE_bool(fullscreen, false, "Whether to launch the emulator in fullscreen.",
+             "Display");
+ 
+@@ -1083,8 +1085,10 @@ void EmulatorWindow::OnKeyDown(ui::KeyEvent& e) {
+     } break;
+ 
+     case ui::VirtualKey::kEscape: {
+-      // Allow users to escape fullscreen (but not enter it).
+-      if (!window_->IsFullscreen()) {
++      // Allow users to escape fullscreen (but not enter it). With the mouse
++      // lock on, Escape belongs to the game (its pause menu) and F11 leaves
++      // fullscreen.
++      if (!window_->IsFullscreen() || cvars::mouse_lock) {
+         return;
+       }
+       SetFullscreen(false);
+@@ -1136,7 +1140,8 @@ void EmulatorWindow::OnMouseDown(const ui::MouseEvent& e) {
+     return;
+   }
+ 
+-  if (e.button() == ui::MouseEvent::Button::kLeft) {
++  // With the mouse lock on, clicks are game input (firing), not UI.
++  if (e.button() == ui::MouseEvent::Button::kLeft && !cvars::mouse_lock) {
+     ToggleFullscreenOnDoubleClick();
+   }
+ }
+diff --git a/src/xenia/hid/input_driver.h b/src/xenia/hid/input_driver.h
+index ee8b00c..7145b5c 100644
+--- a/src/xenia/hid/input_driver.h
++++ b/src/xenia/hid/input_driver.h
+@@ -46,6 +46,10 @@ class InputDriver {
+ 
+   virtual InputType GetInputType() const = 0;
+ 
++  // Whether this driver should be asked before the others for a user, for
++  // instance the keyboard while the mouse is locked for playing.
++  virtual bool TakesPriority(uint32_t user_index) const { return false; }
++
+  protected:
+   explicit InputDriver(xe::ui::Window* window, size_t window_z_order)
+       : window_(window), window_z_order_(window_z_order) {}
+diff --git a/src/xenia/hid/input_system.cc b/src/xenia/hid/input_system.cc
+index b5224f5..96810a6 100644
+--- a/src/xenia/hid/input_system.cc
++++ b/src/xenia/hid/input_system.cc
+@@ -11,6 +11,8 @@
+ 
+ #include "xenia/hid/input_system.h"
+ 
++#include <algorithm>
++
+ #include "xenia/base/profiling.h"
+ #include "xenia/hid/hid_flags.h"
+ #include "xenia/hid/input_driver.h"
+@@ -97,11 +99,20 @@ std::vector<InputDriver*> InputSystem::FilterDrivers(uint32_t flags) {
+   return filtered_drivers;
+ }
+ 
++void InputSystem::PrioritizeDrivers(uint32_t user_index,
++                                    std::vector<InputDriver*>& drivers) {
++  std::stable_partition(drivers.begin(), drivers.end(),
++                        [user_index](const InputDriver* driver) {
++                          return driver->TakesPriority(user_index);
++                        });
++}
++
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
+ 
+   std::vector<InputDriver*> filtered_drivers = FilterDrivers(flags);
++  PrioritizeDrivers(user_index, filtered_drivers);
+ 
+   for (auto& driver : filtered_drivers) {
+     X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
+@@ -120,6 +131,7 @@ X_RESULT InputSystem::GetState(uint32_t user_index, uint32_t flags,
+   if (filtered_drivers.empty()) {
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
++  PrioritizeDrivers(user_index, filtered_drivers);
+ 
+   for (auto& driver : filtered_drivers) {
+     X_RESULT result = driver->GetState(user_index, out_state);
+diff --git a/src/xenia/hid/input_system.h b/src/xenia/hid/input_system.h
+index b3a3629..b5feb36 100644
+--- a/src/xenia/hid/input_system.h
++++ b/src/xenia/hid/input_system.h
+@@ -72,6 +72,9 @@ class InputSystem {
+   X_INPUT_VIBRATION ModifyVibrationLevel(X_INPUT_VIBRATION* vibration);
+ 
+   std::vector<InputDriver*> FilterDrivers(uint32_t flags);
++  // Moves the drivers that take priority for the user to the front.
++  static void PrioritizeDrivers(uint32_t user_index,
++                                std::vector<InputDriver*>& drivers);
+ 
+   xe::ui::Window* window_ = nullptr;
+ 
+diff --git a/src/xenia/hid/keyboard/analog_keys.h b/src/xenia/hid/keyboard/analog_keys.h
+new file mode 100644
+index 0000000..c89fc82
+--- /dev/null
++++ b/src/xenia/hid/keyboard/analog_keys.h
+@@ -0,0 +1,39 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_HID_KEYBOARD_ANALOG_KEYS_H_
++#define XENIA_HID_KEYBOARD_ANALOG_KEYS_H_
++
++#include <cstdint>
++
++namespace xe {
++namespace hid {
++namespace keyboard {
++
++// Analog key travel from keyboards with analog switches (Wooting, through the
++// Wooting Analog SDK that Wootility installs). Unavailable when the SDK or a
++// supported keyboard is missing.
++class AnalogKeys {
++ public:
++  // Loads the SDK on first use. Returns nullptr if it isn't usable.
++  static AnalogKeys* Get();
++
++  // How far a key is pressed, 0 (released) to 1 (bottomed out), by Windows
++  // virtual-key code; negative if the key has no analog reading.
++  virtual float Read(uint16_t virtual_key) = 0;
++
++ protected:
++  virtual ~AnalogKeys() = default;
++};
++
++}  // namespace keyboard
++}  // namespace hid
++}  // namespace xe
++
++#endif  // XENIA_HID_KEYBOARD_ANALOG_KEYS_H_
+diff --git a/src/xenia/hid/keyboard/analog_keys_posix.cc b/src/xenia/hid/keyboard/analog_keys_posix.cc
+new file mode 100644
+index 0000000..43606ea
+--- /dev/null
++++ b/src/xenia/hid/keyboard/analog_keys_posix.cc
+@@ -0,0 +1,22 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/hid/keyboard/analog_keys.h"
++
++namespace xe {
++namespace hid {
++namespace keyboard {
++
++// Analog keys are read through Windows virtual-key codes, so only Windows is
++// supported.
++AnalogKeys* AnalogKeys::Get() { return nullptr; }
++
++}  // namespace keyboard
++}  // namespace hid
++}  // namespace xe
+diff --git a/src/xenia/hid/keyboard/analog_keys_win.cc b/src/xenia/hid/keyboard/analog_keys_win.cc
+new file mode 100644
+index 0000000..0a599d6
+--- /dev/null
++++ b/src/xenia/hid/keyboard/analog_keys_win.cc
+@@ -0,0 +1,109 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/hid/keyboard/analog_keys.h"
++
++#include <mutex>
++
++#include "xenia/base/logging.h"
++#include "xenia/base/platform_win.h"
++
++namespace xe {
++namespace hid {
++namespace keyboard {
++namespace {
++
++// C API of the Wooting Analog SDK (includes/wooting-analog-sdk.h).
++using InitialiseFn = int (*)();
++using SetKeycodeModeFn = int (*)(unsigned int mode);
++using ReadAnalogFn = float (*)(unsigned short code);
++constexpr unsigned int kKeycodeTypeVirtualKey = 2;
++// Virtual keys as the current keyboard layout maps them, like WM_KEYDOWN.
++constexpr unsigned int kKeycodeTypeVirtualKeyTranslate = 3;
++
++class WootingAnalogKeys final : public AnalogKeys {
++ public:
++  bool Load() {
++    // The bundled distributable if the user placed one next to Xenia, then
++    // the system SDK that Wootility installs (current and pre-0.9 locations).
++    static const wchar_t* const kCandidates[] = {
++        L"wooting_analog_sdk_dist.dll",
++        L"C:\\Program Files\\wooting-analog-sdk\\wooting_analog_sdk.dll",
++        L"C:\\Program Files\\WootingAnalogSDK\\wooting_analog_sdk.dll",
++        L"wooting_analog_sdk.dll",
++    };
++    for (const wchar_t* candidate : kCandidates) {
++      library_ = LoadLibraryW(candidate);
++      if (library_) {
++        break;
++      }
++    }
++    if (!library_) {
++      return false;
++    }
++    auto initialise = reinterpret_cast<InitialiseFn>(
++        GetProcAddress(library_, "wooting_analog_initialise"));
++    auto set_keycode_mode = reinterpret_cast<SetKeycodeModeFn>(
++        GetProcAddress(library_, "wooting_analog_set_keycode_mode"));
++    read_analog_ = reinterpret_cast<ReadAnalogFn>(
++        GetProcAddress(library_, "wooting_analog_read_analog"));
++    if (!initialise || !set_keycode_mode || !read_analog_) {
++      XELOGW("Wooting Analog SDK: missing exports, analog keys disabled");
++      return false;
++    }
++    const int devices = initialise();
++    if (devices < 0) {
++      XELOGW("Wooting Analog SDK: initialisation failed ({})", devices);
++      return false;
++    }
++    // WootingAnalogResult_Ok is 1.
++    if (set_keycode_mode(kKeycodeTypeVirtualKeyTranslate) != 1 &&
++        set_keycode_mode(kKeycodeTypeVirtualKey) != 1) {
++      XELOGW("Wooting Analog SDK: virtual-key mode unavailable");
++      return false;
++    }
++    XELOGI("Wooting Analog SDK loaded, {} device(s) found", devices);
++    return true;
++  }
++
++  float Read(uint16_t virtual_key) override {
++    const float value = read_analog_(virtual_key);
++    return value >= 0.0f ? value : -1.0f;
++  }
++
++  ~WootingAnalogKeys() override {
++    if (library_) {
++      FreeLibrary(library_);
++    }
++  }
++
++ private:
++  HMODULE library_ = nullptr;
++  ReadAnalogFn read_analog_ = nullptr;
++};
++
++}  // namespace
++
++AnalogKeys* AnalogKeys::Get() {
++  static WootingAnalogKeys* instance = nullptr;
++  static std::once_flag once;
++  std::call_once(once, [] {
++    auto keys = new WootingAnalogKeys();
++    if (keys->Load()) {
++      instance = keys;
++    } else {
++      delete keys;
++    }
++  });
++  return instance;
++}
++
++}  // namespace keyboard
++}  // namespace hid
++}  // namespace xe
+diff --git a/src/xenia/hid/keyboard/keyboard_input_driver.cc b/src/xenia/hid/keyboard/keyboard_input_driver.cc
+index 0277b0c..40b94a4 100644
+--- a/src/xenia/hid/keyboard/keyboard_input_driver.cc
++++ b/src/xenia/hid/keyboard/keyboard_input_driver.cc
+@@ -9,9 +9,14 @@
+ 
+ #include "xenia/hid/keyboard/keyboard_input_driver.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include "xenia/base/logging.h"
+ #include "xenia/hid/hid_flags.h"
+ #include "xenia/hid/input_system.h"
++#include "xenia/hid/keyboard/analog_keys.h"
++#include "xenia/hid/mouse_input.h"
+ #include "xenia/ui/virtual_key.h"
+ #include "xenia/ui/window.h"
+ 
+@@ -30,6 +35,12 @@ DEFINE_int32(keyboard_mode, 0,
+              "controller being connected!",
+              "HID");
+ 
++DEFINE_bool(keyboard_analog_movement, true,
++            "Drive the left stick from how far its bound keys are pressed on "
++            "keyboards with analog switches (Wooting, with the Wooting Analog "
++            "SDK installed by Wootility).",
++            "HID");
++
+ DEFINE_int32(
+     keyboard_user_index, 0,
+     "Controller port that keyboard emulates. [0, 3] - Keyboard is assigned to "
+@@ -40,6 +51,18 @@ namespace xe {
+ namespace hid {
+ namespace keyboard {
+ 
++namespace {
++// Virtual keys standing in for the mouse wheel in key bindings (unassigned in
++// the Windows virtual key table).
++constexpr ui::VirtualKey kWheelUpKey = static_cast<ui::VirtualKey>(0x0A);
++constexpr ui::VirtualKey kWheelDownKey = static_cast<ui::VirtualKey>(0x0B);
++// How many state polls a wheel notch holds its key down for, so the game sees
++// the press even if it polls slower than the wheel moves.
++constexpr uint32_t kWheelPressPolls = 3;
++// Keystroke events kept for XInputGetKeystroke.
++constexpr size_t kMaxQueuedKeyEvents = 256;
++}  // namespace
++
+ uint8_t KeyboardInputDriver::VirtualKeyToHIDUsage(uint16_t vk) const {
+   // Letters: contiguous in both VK and HID space
+   if (vk >= 'A' && vk <= 'Z') {
+@@ -222,14 +245,30 @@ void KeyboardInputDriver::ParseKeyBinding(
+ KeyboardInputDriver::KeyboardInputDriver(xe::ui::Window* window,
+                                          size_t window_z_order)
+     : InputDriver(window, window_z_order), window_input_listener_(*this) {
++  UpdateKeyBindings();
++  window->AddInputListener(&window_input_listener_, window_z_order);
++}
++
++void KeyboardInputDriver::UpdateKeyBindings() {
++  std::string source;
++#define XE_HID_KEYBOARD_BINDING(button, description, cvar_name, \
++                                cvar_default_value)             \
++  source += cvars::cvar_name;                                   \
++  source += '\n';
++#include "keyboard_binding_table.inc"
++#undef XE_HID_KEYBOARD_BINDING
++  if (source == key_bindings_source_ && !key_bindings_.empty()) {
++    return;
++  }
++  auto global_lock = global_critical_region_.Acquire();
++  key_bindings_.clear();
++  key_bindings_source_ = std::move(source);
+ #define XE_HID_KEYBOARD_BINDING(button, description, cvar_name,        \
+                                 cvar_default_value)                    \
+   ParseKeyBinding(xe::ui::VirtualKey::kXInputPad##button, description, \
+                   cvars::cvar_name);
+ #include "keyboard_binding_table.inc"
+ #undef XE_HID_KEYBOARD_BINDING
+-
+-  window->AddInputListener(&window_input_listener_, window_z_order);
+ }
+ 
+ KeyboardInputDriver::~KeyboardInputDriver() {
+@@ -272,6 +311,8 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  UpdateKeyBindings();
++
+   packet_number_++;
+ 
+   uint16_t buttons = 0;
+@@ -283,6 +324,17 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
+   int16_t thumb_ry = 0;
+ 
+   if (window()->HasFocus()) {
++    {
++      auto global_lock = global_critical_region_.Acquire();
++      if (wheel_up_polls_) {
++        --wheel_up_polls_;
++      }
++      if (wheel_down_polls_) {
++        --wheel_down_polls_;
++      }
++      SetBindingsForKey(kWheelUpKey, wheel_up_polls_ != 0);
++      SetBindingsForKey(kWheelDownKey, wheel_down_polls_ != 0);
++    }
+     for (const KeyBinding& b : key_bindings_) {
+       if (b.is_pressed) {
+         switch (b.output_key) {
+@@ -368,6 +420,52 @@ X_RESULT KeyboardInputDriver::GetState(uint32_t user_index,
+     }
+   }
+ 
++  if (cvars::keyboard_analog_movement && window()->HasFocus()) {
++    if (AnalogKeys* analog = AnalogKeys::Get()) {
++      // Analog travel of each left-stick direction; keys without an analog
++      // reading (another keyboard) count as fully pressed or released.
++      float up = 0.0f, down = 0.0f, left = 0.0f, right = 0.0f;
++      bool any_analog = false;
++      for (const KeyBinding& b : key_bindings_) {
++        float* axis;
++        switch (b.output_key) {
++          case ui::VirtualKey::kXInputPadLThumbUp:
++            axis = &up;
++            break;
++          case ui::VirtualKey::kXInputPadLThumbDown:
++            axis = &down;
++            break;
++          case ui::VirtualKey::kXInputPadLThumbLeft:
++            axis = &left;
++            break;
++          case ui::VirtualKey::kXInputPadLThumbRight:
++            axis = &right;
++            break;
++          default:
++            continue;
++        }
++        float value = analog->Read(static_cast<uint16_t>(b.input_key));
++        if (value >= 0.0f) {
++          any_analog = true;
++        } else {
++          value = b.is_pressed ? 1.0f : 0.0f;
++        }
++        *axis = std::max(*axis, value);
++      }
++      if (any_analog) {
++        float x = right - left;
++        float y = up - down;
++        const float length = std::sqrt(x * x + y * y);
++        if (length > 1.0f) {
++          x /= length;
++          y /= length;
++        }
++        thumb_lx = static_cast<int16_t>(x * 32767.0f);
++        thumb_ly = static_cast<int16_t>(y * 32767.0f);
++      }
++    }
++  }
++
+   out_state->packet_number = packet_number_;
+   out_state->gamepad.buttons = buttons;
+   out_state->gamepad.left_trigger = left_trigger;
+@@ -514,31 +612,31 @@ void KeyboardInputDriver::OnKey(ui::KeyEvent& e, bool is_down) {
+   key.capital_pressed = e.is_capital_pressed();
+ 
+   auto global_lock = global_critical_region_.Acquire();
++  // Titles that only read controller state never drain the keystroke queue;
++  // keep only recent events.
++  if (key_events_.size() >= kMaxQueuedKeyEvents) {
++    key_events_.pop_front();
++  }
+   key_events_.push_back(key);
+ 
+   bool uppercase = key.capital_pressed || key.shift_pressed;
+ 
+   // Update key binding state for the correct input case, otherwise we will
+   // trigger both inputs for uppercase and lowercase causing input to be
+-  // registered twice.
++  // registered twice. A key can be bound to several controller inputs.
+   for (auto& key_binding : key_bindings_) {
+     if (key_binding.input_key != key.virtual_key) {
+       continue;
+     }
+-
+-    if (key_binding.uppercase && uppercase) {
+-      key_binding.is_pressed = is_down;
+-      break;
+-    }
+-
+-    if (key_binding.lowercase && !uppercase) {
+-      key_binding.is_pressed = is_down;
+-      break;
++    if (!is_down) {
++      // Release whichever case was pressed.
++      key_binding.is_pressed = false;
++      continue;
+     }
+-
+-    if (!key_binding.uppercase && !key_binding.lowercase) {
+-      key_binding.is_pressed = is_down;
+-      break;
++    if ((key_binding.uppercase && uppercase) ||
++        (key_binding.lowercase && !uppercase) ||
++        (!key_binding.uppercase && !key_binding.lowercase)) {
++      key_binding.is_pressed = true;
+     }
+   }
+ }
+@@ -572,6 +670,87 @@ InputType KeyboardInputDriver::GetInputType() const {
+   return InputType::Controller;
+ }
+ 
++bool KeyboardInputDriver::TakesPriority(uint32_t user_index) const {
++  // Playing with the mouse locked to the window means keyboard and mouse,
++  // even if a controller is connected too.
++  return static_cast<KeyboardMode>(cvars::keyboard_mode) ==
++             KeyboardMode::Enabled &&
++         user_index == static_cast<uint32_t>(cvars::keyboard_user_index) &&
++         window()->IsMouseLocked();
++}
++
++void KeyboardInputDriver::SetBindingsForKey(ui::VirtualKey key, bool is_down) {
++  for (auto& key_binding : key_bindings_) {
++    if (key_binding.input_key == key) {
++      key_binding.is_pressed = is_down;
++    }
++  }
++}
++
++void KeyboardInputDriver::OnMouseButton(ui::MouseEvent::Button button,
++                                        bool is_down) {
++  if (static_cast<KeyboardMode>(cvars::keyboard_mode) !=
++      KeyboardMode::Enabled) {
++    return;
++  }
++  ui::VirtualKey key;
++  switch (button) {
++    case ui::MouseEvent::Button::kLeft:
++      key = ui::VirtualKey::kLButton;
++      break;
++    case ui::MouseEvent::Button::kRight:
++      key = ui::VirtualKey::kRButton;
++      break;
++    case ui::MouseEvent::Button::kMiddle:
++      key = ui::VirtualKey::kMButton;
++      break;
++    case ui::MouseEvent::Button::kX1:
++      key = ui::VirtualKey::kXButton1;
++      break;
++    case ui::MouseEvent::Button::kX2:
++      key = ui::VirtualKey::kXButton2;
++      break;
++    default:
++      return;
++  }
++  auto global_lock = global_critical_region_.Acquire();
++  SetBindingsForKey(key, is_down);
++}
++
++void KeyboardInputDriver::OnMouseWheel(int32_t scroll_y) {
++  if (static_cast<KeyboardMode>(cvars::keyboard_mode) !=
++          KeyboardMode::Enabled ||
++      !scroll_y) {
++    return;
++  }
++  auto global_lock = global_critical_region_.Acquire();
++  if (scroll_y > 0) {
++    wheel_up_polls_ = kWheelPressPolls;
++  } else {
++    wheel_down_polls_ = kWheelPressPolls;
++  }
++}
++
++void KeyboardInputDriver::KeyboardWindowInputListener::OnMouseDown(
++    ui::MouseEvent& e) {
++  driver_.OnMouseButton(e.button(), true);
++}
++
++void KeyboardInputDriver::KeyboardWindowInputListener::OnMouseUp(
++    ui::MouseEvent& e) {
++  driver_.OnMouseButton(e.button(), false);
++}
++
++void KeyboardInputDriver::KeyboardWindowInputListener::OnMouseWheel(
++    ui::MouseEvent& e) {
++  driver_.OnMouseWheel(e.scroll_y());
++}
++
++void KeyboardInputDriver::KeyboardWindowInputListener::OnRawMouseMove(
++    ui::MouseEvent& e) {
++  MouseInput::AddMotion(e.x(), e.y());
++}
++
+ }  // namespace keyboard
+ }  // namespace hid
+ }  // namespace xe
+diff --git a/src/xenia/hid/keyboard/keyboard_input_driver.h b/src/xenia/hid/keyboard/keyboard_input_driver.h
+index 9cd375b..42ee919 100644
+--- a/src/xenia/hid/keyboard/keyboard_input_driver.h
++++ b/src/xenia/hid/keyboard/keyboard_input_driver.h
+@@ -44,6 +44,7 @@ class KeyboardInputDriver final : public InputDriver {
+                         X_INPUT_KEYSTROKE* out_keystroke) override;
+ 
+   virtual InputType GetInputType() const override;
++  bool TakesPriority(uint32_t user_index) const override;
+ 
+  protected:
+   class KeyboardWindowInputListener final : public ui::WindowInputListener {
+@@ -54,6 +55,10 @@ class KeyboardInputDriver final : public InputDriver {
+     void OnKeyDown(ui::KeyEvent& e) override;
+     void OnKeyUp(ui::KeyEvent& e) override;
+     void OnKeyChar(ui::KeyEvent& e) override;
++    void OnMouseDown(ui::MouseEvent& e) override;
++    void OnMouseUp(ui::MouseEvent& e) override;
++    void OnMouseWheel(ui::MouseEvent& e) override;
++    void OnRawMouseMove(ui::MouseEvent& e) override;
+ 
+    private:
+     KeyboardInputDriver& driver_;
+@@ -82,8 +87,17 @@ class KeyboardInputDriver final : public InputDriver {
+   void ParseKeyBinding(ui::VirtualKey virtual_key,
+                        const std::string_view description,
+                        const std::string_view binding);
++  // Re-parses the bindings if their cvars changed since the last parse (a
++  // per-game config is applied after the driver is created).
++  void UpdateKeyBindings();
+ 
+   void OnKey(ui::KeyEvent& e, bool is_down);
++  // Mouse buttons are bound like keys, as virtual keys 0x01 (left), 0x02
++  // (right), 0x04 (middle), 0x05 / 0x06 (side buttons). The wheel acts as two
++  // momentary keys, 0x0A (up) and 0x0B (down).
++  void OnMouseButton(ui::MouseEvent::Button button, bool is_down);
++  void OnMouseWheel(int32_t scroll_y);
++  void SetBindingsForKey(ui::VirtualKey key, bool is_down);
+ 
+   void OnChar(ui::KeyEvent& e);
+ 
+@@ -91,10 +105,15 @@ class KeyboardInputDriver final : public InputDriver {
+ 
+   std::deque<KeyEvent> key_events_;
+   std::vector<KeyBinding> key_bindings_;
++  std::string key_bindings_source_;
+ 
+   KeyboardWindowInputListener window_input_listener_;
+ 
+   uint32_t packet_number_ = 1;
++
++  // Remaining GetState polls during which a wheel notch holds its key down.
++  uint32_t wheel_up_polls_ = 0;
++  uint32_t wheel_down_polls_ = 0;
+ };
+ 
+ }  // namespace keyboard
+diff --git a/src/xenia/hid/mouse_input.cc b/src/xenia/hid/mouse_input.cc
+new file mode 100644
+index 0000000..8aef820
+--- /dev/null
++++ b/src/xenia/hid/mouse_input.cc
+@@ -0,0 +1,42 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/hid/mouse_input.h"
++
++#include <atomic>
++
++namespace xe {
++namespace hid {
++namespace {
++// Both axes packed into one word so a reader never sees half an update.
++std::atomic<uint64_t> pending_motion{0};
++
++uint64_t Pack(int32_t dx, int32_t dy) {
++  return (uint64_t(uint32_t(dx)) << 32) | uint32_t(dy);
++}
++}  // namespace
++
++void MouseInput::AddMotion(int32_t dx, int32_t dy) {
++  uint64_t current = pending_motion.load(std::memory_order_relaxed);
++  uint64_t next;
++  do {
++    next = Pack(int32_t(uint32_t(current >> 32)) + dx,
++                int32_t(uint32_t(current)) + dy);
++  } while (!pending_motion.compare_exchange_weak(current, next,
++                                                 std::memory_order_relaxed));
++}
++
++void MouseInput::TakeMotion(int32_t* dx, int32_t* dy) {
++  const uint64_t motion = pending_motion.exchange(0, std::memory_order_relaxed);
++  *dx = int32_t(uint32_t(motion >> 32));
++  *dy = int32_t(uint32_t(motion));
++}
++
++}  // namespace hid
++}  // namespace xe
+diff --git a/src/xenia/hid/mouse_input.h b/src/xenia/hid/mouse_input.h
+new file mode 100644
+index 0000000..42d4d6b
+--- /dev/null
++++ b/src/xenia/hid/mouse_input.h
+@@ -0,0 +1,31 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_HID_MOUSE_INPUT_H_
++#define XENIA_HID_MOUSE_INPUT_H_
++
++#include <cstdint>
++
++namespace xe {
++namespace hid {
++
++// Raw relative mouse motion gathered from the window while the mouse is
++// locked, for title code that implements mouse aiming. Written by the UI
++// thread, drained by the game thread.
++class MouseInput {
++ public:
++  static void AddMotion(int32_t dx, int32_t dy);
++  // Returns the motion accumulated since the previous call and resets it.
++  static void TakeMotion(int32_t* dx, int32_t* dy);
++};
++
++}  // namespace hid
++}  // namespace xe
++
++#endif  // XENIA_HID_MOUSE_INPUT_H_
+diff --git a/src/xenia/ui/imgui_drawer.cc b/src/xenia/ui/imgui_drawer.cc
+index d803160..b9c1e3d 100644
+--- a/src/xenia/ui/imgui_drawer.cc
++++ b/src/xenia/ui/imgui_drawer.cc
+@@ -63,6 +63,9 @@ ImGuiDrawer::ImGuiDrawer(xe::ui::Window* window, size_t z_order)
+ }
+ 
+ ImGuiDrawer::~ImGuiDrawer() {
++  if (mouse_lock_inhibited_) {
++    window_->InhibitMouseLock(false);
++  }
+   SetPresenter(nullptr);
+   if (!dialogs_.empty()) {
+     window_->RemoveInputListener(this);
+@@ -97,6 +100,7 @@ void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
+     }
+   }
+   dialogs_.push_back(dialog);
++  UpdateMouseLockInhibition();
+ }
+ 
+ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
+@@ -113,6 +117,7 @@ void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
+     }
+   }
+   dialogs_.erase(it);
++  UpdateMouseLockInhibition();
+   DetachIfLastWindowRemoved();
+ }
+ 
+@@ -903,6 +908,14 @@ void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(
+   UpdateMousePosition(float(e.x()), float(e.y()));
+ }
+ 
++void ImGuiDrawer::UpdateMouseLockInhibition() {
++  const bool inhibit = !dialogs_.empty();
++  if (inhibit != mouse_lock_inhibited_) {
++    mouse_lock_inhibited_ = inhibit;
++    window_->InhibitMouseLock(inhibit);
++  }
++}
++
+ void ImGuiDrawer::DetachIfLastWindowRemoved() {
+   // IsDrawingDialogs() is also checked because in a situation of removing the
+   // only dialog, then adding a dialog, from within a dialog's Draw function,
+diff --git a/src/xenia/ui/imgui_drawer.h b/src/xenia/ui/imgui_drawer.h
+index 6c32a22..bb7fb9f 100644
+--- a/src/xenia/ui/imgui_drawer.h
++++ b/src/xenia/ui/imgui_drawer.h
+@@ -125,6 +125,9 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+ 
+   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
+   void DetachIfLastWindowRemoved();
++  // Dialogs need the cursor: keep the window's mouse lock released while any
++  // is open.
++  void UpdateMouseLockInhibition();
+   void UpdateGamepads();
+ 
+   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
+@@ -172,6 +175,8 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   uint64_t last_frame_time_ticks_;
+ 
+   bool are_notifications_enabled_ = true;
++
++  bool mouse_lock_inhibited_ = false;
+ };
+ 
+ }  // namespace ui
+diff --git a/src/xenia/ui/window.cc b/src/xenia/ui/window.cc
+index 22336cd..8473cb1 100644
+--- a/src/xenia/ui/window.cc
++++ b/src/xenia/ui/window.cc
+@@ -12,6 +12,7 @@
+ #include "third_party/imgui/imgui.h"
+ #include "xenia/base/assert.h"
+ #include "xenia/base/clock.h"
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/ui/imgui_drawer.h"
+ #include "xenia/ui/presenter.h"
+@@ -19,6 +20,13 @@
+ DEFINE_int32(window_size_x, 1280, "Xenia window width", "UI");
+ DEFINE_int32(window_size_y, 720, "Xenia window height", "UI");
+ 
++DEFINE_bool(mouse_lock, false,
++            "Click into the game window to hide and lock the cursor and send "
++            "raw mouse movement to games with mouse aiming support. Switching "
++            "windows (Alt+Tab) releases it. While it is locked, the keyboard "
++            "and mouse take priority over controllers for keyboard_user_index.",
++            "HID");
++
+ namespace xe {
+ namespace ui {
+ 
+@@ -661,6 +669,19 @@ void Window::OnMouseWheel(MouseEvent& e,
+   }
+ }
+ 
++void Window::OnRawMouseMove(MouseEvent& e,
++                            WindowDestructionReceiver& destruction_receiver) {
++  PropagateEventThroughInputListeners(
++      [&e](auto listener) {
++        listener->OnRawMouseMove(e);
++        return e.is_handled();
++      },
++      destruction_receiver);
++  if (destruction_receiver.IsWindowDestroyed()) {
++    return;
++  }
++}
++
+ void Window::OnTouchEvent(TouchEvent& e,
+                           WindowDestructionReceiver& destruction_receiver) {
+   PropagateEventThroughInputListeners(
+diff --git a/src/xenia/ui/window.h b/src/xenia/ui/window.h
+index 487cda1..7ca4028 100644
+--- a/src/xenia/ui/window.h
++++ b/src/xenia/ui/window.h
+@@ -325,6 +325,14 @@ class Window {
+   void SetCursorVisibility(CursorVisibility new_cursor_visibility);
+ 
+   bool HasFocus() const { return HasActualState() ? has_focus_ : false; }
++
++  // Whether the cursor is captured for games with mouse aiming (the
++  // mouse_lock cvar). Safe to call from any thread.
++  virtual bool IsMouseLocked() const { return false; }
++  // While inhibited, for instance while a UI dialog needs the cursor, the
++  // mouse lock is released and clicks don't take it. Calls must be balanced.
++  // UI thread only.
++  virtual void InhibitMouseLock(bool inhibit) {}
+   // May be applied in a delayed way or dropped at all, HasFocus will not
+   // necessarily be true immediately.
+   void Focus();
+@@ -605,6 +613,8 @@ class Window {
+                  WindowDestructionReceiver& destruction_receiver);
+   void OnMouseWheel(MouseEvent& e,
+                     WindowDestructionReceiver& destruction_receiver);
++  void OnRawMouseMove(MouseEvent& e,
++                      WindowDestructionReceiver& destruction_receiver);
+ 
+   void OnTouchEvent(TouchEvent& e,
+                     WindowDestructionReceiver& destruction_receiver);
+diff --git a/src/xenia/ui/window_listener.h b/src/xenia/ui/window_listener.h
+index c22322a..5eb1979 100644
+--- a/src/xenia/ui/window_listener.h
++++ b/src/xenia/ui/window_listener.h
+@@ -49,6 +49,10 @@ class WindowInputListener {
+   virtual void OnMouseMove(MouseEvent& e) {}
+   virtual void OnMouseUp(MouseEvent& e) {}
+   virtual void OnMouseWheel(MouseEvent& e) {}
++  // Relative mouse movement in raw device units (x() / y() are deltas), only
++  // delivered while the platform window has locked the mouse for a game
++  // (Windows: the mouse_lock cvar, click to lock, switch windows to release).
++  virtual void OnRawMouseMove(MouseEvent& e) {}
+ 
+   virtual void OnTouchEvent(TouchEvent& e) {}
+ };
+diff --git a/src/xenia/ui/window_win.cc b/src/xenia/ui/window_win.cc
+index c8addb1..c3dcbbc 100644
+--- a/src/xenia/ui/window_win.cc
++++ b/src/xenia/ui/window_win.cc
+@@ -10,6 +10,7 @@
+ #include "xenia/ui/window_win.h"
+ 
+ #include "xenia/base/assert.h"
++#include "xenia/base/cvar.h"
+ #include "xenia/base/filesystem.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/ui/surface_win.h"
+@@ -22,6 +23,9 @@
+ #include <Dbt.h>
+ #include <ShellScalingApi.h>
+ #include <dwmapi.h>
++#include <hidusage.h>
++
++DECLARE_bool(mouse_lock);
+ 
+ namespace xe {
+ namespace ui {
+@@ -216,6 +220,17 @@ bool Win32Window::OpenImpl() {
+       hwnd_, &filter,
+       DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES);
+ 
++  // Raw mouse input for relative motion while the mouse is locked. Without
++  // RIDEV_INPUTSINK it is only delivered while the window is in the
++  // foreground.
++  RAWINPUTDEVICE raw_mouse = {};
++  raw_mouse.usUsagePage = HID_USAGE_PAGE_GENERIC;
++  raw_mouse.usUsage = HID_USAGE_GENERIC_MOUSE;
++  raw_mouse.hwndTarget = hwnd_;
++  if (!RegisterRawInputDevices(&raw_mouse, 1, sizeof(raw_mouse))) {
++    XELOGW("Failed to register for raw mouse input");
++  }
++
+   // Apply the initial state from the Window that the window shouldn't be
+   // visibly transitioned to.
+ 
+@@ -840,6 +855,19 @@ bool Win32Window::HandleMouse(UINT message, WPARAM wParam, LPARAM lParam,
+     }
+   }
+ 
++  if (message == WM_LBUTTONDOWN) {
++    if (cvars::mouse_lock && !mouse_locked_ && !mouse_lock_inhibitors_ &&
++        HasFocus()) {
++      LockMouse();
++      swallow_left_button_up_ = true;
++      return true;
++    }
++    swallow_left_button_up_ = false;
++  } else if (message == WM_LBUTTONUP && swallow_left_button_up_) {
++    swallow_left_button_up_ = false;
++    return true;
++  }
++
+   MouseEvent::Button button = MouseEvent::Button::kNone;
+   int32_t scroll_y = 0;
+   switch (message) {
+@@ -915,10 +943,12 @@ bool Win32Window::HandleMouse(UINT message, WPARAM wParam, LPARAM lParam,
+ bool Win32Window::HandleKeyboard(
+     UINT message, WPARAM wParam, LPARAM lParam,
+     WindowDestructionReceiver& destruction_receiver) {
+-  KeyEvent e(this, VirtualKey(wParam), lParam & 0xFFFF,
+-             !!(lParam & (LPARAM(1) << 30)), !!(GetKeyState(VK_SHIFT) & 0x1),
+-             !!(GetKeyState(VK_CONTROL) & 0x1), !!(GetKeyState(VK_MENU) & 0x1),
+-             !!(GetKeyState(VK_CAPITAL) & 0x1));
++  // The high bit of GetKeyState is "held"; the low bit is the toggle state,
++  // which only means something for Caps Lock.
++  KeyEvent e(
++      this, VirtualKey(wParam), lParam & 0xFFFF, !!(lParam & (LPARAM(1) << 30)),
++      !!(GetKeyState(VK_SHIFT) & 0x8000), !!(GetKeyState(VK_CONTROL) & 0x8000),
++      !!(GetKeyState(VK_MENU) & 0x8000), !!(GetKeyState(VK_CAPITAL) & 0x1));
+   switch (message) {
+     case WM_KEYDOWN:
+       OnKeyDown(e, destruction_receiver);
+@@ -950,6 +980,54 @@ bool Win32Window::HandleKeyboard(
+   return e.is_handled();
+ }
+ 
++void Win32Window::LockMouse() {
++  mouse_locked_ = true;
++  UpdateMouseLockClip();
++  SetCursor(nullptr);
++}
++
++void Win32Window::UnlockMouse() {
++  swallow_left_button_up_ = false;
++  if (!mouse_locked_) {
++    return;
++  }
++  mouse_locked_ = false;
++  ClipCursor(nullptr);
++  CursorVisibility visibility = GetCursorVisibility();
++  bool hidden = visibility == CursorVisibility::kHidden ||
++                (visibility == CursorVisibility::kAutoHidden &&
++                 cursor_currently_auto_hidden_);
++  SetCursorIfFocusedOnClientArea(hidden ? nullptr : arrow_cursor_);
++}
++
++void Win32Window::InhibitMouseLock(bool inhibit) {
++  mouse_lock_inhibitors_ += inhibit ? 1 : -1;
++  assert_true(mouse_lock_inhibitors_ >= 0);
++  if (mouse_lock_inhibitors_ > 0) {
++    UnlockMouse();
++  }
++}
++
++void Win32Window::UpdateMouseLockClip() {
++  // Pin the cursor to the center of the client area. The clip is lost when the
++  // window moves or another program changes it, so it is re-checked on every
++  // raw mouse message.
++  RECT client;
++  if (!GetClientRect(hwnd_, &client)) {
++    return;
++  }
++  POINT center = {(client.left + client.right) / 2,
++                  (client.top + client.bottom) / 2};
++  if (!ClientToScreen(hwnd_, &center)) {
++    return;
++  }
++  RECT desired = {center.x, center.y, center.x + 1, center.y + 1};
++  RECT current;
++  if (!GetClipCursor(&current) || !EqualRect(&current, &desired)) {
++    ClipCursor(&desired);
++  }
++}
++
+ void Win32Window::SetCursorIfFocusedOnClientArea(HCURSOR cursor) const {
+   if (!HasFocus()) {
+     return;
+@@ -1159,7 +1237,33 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
+       }
+     } break;
+ 
++    case WM_INPUT: {
++      if (!mouse_locked_) {
++        break;
++      }
++      RAWINPUT raw;
++      UINT raw_size = sizeof(raw);
++      if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw,
++                          &raw_size, sizeof(RAWINPUTHEADER)) == UINT(-1) ||
++          raw.header.dwType != RIM_TYPEMOUSE ||
++          (raw.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
++        break;
++      }
++      UpdateMouseLockClip();
++      if (raw.data.mouse.lLastX || raw.data.mouse.lLastY) {
++        MouseEvent e(this, MouseEvent::Button::kNone, raw.data.mouse.lLastX,
++                     raw.data.mouse.lLastY);
++        WindowDestructionReceiver destruction_receiver(this);
++        OnRawMouseMove(e, destruction_receiver);
++        if (destruction_receiver.IsWindowDestroyedOrClosed()) {
++          break;
++        }
++      }
++      // DefWindowProc performs the cleanup for WM_INPUT.
++    } break;
++
+     case WM_KILLFOCUS: {
++      UnlockMouse();
+       WindowDestructionReceiver destruction_receiver(this);
+       OnFocusUpdate(false, destruction_receiver);
+       if (destruction_receiver.IsWindowDestroyedOrClosed()) {
+@@ -1176,6 +1280,10 @@ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam,
+     } break;
+ 
+     case WM_SETCURSOR: {
++      if (mouse_locked_ && reinterpret_cast<HWND>(wParam) == hwnd_) {
++        SetCursor(nullptr);
++        return true;
++      }
+       if (reinterpret_cast<HWND>(wParam) == hwnd_ && HasFocus() &&
+           LOWORD(lParam) == HTCLIENT) {
+         switch (GetCursorVisibility()) {
+diff --git a/src/xenia/ui/window_win.h b/src/xenia/ui/window_win.h
+index bd068d8..b476525 100644
+--- a/src/xenia/ui/window_win.h
++++ b/src/xenia/ui/window_win.h
+@@ -10,6 +10,7 @@
+ #ifndef XENIA_UI_WINDOW_WIN_H_
+ #define XENIA_UI_WINDOW_WIN_H_
+ 
++#include <atomic>
+ #include <memory>
+ #include <string>
+ 
+@@ -40,6 +41,9 @@ class Win32Window : public Window {
+ 
+   uint32_t GetMediumDpi() const override;
+ 
++  bool IsMouseLocked() const override { return mouse_locked_; }
++  void InhibitMouseLock(bool inhibit) override;
++
+  protected:
+   bool OpenImpl() override;
+   void RequestCloseImpl() override;
+@@ -92,6 +96,13 @@ class Win32Window : public Window {
+ 
+   void SetCursorIfFocusedOnClientArea(HCURSOR cursor) const;
+   void SetCursorAutoHideTimer();
++
++  // Mouse lock for games with mouse aiming (mouse_lock cvar): the cursor is
++  // hidden and pinned to the client area center, and raw relative motion is
++  // delivered through OnRawMouseMove.
++  void LockMouse();
++  void UnlockMouse();
++  void UpdateMouseLockClip();
+   static void NTAPI AutoHideCursorTimerCallback(void* parameter,
+                                                 BOOLEAN timer_or_wait_fired);
+ 
+@@ -154,6 +165,12 @@ class Win32Window : public Window {
+   bool cursor_currently_auto_hidden_ = false;
+ 
+   HDEVNOTIFY usb_device_notify_ = nullptr;
++
++  std::atomic<bool> mouse_locked_ = false;
++  int32_t mouse_lock_inhibitors_ = 0;
++  // The click that locked the mouse isn't passed on (it would fire); neither
++  // is its button release.
++  bool swallow_left_button_up_ = false;
+ };
+ 
+ class Win32MenuItem : public MenuItem {

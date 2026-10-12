@@ -1,0 +1,266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [UI] Crash report: the address accessed, a backtrace, and the
+ log
+
+The unhandled exception report named only the faulting instruction. Add
+the address an access violation read or wrote, the integer registers,
+and a backtrace of up to 16 frames as module+offset, unwound with the
+x64 unwind information from the exception's context, frame by frame so
+a fault while unwinding keeps what came before. The walk stops at a
+caller without unwind information or a stack pointer outside the
+thread's stack.
+
+Name modules through the loader (RtlPcToFileHeader) instead of probing
+memory for an MZ header, which could find guest memory and then format
+an unset file name.
+
+Write the report to the log as well (guarded, and flushed again after
+the message box), and bound the report buffer. The exception code is
+printed in hexadecimal.
+---
+ src/xenia/ui/windowed_app_main_win.cc | 166 +++++++++++++++++++-------
+ 1 file changed, 121 insertions(+), 45 deletions(-)
+
+diff --git a/src/xenia/ui/windowed_app_main_win.cc b/src/xenia/ui/windowed_app_main_win.cc
+index b1ff571..7fcd35c 100644
+--- a/src/xenia/ui/windowed_app_main_win.cc
++++ b/src/xenia/ui/windowed_app_main_win.cc
+@@ -7,10 +7,12 @@
+  ******************************************************************************
+  */
+ 
++#include <algorithm>
+ #include <cstdlib>
+ 
+ #include "xenia/base/console.h"
+ #include "xenia/base/cvar.h"
++#include "xenia/base/logging.h"
+ #include "xenia/base/main_win.h"
+ #include "xenia/base/platform_win.h"
+ #include "xenia/kernel/kernel_state.cc"
+@@ -27,30 +29,6 @@ DEFINE_bool(enable_console, false, "Open a console window with the main window",
+ static uintptr_t g_xenia_exe_base = 0;
+ static size_t g_xenia_exe_size = 0;
+ 
+-static HMODULE probe_for_module(void* addr) {
+-  // get 65k aligned addr downwards to probe for MZ
+-  uintptr_t base = reinterpret_cast<uintptr_t>(addr) & ~0xFFFFULL;
+-
+-  constexpr unsigned max_search_iters =
+-      (64 * (1024 * 1024)) /
+-      65536;  // search down at most 64 mb (we do it in
+-              // batches of 64k so its pretty quick). i think its reasonable to
+-              // expect no module will be > 64mb
+-  // break if access violation thrown, we're definitely not a PE in that case
+-  __try {
+-    for (unsigned i = 0; i < max_search_iters; ++i) {
+-      if (*reinterpret_cast<unsigned short*>(base) == 'ZM') {
+-        return reinterpret_cast<HMODULE>(base);
+-      } else {
+-        base -= 65536;
+-      }
+-    }
+-    return nullptr;
+-  } __except (EXCEPTION_EXECUTE_HANDLER) {
+-    return nullptr;
+-  }
+-}
+-
+ static constexpr auto XENIA_ERROR_LANGUAGE =
+     MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT);
+ 
+@@ -62,7 +40,7 @@ struct HostExceptionReport {
+   const NTSTATUS last_ntstatus;
+ 
+   const int errno_value;
+-  char Report_Scratchbuffer[2048];
++  char Report_Scratchbuffer[4096];
+ 
+   unsigned int address_format_ring_index;
+ 
+@@ -121,6 +99,8 @@ char* HostExceptionReport::ChompNewlines(char* s) {
+ }
+ void HostExceptionReport::AddString(const char* s) {
+   size_t ln = strlen(s);
++  // Keep the terminating zero of the buffer.
++  ln = std::min(ln, sizeof(Report_Scratchbuffer) - 1 - Report_Scratchpos);
+ 
+   for (size_t i = 0; i < ln; ++i) {
+     Report_Scratchbuffer[i + Report_Scratchpos] = s[i];
+@@ -139,25 +119,25 @@ const char* HostExceptionReport::GetFormattedAddress(uintptr_t address) {
+      sprintf_s(current_buffer, "xenia_canary.exe+%llX", offset);
+    } else */
+   {
+-    HMODULE hmod_for = probe_for_module((void*)address);
+-
+-    if (hmod_for) {
++    // Only loaded modules: an MZ found by probing may be guest memory (the
++    // game's own executable image), which has no file name.
++    PVOID image_base = nullptr;
++    if (RtlPcToFileHeader(reinterpret_cast<PVOID>(address), &image_base) &&
++        image_base) {
+       // get the module filename, then chomp off all but the actual file name
+       // (full path is obtained)
+-      char tmp_module_name[MAX_PATH + 1];
+-      GetModuleFileNameA(hmod_for, tmp_module_name, sizeof(tmp_module_name));
+-
+-      size_t search_back = strlen(tmp_module_name);
+-      // hunt backwards for the last sep
+-      while (tmp_module_name[--search_back] != '\\');
+-
+-      // MessageBoxA(nullptr, tmp_module_name, "ffds", MB_OK);
+-      sprintf_s(current_buffer, "%s+%llX", tmp_module_name + search_back + 1,
+-                address - reinterpret_cast<uintptr_t>(hmod_for));
+-
+-    } else {
+-      sprintf_s(current_buffer, "0x%llX", address);
++      char tmp_module_name[MAX_PATH + 1] = {};
++      DWORD length = GetModuleFileNameA(static_cast<HMODULE>(image_base),
++                                        tmp_module_name, MAX_PATH);
++      if (length && length < MAX_PATH) {
++        const char* file_name = strrchr(tmp_module_name, '\\');
++        file_name = file_name ? file_name + 1 : tmp_module_name;
++        sprintf_s(current_buffer, "%s+%llX", file_name,
++                  address - reinterpret_cast<uintptr_t>(image_base));
++        return current_buffer;
++      }
+     }
++    sprintf_s(current_buffer, "0x%llX", address);
+   }
+   return current_buffer;
+ }
+@@ -206,7 +186,7 @@ static bool exception_pointers_handler(HostExceptionReport* report) {
+ 
+   const std::string except_message = fmt::format(
+       "Exception encountered!\nTitle Info: {}\nBuild: {}\nException address: "
+-      "{}\nStackpointer: {}\nInstruction pointer: {}\nExceptionCode: 0x{} "
++      "{}\nStackpointer: {}\nInstruction pointer: {}\nExceptionCode: 0x{:08X} "
+       "({})\n",
+       title_info, build.c_str(), report->GetFormattedAddress(exception_addr),
+       report->GetFormattedAddress(last_stackpointer),
+@@ -218,6 +198,81 @@ static bool exception_pointers_handler(HostExceptionReport* report) {
+   return true;
+ }
+ 
++// Which address an access violation touched, and how.
++static bool exception_access_violation_handler(HostExceptionReport* report) {
++  const EXCEPTION_RECORD* record = report->ExceptionInfo->ExceptionRecord;
++  if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
++      record->NumberParameters < 2) {
++    return false;
++  }
++  const char* access = record->ExceptionInformation[0] == 0   ? "reading"
++                       : record->ExceptionInformation[0] == 1 ? "writing"
++                                                              : "executing";
++  char buffer[128];
++  sprintf_s(buffer, "Access violation %s 0x%llX\n", access,
++            static_cast<unsigned long long>(record->ExceptionInformation[1]));
++  report->AddString(buffer);
++  return true;
++}
++
++#if XE_ARCH_AMD64
++// The faulting function's callers, as module+offset, unwound with the x64
++// unwind information from the exception's context (generated guest code
++// registers its own, so it is walked through too).
++static bool exception_backtrace_handler(HostExceptionReport* report) {
++  CONTEXT context = *report->ExceptionInfo->ContextRecord;
++  // The filter runs on the faulting thread, so these are its stack's limits.
++  ULONG_PTR stack_low = 0, stack_high = 0;
++  GetCurrentThreadStackLimits(&stack_low, &stack_high);
++  // Frame by frame, so a fault while unwinding keeps the frames before it.
++  report->AddString("Backtrace:");
++  for (int frame = 0; frame < 16 && context.Rip; ++frame) {
++    report->AddString(frame ? " < " : " ");
++    report->AddString(report->GetFormattedAddress(uintptr_t(context.Rip)));
++    if (context.Rsp < stack_low || context.Rsp >= stack_high ||
++        (context.Rsp & (sizeof(DWORD64) - 1))) {
++      break;
++    }
++    DWORD64 image_base;
++    PRUNTIME_FUNCTION function =
++        RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
++    if (function) {
++      void* handler_data;
++      DWORD64 establisher_frame;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function,
++                       &context, &handler_data, &establisher_frame, nullptr);
++    } else if (!frame) {
++      // A leaf function: the return address is on top of the stack.
++      context.Rip = *reinterpret_cast<const DWORD64*>(context.Rsp);
++      context.Rsp += sizeof(DWORD64);
++    } else {
++      // Only the faulting function can be a leaf: a caller without unwind
++      // information can't be walked through.
++      report->AddString(" < ?");
++      break;
++    }
++  }
++  report->AddString("\n");
++  return true;
++}
++
++// The faulting context's integer registers (a pointer that was followed, a
++// count that ran over).
++static bool exception_registers_handler(HostExceptionReport* report) {
++  const CONTEXT& context = *report->ExceptionInfo->ContextRecord;
++  char buffer[512];
++  sprintf_s(buffer,
++            "RAX=%llX RBX=%llX RCX=%llX RDX=%llX RSI=%llX RDI=%llX RBP=%llX\n"
++            "R8=%llX R9=%llX R10=%llX R11=%llX R12=%llX R13=%llX R14=%llX "
++            "R15=%llX\n",
++            context.Rax, context.Rbx, context.Rcx, context.Rdx, context.Rsi,
++            context.Rdi, context.Rbp, context.R8, context.R9, context.R10,
++            context.R11, context.R12, context.R13, context.R14, context.R15);
++  report->AddString(buffer);
++  return true;
++}
++#endif  // XE_ARCH_AMD64
++
+ static bool exception_win32_error_handle(HostExceptionReport* report) {
+   if (!report->last_win32_error) {
+     return false;  // no error, nothing to do
+@@ -287,9 +342,20 @@ static bool thread_name_handle(HostExceptionReport* report) {
+   return true;
+ }
+ static ExceptionInfoCategoryHandler host_exception_category_handlers[] = {
+-    exception_pointers_handler, exception_win32_error_handle,
+-    exception_ntstatus_error_handle, exception_cerror_handle,
+-    thread_name_handle};
++    exception_pointers_handler,   exception_access_violation_handler,
++    thread_name_handle,
++#if XE_ARCH_AMD64
++    exception_backtrace_handler,  exception_registers_handler,
++#endif
++    exception_win32_error_handle, exception_ntstatus_error_handle,
++    exception_cerror_handle};
++
++// Into the log too, which the message box can't be copied from. Not in the
++// filter itself, which uses __try and can't have objects to unwind.
++static void LogExceptionReport(const char* report) {
++  XELOGE("Unhandled exception:\n{}", report);
++  xe::FlushLog();
++}
+ 
+ LONG _UnhandledExceptionFilter(_EXCEPTION_POINTERS* ExceptionInfo) {
+   HostExceptionReport report{ExceptionInfo};
+@@ -302,7 +368,17 @@ LONG _UnhandledExceptionFilter(_EXCEPTION_POINTERS* ExceptionInfo) {
+       report.AddString("<Nested Exception Encountered>\n");
+     }
+   }
++  __try {
++    LogExceptionReport(report.Report_Scratchbuffer);
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++  }
+   report.DisplayExceptionMessage();
++  // The log thread may have written the report only while the message was
++  // shown.
++  __try {
++    xe::FlushLog();
++  } __except (EXCEPTION_EXECUTE_HANDLER) {
++  }
+ 
+   return EXCEPTION_CONTINUE_SEARCH;
+ }

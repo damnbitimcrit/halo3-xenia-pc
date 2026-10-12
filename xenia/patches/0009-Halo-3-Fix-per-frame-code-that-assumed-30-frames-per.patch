@@ -1,0 +1,409 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Fix per-frame code that assumed 30 frames per second
+
+With the frame rate unlocked the main loop body runs once per drawn frame
+instead of once per 30 Hz tick. While unlocked:
+
+- Shader and effect "time" inputs, computed from the tick counter in four
+  render input providers, get the fraction of a tick since the last one
+  added, so animated shaders and effect functions move smoothly.
+- The two HUD fades that stepped a fixed 1/15 per frame scale the step by
+  frame time.
+- The UI and HUD millisecond clocks carry the truncated fraction of each
+  frame's time to the next frame instead of losing it.
+- Debris (muffins) keeps the overshoot when it takes its 1/30 s step
+  instead of resetting the accumulator.
+- The wind random walk steps once per tick instead of once per drawn frame,
+  its time input is smooth, and the per-call gust increment scales with
+  frame time.
+- Sound needs nothing: its fades and slews step by the sound clock's own
+  elapsed time.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        |   1 +
+ src/xenia/kernel/title/halo3/halo3.h         |   7 +
+ src/xenia/kernel/title/halo3/halo3_frame.cc  |   5 +
+ src/xenia/kernel/title/halo3/halo3_interp.cc |   7 +
+ src/xenia/kernel/title/halo3/halo3_timing.cc | 257 +++++++++++++++++++
+ 5 files changed, 277 insertions(+)
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_timing.cc
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 6aca5c2..3af6666 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -93,6 +93,7 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   InstallFramePacing(kernel_state);
+   InstallInterpolation(kernel_state);
+   InstallInput(kernel_state);
++  InstallTiming(kernel_state);
+   cpu::GuestHooks::Get().Add(kernel_state->processor(), kMainLoopBodyEntry,
+                              OnMainLoopBodyEntry);
+ }
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 247af42..8aec580 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -54,10 +54,17 @@ Stats& stats();
+ void InstallFramePacing(KernelState* kernel_state);
+ // Waits for the frame-rate cap.
+ void OnPacingFrameStart(cpu::ppc::PPCContext* ctx);
++// Real time since the previous frame in seconds, as given to the game this
++// frame (0 until the frame rate is unlocked).
++float FrameDeltaSeconds();
+ // halo3_interp.cc
+ void InstallInterpolation(KernelState* kernel_state);
+ // Puts the real simulation state back over the previous frame's blend.
+ void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx);
++// Whether game_update, which runs the simulation ticks, is running.
++bool InGameUpdate();
++// halo3_timing.cc
++void InstallTiming(KernelState* kernel_state);
+ // halo3_input.cc
+ void InstallInput(KernelState* kernel_state);
+ // Takes the mouse motion for this frame.
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index 43eb2c6..8c585d6 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -70,6 +70,7 @@ struct FramePacer {
+   uint64_t deadline = 0;
+ };
+ FramePacer pacer;
++float frame_delta_seconds = 0.0f;
+ 
+ void WaitForFrameDeadline(uint64_t frequency) {
+   const int32_t limit = cvars::halo3_framerate_limit;
+@@ -127,6 +128,7 @@ void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
+ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+   if (!cvars::halo3_unlock_framerate) {
+     pacer = {};
++    frame_delta_seconds = 0.0f;
+     return;
+   }
+   const uint64_t frequency = Clock::guest_tick_frequency();
+@@ -136,11 +138,14 @@ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+     dt = double(now - pacer.last_ticks) / double(frequency);
+   }
+   pacer.last_ticks = now;
++  frame_delta_seconds = float(dt);
+   ctx->f[1] = dt;
+ }
+ 
+ }  // namespace
+ 
++float FrameDeltaSeconds() { return frame_delta_seconds; }
++
+ void OnPacingFrameStart(cpu::ppc::PPCContext* ctx) {
+   if (Unlocked(ctx)) {
+     WaitForFrameDeadline(Clock::guest_tick_frequency());
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 8ecceef..777d785 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -33,6 +33,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -182,6 +183,8 @@ struct InterpolationState {
+   std::array<PoseSnapshot, kLocalPlayers * kFpSlots> poses;
+ };
+ InterpolationState* state = nullptr;
++// Read by the render thread too (loading screens).
++std::atomic<bool> in_game_update{false};
+ 
+ uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
+   return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
+@@ -653,6 +656,7 @@ void Restore(cpu::ppc::PPCContext* ctx) {
+ }
+ 
+ void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
++  in_game_update = true;
+   // Normally already done at the start of the frame.
+   Restore(ctx);
+ }
+@@ -684,6 +688,7 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+ }
+ 
+ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
++  in_game_update = false;
+   if (!cvars::halo3_unlock_framerate) {
+     return;
+   }
+@@ -705,6 +710,8 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx) { Restore(ctx); }
+ 
++bool InGameUpdate() { return in_game_update; }
++
+ void InstallInterpolation(KernelState* kernel_state) {
+   // A relaunch starts from a clean slate.
+   delete state;
+diff --git a/src/xenia/kernel/title/halo3/halo3_timing.cc b/src/xenia/kernel/title/halo3/halo3_timing.cc
+new file mode 100644
+index 0000000..3abec6a
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_timing.cc
+@@ -0,0 +1,257 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// Per-frame code that assumed 30 frames per second.
++//
++// With the frame rate unlocked the main loop body runs once per drawn frame
++// instead of once per 30 Hz tick. Most per-frame code already scales by the
++// frame time; these places don't:
++//
++// - Shader and effect "time" inputs are computed from the tick counter, so
++//   anything animated by them moves in 30 Hz steps. Add the fraction of a
++//   tick elapsed since the last one, as the interpolation does.
++// - Two HUD fades step a fixed 1/15 per frame: scale the step by frame time.
++// - The UI and HUD millisecond clocks truncate each frame's time, so short
++//   frames lose a large share of it: carry the fraction to the next frame.
++// - Debris ("muffins") takes a 1/30 s step once that much time has
++//   accumulated, then resets the accumulator instead of subtracting the step,
++//   which loses the overshoot: keep it.
++// - The wind random walk advances once per drawn frame: advance it once per
++//   tick, give it a smooth time input, and scale its per-call gust increment.
++// Sound needs nothing: its fades and slews step by the sound clock's own
++// elapsed time (sub_821A39E8 stores it in seconds at sound globals + 0x260,
++// from the kernel's millisecond tick count).
++//
++// All of it only applies while the frame rate is unlocked.
++
++#include <algorithm>
++#include <cmath>
++#include <cstdint>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/cpu/ppc/ppc_context.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// `stfs f0` of t = (elapsed ticks mod tick rate) * seconds per tick in the
++// four render input providers that compute it.
++constexpr uint32_t kTickTimeStores[] = {0x82142ED4, 0x822B4438, 0x8214BDC0,
++                                        0x82300670};
++
++// sub_82131118: `fadds f0, f0, f13` with f0 = +-1/15, the fade step.
++constexpr uint32_t kHudFadeStep = 0x8213180C;
++// sub_82135490: `fadds f0, f11, f0` with f11 = the value, f0 = the step toward
++// the target at r31 + 0x98, clamped to +-1/15.
++constexpr uint32_t kHudFadeClampedStep = 0x821355CC;
++constexpr uint32_t kHudFadeTarget = 0x98;
++constexpr float kHudFadeStepPerFrame = 1.0f / 15.0f;
++
++// `fctiwz f0, f0` with f0 = frame time in milliseconds: the UI clock
++// (sub_82088FA0) and the HUD clock (sub_8212CDF0).
++constexpr uint32_t kUiClockTruncate = 0x82088FCC;
++constexpr uint32_t kHudClockTruncate = 0x8212CE2C;
++
++// sub_82126EA0: `stfs f29 (0), 0x188C(r30)` resets a debris accumulator
++// after a step (taken once it reached 1/30 s); the next instruction is only
++// reached from there.
++constexpr uint32_t kDebrisAccumulatorReset = 0x82126F20;
++constexpr uint32_t kDebrisAfterReset = 0x82126F24;
++constexpr uint32_t kDebrisAccumulator = 0x188C;
++constexpr float kDebrisStep = 1.0f / 30.0f;
++
++// sub_82369938 (wind): `fmuls f31, f0, f13` with f0 = elapsed ticks.
++constexpr uint32_t kWindTime = 0x823699EC;
++// `cmpw cr6, r11, r10`: render frame index against the frame of the last
++// random walk step; the step runs if it is greater.
++constexpr uint32_t kWindStepGate = 0x82369A98;
++// `fadds f0, f13, f0`: gust += f0, on every call.
++constexpr uint32_t kWindGustAdd = 0x82369C34;
++
++constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
++constexpr uint32_t kGameTimeSecondsPerTick = 0x08;
++constexpr uint32_t kGameTimeElapsedTicks = 0x0C;
++constexpr uint32_t kGameTimeTicksLeftover = 0x14;
++
++// Main thread state (the hooks below run on it, except the tick time
++// providers, which loading screens also call from the render thread).
++float ui_clock_carry = 0.0f;
++float hud_clock_carry = 0.0f;
++struct {
++  bool pending = false;
++  uint32_t address = 0;
++  float value = 0.0f;
++} debris_reset;
++uint32_t wind_step_tick = 0;
++
++uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
++}
++float LoadF32(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<float>(ctx->TranslateVirtual(address));
++}
++void StoreF32(cpu::ppc::PPCContext* ctx, uint32_t address, float value) {
++  xe::store_and_swap<float>(ctx->TranslateVirtual(address), value);
++}
++
++uint32_t GameTimeGlobals(cpu::ppc::PPCContext* ctx) {
++  const uint32_t tls = LoadU32(ctx, static_cast<uint32_t>(ctx->r[13]));
++  return tls ? LoadU32(ctx, tls + kTlsGameTimeGlobals) : 0;
++}
++
++// Fraction of a tick elapsed since the last one, or -1 while the simulation
++// runs (the value is from the previous frame then) or if there is none.
++float TickFraction(cpu::ppc::PPCContext* ctx, uint32_t time_globals) {
++  if (!time_globals || InGameUpdate()) {
++    return -1.0f;
++  }
++  const float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
++  return alpha >= 0.0f && alpha < 1.0f ? alpha : -1.0f;
++}
++
++// Frame time relative to a 30 FPS frame, for steps meant per 30 Hz frame.
++float FrameScale() {
++  return std::clamp(FrameDeltaSeconds() * 30.0f, 0.0f, 4.0f);
++}
++
++bool Unlocked() { return cvars::halo3_unlock_framerate; }
++
++void OnTickTimeStore(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  const uint32_t time_globals = GameTimeGlobals(ctx);
++  const float alpha = TickFraction(ctx, time_globals);
++  if (alpha <= 0.0f) {
++    return;
++  }
++  ctx->f[0] += alpha * LoadF32(ctx, time_globals + kGameTimeSecondsPerTick);
++}
++
++void OnHudFadeStep(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked()) {
++    ctx->f[0] *= FrameScale();
++  }
++}
++
++void OnHudFadeClampedStep(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  const float max_step = kHudFadeStepPerFrame * FrameScale();
++  const float target =
++      LoadF32(ctx, static_cast<uint32_t>(ctx->r[31]) + kHudFadeTarget);
++  const float delta = target - static_cast<float>(ctx->f[11]);
++  ctx->f[0] = std::clamp(delta, -max_step, max_step);
++}
++
++void CarryMilliseconds(cpu::ppc::PPCContext* ctx, float* carry) {
++  if (!Unlocked()) {
++    *carry = 0.0f;
++    return;
++  }
++  const double milliseconds = ctx->f[0] + *carry;
++  if (!(milliseconds >= 0.0 && milliseconds < 1.0e6)) {
++    *carry = 0.0f;
++    return;
++  }
++  *carry = static_cast<float>(milliseconds - std::floor(milliseconds));
++  ctx->f[0] = milliseconds;
++}
++void OnUiClockTruncate(cpu::ppc::PPCContext* ctx, void*) {
++  CarryMilliseconds(ctx, &ui_clock_carry);
++}
++void OnHudClockTruncate(cpu::ppc::PPCContext* ctx, void*) {
++  CarryMilliseconds(ctx, &hud_clock_carry);
++}
++
++void OnDebrisAccumulatorReset(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  // The accumulator still holds its value; the reset stores 0 next.
++  const uint32_t address =
++      static_cast<uint32_t>(ctx->r[30]) + kDebrisAccumulator;
++  float rest = LoadF32(ctx, address) - kDebrisStep;
++  if (!(rest > 0.0f)) {
++    rest = 0.0f;  // also NaN
++  }
++  debris_reset = {true, address, std::min(rest, kDebrisStep * 0.999f)};
++}
++void OnDebrisAfterReset(cpu::ppc::PPCContext* ctx, void*) {
++  if (debris_reset.pending) {
++    StoreF32(ctx, debris_reset.address, debris_reset.value);
++    debris_reset.pending = false;
++  }
++}
++
++void OnWindTime(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  const float alpha = TickFraction(ctx, GameTimeGlobals(ctx));
++  if (alpha > 0.0f) {
++    ctx->f[0] += alpha;
++  }
++}
++
++void OnWindStepGate(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  const uint32_t time_globals = GameTimeGlobals(ctx);
++  if (!time_globals) {
++    return;
++  }
++  // Make the game's "is this a new frame" test say yes once per tick.
++  const uint32_t tick = LoadU32(ctx, time_globals + kGameTimeElapsedTicks);
++  const uint32_t last_step = static_cast<uint32_t>(ctx->r[10]);
++  if (tick != wind_step_tick) {
++    wind_step_tick = tick;
++    ctx->r[11] = last_step + 1;
++  } else {
++    ctx->r[11] = last_step;
++  }
++}
++
++void OnWindGustAdd(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked()) {
++    ctx->f[0] *= FrameScale();
++  }
++}
++
++}  // namespace
++
++void InstallTiming(KernelState* kernel_state) {
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  for (uint32_t address : kTickTimeStores) {
++    hooks.Add(processor, address, OnTickTimeStore);
++  }
++  hooks.Add(processor, kHudFadeStep, OnHudFadeStep);
++  hooks.Add(processor, kHudFadeClampedStep, OnHudFadeClampedStep);
++  hooks.Add(processor, kUiClockTruncate, OnUiClockTruncate);
++  hooks.Add(processor, kHudClockTruncate, OnHudClockTruncate);
++  hooks.Add(processor, kDebrisAccumulatorReset, OnDebrisAccumulatorReset);
++  hooks.Add(processor, kDebrisAfterReset, OnDebrisAfterReset);
++  hooks.Add(processor, kWindTime, OnWindTime);
++  hooks.Add(processor, kWindStepGate, OnWindStepGate);
++  hooks.Add(processor, kWindGustAdd, OnWindGustAdd);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe

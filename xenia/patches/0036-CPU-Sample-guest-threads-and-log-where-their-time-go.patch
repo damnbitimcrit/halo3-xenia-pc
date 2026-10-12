@@ -1,0 +1,2855 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [CPU] Sample guest threads and log where their time goes
+ (guest_profile)
+
+Nothing showed which guest functions take a thread's time per frame.
+With guest_profile (default off; Windows x64), a sampler thread at
+time-critical priority wakes every 0.5 to 1.5 ms (guest_profile_period_us,
+randomized so samples don't lock to anything periodic) and samples every
+thread the processor knows (Processor::VisitThreadDebugInfos, under the
+global lock; handles duplicated, stack base from the TEB, names from
+GetThreadDescription):
+
+- A thread that hasn't run since its last capture (QueryThreadCycleTime,
+  allowing for what the capture itself cost it) and is in a wait now (the
+  system's ThreadLastSystemCall probe, once it has answered; else a
+  capture that stopped right after a system call) gets that stack again,
+  counted as waiting: in a system call, or stopped by something else.
+- Otherwise it is suspended (with its priority boost disabled), its
+  context read, its stack from the stack pointer up to the end of its
+  committed region (at most 512 KB, never a guard page) copied by the
+  kernel (ReadProcessMemory), and it is resumed. Nothing in between
+  allocates, takes a lock or can raise an exception: the stopped thread
+  may hold the heap, loader or function table locks.
+- After resuming, the copy's pointers into the original stack are moved
+  into the copy and it is unwound with RtlLookupFunctionEntry and
+  RtlVirtualUnwind (translated code through the code cache's growable
+  function table), only for code in the code cache or a loaded module,
+  keeping only frames that return to just after a call (or the context
+  an exception or APC interrupted). Two spots Xenia's unwind information
+  doesn't describe are handled: a translated epilog's stack point pop
+  (and indirect tail calls) after 'add rsp', and the host-to-guest
+  thunk's saved nonvolatile registers.
+
+Every guest_profile_report_s seconds (30) a report thread turns the
+window into "Guest profile:" log lines (also when Xenia closes): frame
+times between the VdSwap calls (GuestProfiler::MarkFrame) of the thread
+that swaps most, with the frames over 8.3 / 16.7 / 33.3 ms and the slow
+ones (guest_profile_slow_frame_ms, 0: 1.5 times the median); the threads'
+running and waiting shares; and for each thread running at least 3% of
+the time, in milliseconds per frame over the frames in the window:
+
+- own time by guest function (the innermost on the stack; register save
+  and restore helpers count as their caller), with the part spent in
+  emulator code it called and the callers;
+- waits by guest function, with the system call;
+- call trees (every guest function with what it called);
+- emulator functions, stopped in and under them, with their guest
+  callers;
+- the hottest guest instructions of the top functions (calls into
+  emulator code marked);
+- what grew in slow frames against the others.
+
+Guest functions and instructions come from the code cache and its
+source map (kernel imports by name). Xenia's own functions are named from
+the linker map next to the executable (xenia-app now links with
+/MAP:xenia_canary.map; a map from another link is ignored), system
+libraries by their exports, other executable memory by its allocation.
+dbghelp calls share one lock (DbgHelpMutex). The report is built by
+platform-independent code covered by xenia-cpu-tests "[guest_profiler]".
+---
+ src/xenia/app/CMakeLists.txt                 |    7 +
+ src/xenia/app/xenia_main.cc                  |    7 +
+ src/xenia/cpu/guest_profiler.cc              |  687 +++++++++
+ src/xenia/cpu/guest_profiler.h               |  202 +++
+ src/xenia/cpu/guest_profiler_posix.cc        |   28 +
+ src/xenia/cpu/guest_profiler_win.cc          | 1351 ++++++++++++++++++
+ src/xenia/cpu/processor.cc                   |   18 +
+ src/xenia/cpu/processor.h                    |   11 +
+ src/xenia/cpu/stack_walker.h                 |    5 +
+ src/xenia/cpu/stack_walker_win.cc            |   12 +-
+ src/xenia/cpu/testing/guest_profiler_test.cc |  234 +++
+ src/xenia/emulator.cc                        |    5 +
+ src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc  |    3 +
+ 13 files changed, 2566 insertions(+), 4 deletions(-)
+ create mode 100644 src/xenia/cpu/guest_profiler.cc
+ create mode 100644 src/xenia/cpu/guest_profiler.h
+ create mode 100644 src/xenia/cpu/guest_profiler_posix.cc
+ create mode 100644 src/xenia/cpu/guest_profiler_win.cc
+ create mode 100644 src/xenia/cpu/testing/guest_profiler_test.cc
+
+diff --git a/src/xenia/app/CMakeLists.txt b/src/xenia/app/CMakeLists.txt
+index f59d5c3..b9827b9 100644
+--- a/src/xenia/app/CMakeLists.txt
++++ b/src/xenia/app/CMakeLists.txt
+@@ -122,4 +122,11 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+   )
+ endif()
+ 
++# The guest profiler (guest_profile) names Xenia's own functions from the
++# linker map next to the executable.
++if(MSVC)
++  target_link_options(xenia-app PRIVATE
++    "/MAP:$<TARGET_FILE_DIR:xenia-app>/xenia_canary.map")
++endif()
++
+ xe_target_defaults(xenia-app)
+diff --git a/src/xenia/app/xenia_main.cc b/src/xenia/app/xenia_main.cc
+index 9777dc6..9a33c26 100644
+--- a/src/xenia/app/xenia_main.cc
++++ b/src/xenia/app/xenia_main.cc
+@@ -24,6 +24,7 @@
+ #include "xenia/base/profiling.h"
+ #include "xenia/base/threading.h"
+ #include "xenia/config.h"
++#include "xenia/cpu/processor.h"
+ #include "xenia/debug/ui/debug_window.h"
+ #include "xenia/emulator.h"
+ #include "xenia/kernel/xam/xam_module.h"
+@@ -566,6 +567,12 @@ bool EmulatorApp::OnInitialize() {
+ void EmulatorApp::OnDestroy() {
+   ShutdownEmulatorThreadFromUIThread();
+ 
++  // The guest profiler logs its last report as it stops (nothing below
++  // destroys the emulator).
++  if (emulator_ && emulator_->processor()) {
++    emulator_->processor()->StopGuestProfiler();
++  }
++
+   if (cvars::discord) {
+     discord::DiscordPresence::Shutdown();
+   }
+diff --git a/src/xenia/cpu/guest_profiler.cc b/src/xenia/cpu/guest_profiler.cc
+new file mode 100644
+index 0000000..57d8a71
+--- /dev/null
++++ b/src/xenia/cpu/guest_profiler.cc
+@@ -0,0 +1,687 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/cpu/guest_profiler.h"
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <unordered_map>
++#include <utility>
++
++#include "third_party/fmt/include/fmt/format.h"
++#include "xenia/base/clock.h"
++#include "xenia/base/cvar.h"
++#include "xenia/base/threading.h"
++
++DEFINE_bool(guest_profile, false,
++            "Sample the emulated threads about every guest_profile_period_us "
++            "and log where their time goes every guest_profile_report_s "
++            "seconds (\"Guest profile\" lines). Windows only. Costs about 1% "
++            "of each busy thread.",
++            "CPU");
++DEFINE_uint32(guest_profile_period_us, 1000,
++              "guest_profile: average time between samples of a thread, in "
++              "microseconds (each wait is randomized between half and one "
++              "and a half times this).",
++              "CPU");
++DEFINE_uint32(guest_profile_report_s, 30,
++              "guest_profile: seconds between reports.", "CPU");
++DEFINE_double(guest_profile_slow_frame_ms, 0.0,
++              "guest_profile: frames (VdSwap to VdSwap) longer than this are "
++              "slow; 0: 1.5 times the median frame and at least 1 ms over "
++              "it.",
++              "CPU");
++
++namespace xe {
++namespace cpu {
++
++namespace guest_profile {
++
++namespace {
++
++constexpr size_t kFrameMarkRingSize = 4096;
++std::atomic<bool> frame_marks_enabled{false};
++std::atomic<uint64_t> frame_mark_count{0};
++std::array<std::atomic<uint64_t>, kFrameMarkRingSize> frame_mark_ticks;
++std::array<std::atomic<uint32_t>, kFrameMarkRingSize> frame_mark_threads;
++
++}  // namespace
++
++void EnableFrameMarks(bool enabled) {
++  frame_marks_enabled.store(enabled, std::memory_order_release);
++}
++
++uint32_t TakeFrameMarks(uint64_t* cursor, std::vector<uint64_t>* ticks,
++                        std::vector<uint32_t>* threads) {
++  const uint64_t count = frame_mark_count.load(std::memory_order_acquire);
++  if (count < *cursor) {
++    *cursor = count;
++  }
++  uint32_t lost = 0;
++  if (count - *cursor > kFrameMarkRingSize) {
++    lost = uint32_t(count - kFrameMarkRingSize - *cursor);
++    *cursor = count - kFrameMarkRingSize;
++  }
++  for (; *cursor < count; ++*cursor) {
++    const size_t slot = *cursor % kFrameMarkRingSize;
++    ticks->push_back(frame_mark_ticks[slot].load(std::memory_order_relaxed));
++    threads->push_back(
++        frame_mark_threads[slot].load(std::memory_order_relaxed));
++  }
++  return lost;
++}
++
++namespace {
++
++// Time in microseconds, split by whether the thread was running or in a
++// system call.
++struct Time {
++  double running = 0.0;
++  double system = 0.0;
++  void Add(double us, bool system_call) {
++    (system_call ? system : running) += us;
++  }
++  double total() const { return running + system; }
++};
++
++struct FunctionStats {
++  // As the innermost guest function on the stack: its own code and the
++  // emulator code it called.
++  Time own;
++  // Of own: stopped in emulator code (host or thunks).
++  Time own_emulator;
++  // Anywhere on the stack, once per sample.
++  Time tree;
++  // own and tree (running and system calls) in slow and other frames.
++  double own_slow = 0.0, own_normal = 0.0;
++  double tree_slow = 0.0, tree_normal = 0.0;
++  // own by the guest function that called it (0: none).
++  std::unordered_map<uint32_t, double> callers;
++  // own by guest instruction; bit 32 set for a call into emulator code.
++  std::unordered_map<uint64_t, double> instructions;
++  // own_emulator (running) by the emulator function stopped in; system
++  // calls by the system call stopped in.
++  std::unordered_map<uint32_t, double> emulator_leaves;
++  std::unordered_map<uint32_t, double> system_calls;
++};
++
++struct HostStats {
++  // Stopped in this function.
++  Time own;
++  // Anywhere between the stop and the innermost guest function.
++  Time tree;
++  double tree_slow = 0.0, tree_normal = 0.0;
++  // tree by the innermost guest function (0: none).
++  std::unordered_map<uint32_t, double> guest_callers;
++};
++
++struct ThreadStats {
++  Time time;
++  uint32_t samples = 0;
++  uint32_t repeated = 0;
++  uint32_t truncated = 0;
++  uint64_t depth = 0;
++  std::unordered_map<uint32_t, FunctionStats> functions;
++  std::unordered_map<uint32_t, HostStats> host;
++};
++
++template <typename Map>
++std::vector<std::pair<typename Map::key_type, double>> Top(const Map& map,
++                                                           size_t count) {
++  std::vector<std::pair<typename Map::key_type, double>> entries(map.begin(),
++                                                                 map.end());
++  std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
++    return a.second != b.second ? a.second > b.second : a.first < b.first;
++  });
++  if (entries.size() > count) {
++    entries.resize(count);
++  }
++  return entries;
++}
++
++double Percentile(const std::vector<double>& sorted, double fraction) {
++  if (sorted.empty()) {
++    return 0.0;
++  }
++  const size_t index = std::min(
++      sorted.size() - 1, size_t(fraction * double(sorted.size() - 1) + 0.5));
++  return sorted[index];
++}
++
++std::string GuestName(uint32_t function) {
++  return function ? fmt::format("{:08X}", function) : std::string("(none)");
++}
++
++}  // namespace
++
++std::vector<std::string> BuildReport(const Window& window,
++                                     Symbolizer& symbolizer,
++                                     const ReportOptions& options) {
++  std::vector<std::string> lines;
++  const double frequency = double(std::max<uint64_t>(window.tick_frequency, 1));
++  const double ticks_to_us = 1000000.0 / frequency;
++  const double ticks_to_ms = 1000.0 / frequency;
++  const double seconds = double(window.end - window.start) / frequency;
++
++  // Frames: the time between consecutive swaps of the thread that swapped
++  // most (a game may also swap from a loading or keep-alive thread).
++  std::vector<uint64_t> swaps = window.swaps;
++  uint32_t swap_thread = 0;
++  size_t other_swaps = 0;
++  if (window.swap_threads.size() == window.swaps.size() && !swaps.empty()) {
++    std::unordered_map<uint32_t, size_t> counts;
++    for (uint32_t thread : window.swap_threads) {
++      ++counts[thread];
++    }
++    size_t most = 0;
++    for (const auto& [thread, count] : counts) {
++      if (count > most || (count == most && thread < swap_thread)) {
++        most = count;
++        swap_thread = thread;
++      }
++    }
++    swaps.clear();
++    for (size_t i = 0; i < window.swaps.size(); ++i) {
++      if (window.swap_threads[i] == swap_thread) {
++        swaps.push_back(window.swaps[i]);
++      }
++    }
++    other_swaps = window.swaps.size() - swaps.size();
++  }
++  std::vector<double> frame_ms;
++  for (size_t i = 1; i < swaps.size(); ++i) {
++    if (swaps[i] >= swaps[i - 1]) {
++      frame_ms.push_back(double(swaps[i] - swaps[i - 1]) * ticks_to_ms);
++    }
++  }
++  std::vector<double> sorted_ms = frame_ms;
++  std::sort(sorted_ms.begin(), sorted_ms.end());
++  const double median_ms = Percentile(sorted_ms, 0.5);
++  double slow_ms = options.slow_frame_ms;
++  if (slow_ms <= 0.0) {
++    slow_ms = std::max(median_ms * 1.5, median_ms + 1.0);
++  }
++  uint32_t slow_frames = 0;
++  double slow_total_ms = 0.0;
++  uint32_t over[3] = {};
++  const double over_ms[3] = {1000.0 / 120.0, 1000.0 / 60.0, 1000.0 / 30.0};
++  for (double ms : frame_ms) {
++    if (ms > slow_ms) {
++      ++slow_frames;
++      slow_total_ms += ms;
++    }
++    for (size_t i = 0; i < 3; ++i) {
++      if (ms > over_ms[i]) {
++        ++over[i];
++      }
++    }
++  }
++  const uint32_t normal_frames = uint32_t(frame_ms.size()) - slow_frames;
++  // 0: outside the frames, 1: in a frame, 2: in a slow frame.
++  const auto classify = [&](uint64_t time) -> int {
++    auto it = std::upper_bound(swaps.begin(), swaps.end(), time);
++    if (it == swaps.begin() || it == swaps.end()) {
++      return 0;
++    }
++    const uint64_t frame_ticks = *it - *(it - 1);
++    return double(frame_ticks) * ticks_to_ms > slow_ms ? 2 : 1;
++  };
++
++  // Per-frame figures cover the samples between the first and the last swap,
++  // divided by the frames between them; with too few frames, per second over
++  // the whole window.
++  const bool per_frame = frame_ms.size() >= std::max(options.min_frames, 1u);
++  const uint64_t span_begin = per_frame ? swaps.front() : window.start;
++  const uint64_t span_end = per_frame ? swaps.back() : window.end;
++  const double span_seconds =
++      std::max(double(span_end - span_begin) / frequency, 1e-9);
++  const double divisor = per_frame ? double(frame_ms.size()) : span_seconds;
++  const char* const unit = per_frame ? "ms/frame" : "ms/s";
++  const auto ms = [&](double us) { return us / 1000.0 / divisor; };
++
++  const SamplerStats& s = window.stats;
++  std::string summary = fmt::format("{:.1f} s; ", seconds);
++  if (per_frame) {
++    summary += fmt::format(
++        "{} frames ({:.1f}/s), frame ms median {:.2f}, p90 {:.2f}, p99 "
++        "{:.2f}, max {:.2f}; over 8.3 ms {}, 16.7 ms {}, 33.3 ms {}; {} slow "
++        "frames over {:.2f} ms ({:.0f} ms in all); ",
++        frame_ms.size(), double(frame_ms.size()) / span_seconds, median_ms,
++        Percentile(sorted_ms, 0.9), Percentile(sorted_ms, 0.99),
++        sorted_ms.empty() ? 0.0 : sorted_ms.back(), over[0], over[1], over[2],
++        slow_frames, slow_ms, slow_total_ms);
++    if (span_seconds < seconds * 0.9) {
++      summary += fmt::format("figures from the {:.1f} s between swaps; ",
++                             span_seconds);
++    }
++    if (other_swaps) {
++      std::string swapper = fmt::format("host thread {:X}", swap_thread);
++      for (const ThreadInfo& info : window.threads) {
++        if (info.host_id == swap_thread) {
++          swapper = info.name;
++          break;
++        }
++      }
++      summary +=
++          fmt::format("frames are {}'s swaps, {} from other threads left out; ",
++                      swapper, other_swaps);
++    }
++    if (window.swaps_lost) {
++      summary += fmt::format("{} swaps not seen; ", window.swaps_lost);
++    }
++  } else {
++    summary += fmt::format(
++        "{} frames, too few for per-frame figures (figures per second); ",
++        frame_ms.size());
++  }
++  summary += fmt::format(
++      "sampling every {} us: {} stacks, {} repeated (wait probe {}), {} "
++      "failed; threads stopped {:.1f} us a stack (longest {:.0f} us), a "
++      "capture costs a waiting thread up to {} cycles; sampler {:.1f}% of a "
++      "core; the last report took {:.0f} ms{}",
++      window.period_us, s.captures, s.repeats, s.wait_probe ? "on" : "off",
++      s.failures,
++      s.captures ? double(s.stopped_ticks) * ticks_to_us / s.captures : 0.0,
++      double(s.max_stopped_ticks) * ticks_to_us, s.max_capture_cycles,
++      seconds > 0.0
++          ? double(s.sampler_cpu_ticks) * ticks_to_us / (seconds * 10000.0)
++          : 0.0,
++      double(s.report_ticks) * ticks_to_ms,
++      s.windows_dropped
++          ? fmt::format("; {} windows not reported (report thread behind)",
++                        s.windows_dropped)
++          : std::string());
++  lines.push_back(std::move(summary));
++
++  std::vector<ThreadStats> threads(window.threads.size());
++  std::vector<ResolvedFrame> resolved;
++  std::vector<uint32_t> seen_functions;
++  std::vector<uint32_t> seen_symbols;
++  for (const Sample& sample : window.samples) {
++    if (sample.thread >= threads.size() || !sample.frame_count) {
++      continue;
++    }
++    if (sample.time < span_begin || sample.time >= span_end) {
++      continue;
++    }
++    ThreadStats& t = threads[sample.thread];
++    const double us = double(sample.weight) * ticks_to_us;
++    // Waiting: in a system call, or stopped by something else.
++    const bool system_call =
++        (sample.flags & (kSampleSystemCall | kSampleStopped)) != 0;
++    t.time.Add(us, system_call);
++    ++t.samples;
++    if (sample.flags & kSampleRepeated) {
++      ++t.repeated;
++    }
++    if (sample.flags & kSampleTruncated) {
++      ++t.truncated;
++    }
++    t.depth += sample.frame_count;
++
++    resolved.clear();
++    int innermost = -1;
++    for (uint32_t i = 0; i < sample.frame_count; ++i) {
++      const ResolvedFrame frame =
++          symbolizer.Resolve(window.frames[sample.frame_begin + i], i == 0);
++      if (frame.kind == FrameKind::kGuest && frame.fold) {
++        // Part of its caller: leave it out.
++        continue;
++      }
++      if (innermost < 0 && frame.kind == FrameKind::kGuest) {
++        innermost = int(resolved.size());
++      }
++      resolved.push_back(frame);
++    }
++    if (resolved.empty()) {
++      continue;
++    }
++    const int frame_class = classify(sample.time);
++    const uint32_t function =
++        innermost >= 0 ? resolved[innermost].guest_function : 0;
++
++    FunctionStats& f = t.functions[function];
++    f.own.Add(us, system_call);
++    if (frame_class == 2) {
++      f.own_slow += us;
++    } else if (frame_class == 1) {
++      f.own_normal += us;
++    }
++    if (innermost != 0) {
++      f.own_emulator.Add(us, system_call);
++      const uint32_t leaf_symbol = resolved[0].symbol;
++      (system_call ? f.system_calls : f.emulator_leaves)[leaf_symbol] += us;
++    }
++    if (innermost >= 0) {
++      f.instructions[uint64_t(resolved[innermost].guest_pc) |
++                     (innermost > 0 ? uint64_t(1) << 32 : 0)] += us;
++      uint32_t caller = 0;
++      for (size_t i = size_t(innermost) + 1; i < resolved.size(); ++i) {
++        if (resolved[i].kind == FrameKind::kGuest) {
++          caller = resolved[i].guest_function;
++          break;
++        }
++      }
++      f.callers[caller] += us;
++    }
++
++    seen_functions.clear();
++    for (const ResolvedFrame& frame : resolved) {
++      if (frame.kind != FrameKind::kGuest ||
++          std::find(seen_functions.begin(), seen_functions.end(),
++                    frame.guest_function) != seen_functions.end()) {
++        continue;
++      }
++      seen_functions.push_back(frame.guest_function);
++      FunctionStats& g = t.functions[frame.guest_function];
++      g.tree.Add(us, system_call);
++      if (frame_class == 2) {
++        g.tree_slow += us;
++      } else if (frame_class == 1) {
++        g.tree_normal += us;
++      }
++    }
++
++    if (resolved[0].kind != FrameKind::kGuest) {
++      t.host[resolved[0].symbol].own.Add(us, system_call);
++    }
++    seen_symbols.clear();
++    const size_t host_end =
++        innermost >= 0 ? size_t(innermost) : resolved.size();
++    for (size_t i = 0; i < host_end; ++i) {
++      const uint32_t symbol = resolved[i].symbol;
++      if (resolved[i].kind == FrameKind::kGuest ||
++          std::find(seen_symbols.begin(), seen_symbols.end(), symbol) !=
++              seen_symbols.end()) {
++        continue;
++      }
++      seen_symbols.push_back(symbol);
++      HostStats& h = t.host[symbol];
++      h.tree.Add(us, system_call);
++      h.guest_callers[function] += us;
++      if (frame_class == 2) {
++        h.tree_slow += us;
++      } else if (frame_class == 1) {
++        h.tree_normal += us;
++      }
++    }
++  }
++
++  // Thread summary, busiest first.
++  std::vector<size_t> order;
++  for (size_t i = 0; i < threads.size(); ++i) {
++    if (threads[i].samples) {
++      order.push_back(i);
++    }
++  }
++  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
++    return threads[a].time.running > threads[b].time.running;
++  });
++  const double window_us = span_seconds * 1000000.0;
++  {
++    std::string line = "threads (running / waiting, % of the time):";
++    size_t listed = 0;
++    for (size_t i : order) {
++      if (listed++ == 16) {
++        line += fmt::format(" and {} more", order.size() - 16);
++        break;
++      }
++      const ThreadStats& t = threads[i];
++      line += fmt::format(" {} [{:X}] {:.0f}/{:.0f};", window.threads[i].name,
++                          window.threads[i].thread_id,
++                          t.time.running * 100.0 / window_us,
++                          t.time.system * 100.0 / window_us);
++    }
++    lines.push_back(std::move(line));
++  }
++
++  const auto name_of = [&](uint32_t symbol) -> const std::string& {
++    return symbolizer.SymbolName(symbol);
++  };
++  const auto guest_name = [&](uint32_t function) {
++    const std::string* name =
++        function ? symbolizer.GuestFunctionName(function) : nullptr;
++    return name ? GuestName(function) + " " + *name : GuestName(function);
++  };
++  for (size_t index : order) {
++    const ThreadStats& t = threads[index];
++    if (t.time.running * 100.0 < options.min_thread_percent * window_us) {
++      continue;
++    }
++    const std::string& name = window.threads[index].name;
++    lines.push_back(fmt::format(
++        "{}: {:.3f} {} running, {:.3f} waiting; {} samples ({} "
++        "repeated), {:.1f}% of stacks cut short, {:.1f} frames deep",
++        name, ms(t.time.running), unit, ms(t.time.system), t.samples,
++        t.repeated, t.truncated * 100.0 / t.samples,
++        double(t.depth) / t.samples));
++
++    // Own time, by the running part.
++    std::vector<std::pair<uint32_t, const FunctionStats*>> functions;
++    for (const auto& [function, stats] : t.functions) {
++      functions.emplace_back(function, &stats);
++    }
++    std::sort(functions.begin(), functions.end(),
++              [](const auto& a, const auto& b) {
++                return a.second->own.running != b.second->own.running
++                           ? a.second->own.running > b.second->own.running
++                           : a.first < b.first;
++              });
++    lines.push_back(fmt::format(
++        "{} own time ({} running, share of running; of it in emulator code, "
++        "the top emulator functions; called from):",
++        name, unit));
++    std::vector<uint32_t> top_functions;
++    for (const auto& [function, stats] : functions) {
++      if (top_functions.size() >= options.rows ||
++          stats->own.running < t.time.running * 0.002) {
++        break;
++      }
++      top_functions.push_back(function);
++      std::string line = fmt::format(
++          "  {:7.3f} {:5.1f}%  {}", ms(stats->own.running),
++          stats->own.running * 100.0 / t.time.running, guest_name(function));
++      if (stats->own_emulator.running > 0.0) {
++        line +=
++            fmt::format("  emulator {:.3f}", ms(stats->own_emulator.running));
++        std::string leaves;
++        for (const auto& [symbol, us] : Top(stats->emulator_leaves, 3)) {
++          leaves += fmt::format("{}{} {:.0f}%", leaves.empty() ? "" : ", ",
++                                name_of(symbol),
++                                us * 100.0 / stats->own_emulator.running);
++        }
++        line += " (" + leaves + ")";
++      }
++      std::string callers;
++      for (const auto& [caller, us] : Top(stats->callers, 3)) {
++        callers +=
++            fmt::format("{}{} {:.0f}%", callers.empty() ? "" : ", ",
++                        guest_name(caller), us * 100.0 / stats->own.total());
++      }
++      if (!callers.empty()) {
++        line += "  from " + callers;
++      }
++      lines.push_back(std::move(line));
++    }
++
++    // Waits: own time in system calls or stopped.
++    std::sort(functions.begin(), functions.end(),
++              [](const auto& a, const auto& b) {
++                return a.second->own.system != b.second->own.system
++                           ? a.second->own.system > b.second->own.system
++                           : a.first < b.first;
++              });
++    {
++      std::string line = fmt::format(
++          "{} waiting ({}; where it waited, in system calls or stopped):", name,
++          unit);
++      size_t listed = 0;
++      for (const auto& [function, stats] : functions) {
++        if (listed++ == 8 || stats->own.system <= 0.0 ||
++            stats->own.system < t.time.system * 0.01) {
++          break;
++        }
++        std::string calls;
++        for (const auto& [symbol, us] : Top(stats->system_calls, 2)) {
++          calls +=
++              fmt::format("{}{}", calls.empty() ? "" : ", ", name_of(symbol));
++        }
++        line += fmt::format(" {} {:.3f} ({});", guest_name(function),
++                            ms(stats->own.system), calls);
++      }
++      lines.push_back(std::move(line));
++    }
++
++    // Call trees: every guest function with what it called, by running time.
++    std::sort(functions.begin(), functions.end(),
++              [](const auto& a, const auto& b) {
++                return a.second->tree.running != b.second->tree.running
++                           ? a.second->tree.running > b.second->tree.running
++                           : a.first < b.first;
++              });
++    {
++      std::string line = fmt::format(
++          "{} call trees ({} running, share of running):", name, unit);
++      size_t listed = 0;
++      for (const auto& [function, stats] : functions) {
++        if (!function) {
++          continue;
++        }
++        if (listed++ == options.rows ||
++            stats->tree.running < t.time.running * 0.01) {
++          break;
++        }
++        line += fmt::format(" {} {:.3f} {:.0f}%;", guest_name(function),
++                            ms(stats->tree.running),
++                            stats->tree.running * 100.0 / t.time.running);
++      }
++      lines.push_back(std::move(line));
++    }
++
++    // Emulator code: by the time under each emulator function.
++    {
++      std::vector<std::pair<uint32_t, const HostStats*>> host;
++      for (const auto& [symbol, stats] : t.host) {
++        host.emplace_back(symbol, &stats);
++      }
++      std::sort(host.begin(), host.end(), [](const auto& a, const auto& b) {
++        return a.second->tree.running != b.second->tree.running
++                   ? a.second->tree.running > b.second->tree.running
++                   : a.first < b.first;
++      });
++      lines.push_back(fmt::format(
++          "{} emulator code ({} running: stopped in it / under it; for "
++          "guest functions):",
++          name, unit));
++      size_t listed = 0;
++      for (const auto& [symbol, stats] : host) {
++        if (listed++ == options.rows ||
++            stats->tree.running < t.time.running * 0.002) {
++          break;
++        }
++        std::string callers;
++        for (const auto& [caller, us] : Top(stats->guest_callers, 3)) {
++          callers +=
++              fmt::format("{}{} {:.0f}%", callers.empty() ? "" : ", ",
++                          guest_name(caller), us * 100.0 / stats->tree.total());
++        }
++        lines.push_back(fmt::format(
++            "  {:7.3f} / {:7.3f}  {}  for {}", ms(stats->own.running),
++            ms(stats->tree.running), name_of(symbol), callers));
++      }
++    }
++
++    // The hottest instructions of the functions with the most own time.
++    {
++      lines.push_back(fmt::format(
++          "{} hot instructions (share of the function's own time; c: a call "
++          "into emulator code):",
++          name));
++      size_t listed = 0;
++      for (uint32_t function : top_functions) {
++        if (!function) {
++          continue;
++        }
++        if (listed++ == 12) {
++          break;
++        }
++        const FunctionStats& stats = t.functions.at(function);
++        std::string line = fmt::format("  {}:", guest_name(function));
++        for (const auto& [key, us] : Top(stats.instructions, 6)) {
++          line += fmt::format(" {:08X}{} {:.0f}%", uint32_t(key),
++                              (key >> 32) ? "c" : "",
++                              us * 100.0 / stats.own.total());
++        }
++        lines.push_back(std::move(line));
++      }
++    }
++
++    // What grew in slow frames: per slow frame against per other frame.
++    if (slow_frames && normal_frames) {
++      struct Growth {
++        std::string name;
++        double slow, normal;
++      };
++      std::vector<Growth> growth;
++      for (const auto& [function, stats] : t.functions) {
++        growth.push_back({"own " + guest_name(function),
++                          stats.own_slow / slow_frames,
++                          stats.own_normal / normal_frames});
++        if (function) {
++          growth.push_back({"tree " + guest_name(function),
++                            stats.tree_slow / slow_frames,
++                            stats.tree_normal / normal_frames});
++        }
++      }
++      for (const auto& [symbol, stats] : t.host) {
++        growth.push_back({"emulator " + name_of(symbol),
++                          stats.tree_slow / slow_frames,
++                          stats.tree_normal / normal_frames});
++      }
++      std::sort(growth.begin(), growth.end(),
++                [](const Growth& a, const Growth& b) {
++                  return a.slow - a.normal > b.slow - b.normal;
++                });
++      std::string line = fmt::format(
++          "{} in slow frames (ms per slow frame / per other frame, {} slow, "
++          "{} others):",
++          name, slow_frames, normal_frames);
++      size_t listed = 0;
++      for (const Growth& g : growth) {
++        if (listed++ == 15 || g.slow - g.normal < 100.0) {
++          break;
++        }
++        line += fmt::format(" {} {:.2f} / {:.2f};", g.name, g.slow / 1000.0,
++                            g.normal / 1000.0);
++      }
++      lines.push_back(std::move(line));
++    }
++  }
++  return lines;
++}
++
++}  // namespace guest_profile
++
++void GuestProfiler::MarkFrame() {
++  if (!guest_profile::frame_marks_enabled.load(std::memory_order_relaxed)) {
++    return;
++  }
++  const uint64_t index =
++      guest_profile::frame_mark_count.load(std::memory_order_relaxed);
++  const size_t slot = index % guest_profile::kFrameMarkRingSize;
++  guest_profile::frame_mark_ticks[slot].store(Clock::QueryHostTickCount(),
++                                              std::memory_order_relaxed);
++  guest_profile::frame_mark_threads[slot].store(
++      threading::current_thread_system_id(), std::memory_order_relaxed);
++  guest_profile::frame_mark_count.store(index + 1, std::memory_order_release);
++}
++
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/cpu/guest_profiler.h b/src/xenia/cpu/guest_profiler.h
+new file mode 100644
+index 0000000..cef8268
+--- /dev/null
++++ b/src/xenia/cpu/guest_profiler.h
+@@ -0,0 +1,202 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_CPU_GUEST_PROFILER_H_
++#define XENIA_CPU_GUEST_PROFILER_H_
++
++#include <cstdint>
++#include <memory>
++#include <string>
++#include <vector>
++
++namespace xe {
++namespace cpu {
++
++class Processor;
++
++// Sampling profiler for the emulated threads (guest_profile, off by default).
++// About every millisecond a sampler thread stops each thread for a few
++// microseconds, copies its stack and lets it run again; the copy is unwound
++// afterwards, so nothing the stopped thread may hold (heap, loader or code
++// cache locks) is needed while it is stopped. Translated code is named by the
++// guest function and instruction it came from, Xenia's own code by the linker
++// map next to the executable (xenia_canary.map) and system libraries by their
++// exports. Every guest_profile_report_s seconds the log gets a report per
++// busy thread: time per frame by guest function (own code and the emulator
++// code it called), by whole call tree, by emulator function, the hottest
++// guest instructions, the waits, and what grew in slow frames (frames are the
++// guest's VdSwap calls).
++class GuestProfiler {
++ public:
++  // Starts sampling if guest_profile is set and the platform supports it.
++  static std::unique_ptr<GuestProfiler> Create(Processor* processor);
++  virtual ~GuestProfiler() = default;
++
++  // Stops the sampler and logs the last report. Idempotent.
++  virtual void Stop() = 0;
++
++  // The guest handed a frame to the GPU (VdSwap). Any thread; one relaxed
++  // load when the profiler is off.
++  static void MarkFrame();
++};
++
++namespace guest_profile {
++
++// The platform-independent half: what a sample holds and how a report is
++// built from a window of samples.
++
++enum class FrameKind : uint8_t {
++  kUnknown,
++  // Translated guest code.
++  kGuest,
++  // Code in the code cache that isn't a guest function (thunks).
++  kThunk,
++  // Host code (Xenia, system libraries, drivers).
++  kHost,
++};
++
++struct ResolvedFrame {
++  FrameKind kind = FrameKind::kUnknown;
++  // kGuest: the guest function's address and the guest instruction.
++  uint32_t guest_function = 0;
++  uint32_t guest_pc = 0;
++  // kHost / kThunk / kUnknown: the symbol's index (Symbolizer::SymbolName).
++  uint32_t symbol = 0;
++  // kGuest: a helper counted as part of its caller (register save and
++  // restore helpers).
++  bool fold = false;
++};
++
++class Symbolizer {
++ public:
++  virtual ~Symbolizer() = default;
++  // leaf: pc is where the thread was stopped rather than a return address
++  // (a return address is looked up one byte back, inside the call).
++  virtual ResolvedFrame Resolve(uint64_t pc, bool leaf) = 0;
++  virtual const std::string& SymbolName(uint32_t symbol) = 0;
++  // A guest function's name if it has one (kernel imports), else null.
++  virtual const std::string* GuestFunctionName(uint32_t function) {
++    return nullptr;
++  }
++};
++
++enum SampleFlags : uint8_t {
++  // The thread was stopped right after a system call instruction: waiting,
++  // sleeping, or in the kernel.
++  kSampleSystemCall = 1 << 0,
++  // The thread hadn't run since the previous sample, which was in a system
++  // call: the previous stack, not captured again.
++  kSampleRepeated = 1 << 1,
++  // The unwind stopped before the thread's first frame.
++  kSampleTruncated = 1 << 2,
++  // The thread hadn't run since the previous sample, which wasn't in a
++  // system call: stopped (suspended) there. Counted as waiting.
++  kSampleStopped = 1 << 3,
++};
++
++struct Sample {
++  // Host ticks when it was taken.
++  uint64_t time = 0;
++  // Frames (leaf first) are frames[frame_begin, frame_begin + frame_count).
++  uint32_t frame_begin = 0;
++  uint16_t frame_count = 0;
++  // Index into Window::threads.
++  uint16_t thread = 0;
++  // Host ticks since the thread's previous sample: the time it stands for.
++  uint32_t weight = 0;
++  uint8_t flags = 0;
++};
++
++struct ThreadInfo {
++  std::string name;
++  // The guest's thread id, and the host's (the swap marks carry that one).
++  uint32_t thread_id = 0;
++  uint32_t host_id = 0;
++};
++
++struct SamplerStats {
++  uint32_t ticks = 0;
++  uint32_t captures = 0;
++  uint32_t repeats = 0;
++  uint32_t failures = 0;
++  // Host ticks the stopped threads were stopped (in all, and the longest),
++  // and the sampler thread's CPU time over the window.
++  uint64_t stopped_ticks = 0;
++  uint64_t max_stopped_ticks = 0;
++  uint64_t sampler_cpu_ticks = 0;
++  // Host ticks the previous report took to build (on its own thread).
++  uint64_t report_ticks = 0;
++  // Whether the system says if a thread is waiting (repeats need it then),
++  // and the CPU cycles a capture cost a waiting thread (largest seen).
++  bool wait_probe = false;
++  uint64_t max_capture_cycles = 0;
++  // Windows not reported because the report thread was behind.
++  uint32_t windows_dropped = 0;
++};
++
++struct Window {
++  uint64_t tick_frequency = 1;
++  uint64_t start = 0;
++  uint64_t end = 0;
++  uint32_t period_us = 0;
++  std::vector<ThreadInfo> threads;
++  std::vector<Sample> samples;
++  std::vector<uint64_t> frames;
++  // Host ticks of the guest's swaps (MarkFrame), in order, and the host
++  // thread that made each.
++  std::vector<uint64_t> swaps;
++  std::vector<uint32_t> swap_threads;
++  // Swaps the sampler missed (its ring overflowed).
++  uint32_t swaps_lost = 0;
++  SamplerStats stats;
++
++  void Clear() {
++    samples.clear();
++    frames.clear();
++    swaps.clear();
++    swap_threads.clear();
++    swaps_lost = 0;
++    stats = {};
++  }
++};
++
++struct ReportOptions {
++  // A frame is slow above this many milliseconds; 0: 1.5 times the median
++  // frame and at least 1 ms over it.
++  double slow_frame_ms = 0.0;
++  // Fewer frames than this in a window: figures per second over the whole
++  // window instead of per frame over the frames.
++  uint32_t min_frames = 10;
++  // Threads using less of the window than this (percent) get only their
++  // summary.
++  double min_thread_percent = 3.0;
++  // Rows per table.
++  uint32_t rows = 25;
++};
++
++// The report's log lines (without the "Guest profile" prefix the caller
++// adds).
++std::vector<std::string> BuildReport(const Window& window,
++                                     Symbolizer& symbolizer,
++                                     const ReportOptions& options);
++
++// The swaps GuestProfiler::MarkFrame records while enabled.
++void EnableFrameMarks(bool enabled);
++// Appends the host ticks of the swaps after *cursor, and the host thread of
++// each, and advances *cursor; returns how many were lost to the ring
++// wrapping. One reader.
++uint32_t TakeFrameMarks(uint64_t* cursor, std::vector<uint64_t>* ticks,
++                        std::vector<uint32_t>* threads);
++
++}  // namespace guest_profile
++
++}  // namespace cpu
++}  // namespace xe
++
++#endif  // XENIA_CPU_GUEST_PROFILER_H_
+diff --git a/src/xenia/cpu/guest_profiler_posix.cc b/src/xenia/cpu/guest_profiler_posix.cc
+new file mode 100644
+index 0000000..d3431fb
+--- /dev/null
++++ b/src/xenia/cpu/guest_profiler_posix.cc
+@@ -0,0 +1,28 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/cpu/guest_profiler.h"
++
++#include "xenia/base/cvar.h"
++#include "xenia/base/logging.h"
++
++DECLARE_bool(guest_profile);
++
++namespace xe {
++namespace cpu {
++
++std::unique_ptr<GuestProfiler> GuestProfiler::Create(Processor* processor) {
++  if (cvars::guest_profile) {
++    XELOGW("guest_profile: not supported on this platform");
++  }
++  return nullptr;
++}
++
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/cpu/guest_profiler_win.cc b/src/xenia/cpu/guest_profiler_win.cc
+new file mode 100644
+index 0000000..fb5199a
+--- /dev/null
++++ b/src/xenia/cpu/guest_profiler_win.cc
+@@ -0,0 +1,1351 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/cpu/guest_profiler.h"
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <cstring>
++#include <deque>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <unordered_map>
++#include <utility>
++#include <vector>
++
++#include "third_party/fmt/include/fmt/format.h"
++#include "xenia/base/clock.h"
++#include "xenia/base/cvar.h"
++#include "xenia/base/filesystem.h"
++#include "xenia/base/logging.h"
++#include "xenia/base/mutex.h"
++#include "xenia/base/platform_win.h"
++#include "xenia/base/string.h"
++#include "xenia/base/threading.h"
++#include "xenia/cpu/backend/backend.h"
++#include "xenia/cpu/backend/code_cache.h"
++#include "xenia/cpu/function.h"
++#include "xenia/cpu/processor.h"
++#include "xenia/cpu/stack_walker.h"
++#include "xenia/cpu/thread.h"
++#include "xenia/cpu/thread_debug_info.h"
++
++DECLARE_bool(guest_profile);
++DECLARE_uint32(guest_profile_period_us);
++DECLARE_uint32(guest_profile_report_s);
++DECLARE_double(guest_profile_slow_frame_ms);
++
++namespace xe {
++namespace cpu {
++
++#if XE_ARCH_AMD64
++
++namespace {
++
++using namespace guest_profile;
++
++// The stack copied per sample, from the stack pointer up (plus 16 bytes so
++// the copy can keep the original's alignment).
++constexpr size_t kStackCopySize = 512 * 1024;
++// Frames kept per sample.
++constexpr size_t kMaxFrames = 160;
++// CPU cycles a capture may cost a waiting thread (it runs the suspend and
++// get-context APCs and waits again) for the thread to still count as not
++// having run since.
++constexpr uint64_t kCaptureCycleAllowance = 400000;
++
++// ---------------------------------------------------------------------------
++// The stopped window: nothing in these may allocate, take a lock or raise an
++// exception (exception dispatch takes loader and function table locks the
++// stopped thread may hold).
++
++// The part of [address, address + size) in address's committed region,
++// without guard pages.
++size_t ReadableSize(uint64_t address, size_t size) {
++  MEMORY_BASIC_INFORMATION info;
++  if (!VirtualQuery(reinterpret_cast<const void*>(address), &info,
++                    sizeof(info)) ||
++      info.State != MEM_COMMIT ||
++      (info.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
++      !(info.Protect &
++        (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
++         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
++    return 0;
++  }
++  const uint64_t region_end =
++      uint64_t(uintptr_t(info.BaseAddress)) + info.RegionSize;
++  return size_t(std::min<uint64_t>(size, region_end - address));
++}
++
++struct Capture {
++  // Bytes copied to buffer + offset (0 if the capture failed).
++  size_t size = 0;
++  size_t offset = 0;
++  bool resume_failed = false;
++};
++
++// Stops the thread, reads its registers, copies its stack from the stack
++// pointer up to the stack base, and lets it run again, without boosting its
++// priority. The copy starts at the same offset modulo 16 as the original.
++Capture CaptureStopped(HANDLE thread, CONTEXT* context, uint64_t stack_base,
++                       uint8_t* buffer) {
++  Capture capture;
++  // The get-context and resume wake-ups would otherwise boost the thread's
++  // priority.
++  BOOL boost_disabled = FALSE;
++  const bool boost_known =
++      GetThreadPriorityBoost(thread, &boost_disabled) != FALSE;
++  if (boost_known) {
++    SetThreadPriorityBoost(thread, TRUE);
++  }
++  if (SuspendThread(thread) == DWORD(-1)) {
++    if (boost_known) {
++      SetThreadPriorityBoost(thread, boost_disabled);
++    }
++    return capture;
++  }
++  context->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++  // GetThreadContext returns once the thread is really stopped.
++  if (GetThreadContext(thread, context)) {
++    const uint64_t stack_pointer = context->Rsp;
++    if (stack_pointer < stack_base && !(stack_pointer & 7)) {
++      const size_t wanted = size_t(
++          std::min<uint64_t>(stack_base - stack_pointer, kStackCopySize));
++      const size_t readable = ReadableSize(stack_pointer, wanted);
++      capture.offset = size_t(stack_pointer & 15);
++      // The kernel copies, so memory that goes away meanwhile (the thread
++      // terminated by another) gives a short copy, not an exception.
++      SIZE_T read = 0;
++      ReadProcessMemory(GetCurrentProcess(),
++                        reinterpret_cast<LPCVOID>(stack_pointer),
++                        buffer + capture.offset, readable, &read);
++      capture.size = size_t(read) & ~size_t(7);
++    }
++  }
++  if (ResumeThread(thread) == DWORD(-1) && ResumeThread(thread) == DWORD(-1)) {
++    capture.resume_failed = true;
++  }
++  if (boost_known) {
++    SetThreadPriorityBoost(thread, boost_disabled);
++  }
++  return capture;
++}
++
++// ---------------------------------------------------------------------------
++// After the thread runs again: structured exception handling is fine here.
++
++bool CopyMemoryGuarded(void* destination, const void* source, size_t size) {
++  __try {
++    std::memcpy(destination, source, size);
++    return true;
++  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
++                  ? EXCEPTION_EXECUTE_HANDLER
++                  : EXCEPTION_CONTINUE_SEARCH) {
++    return false;
++  }
++}
++
++bool UnwindStepGuarded(DWORD64 pc, CONTEXT* context, bool* found) {
++  __try {
++    DWORD64 image_base = 0;
++    PRUNTIME_FUNCTION function =
++        RtlLookupFunctionEntry(pc, &image_base, nullptr);
++    *found = function != nullptr;
++    if (function) {
++      PVOID handler_data = nullptr;
++      DWORD64 establisher_frame = 0;
++      RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, pc, function, context,
++                       &handler_data, &establisher_frame, nullptr);
++    }
++    return true;
++  } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION
++                  ? EXCEPTION_EXECUTE_HANDLER
++                  : EXCEPTION_CONTINUE_SEARCH) {
++    return false;
++  }
++}
++
++// Whether the bytes before address end with a call instruction, as before a
++// return address: E8 rel32, or FF /2 (with an optional REX prefix, any
++// addressing form).
++bool FollowsCall(uint64_t address) {
++  uint8_t b[8];
++  if (address < 8 ||
++      !CopyMemoryGuarded(b, reinterpret_cast<const void*>(address - 8), 8)) {
++    return false;
++  }
++  if (b[3] == 0xE8) {
++    return true;
++  }
++  for (size_t length = 2; length <= 8; ++length) {
++    size_t i = 8 - length;
++    if ((b[i] & 0xF0) == 0x40) {
++      ++i;
++    }
++    if (i + 1 >= 8 || b[i] != 0xFF || ((b[i + 1] >> 3) & 7) != 2) {
++      continue;
++    }
++    const uint8_t mod = b[i + 1] >> 6;
++    const uint8_t rm = b[i + 1] & 7;
++    size_t end = i + 2;
++    if (mod != 3 && rm == 4) {
++      if (end >= 8) {
++        continue;
++      }
++      if (mod == 0 && (b[end] & 7) == 5) {
++        end += 4;
++      }
++      ++end;
++    }
++    if (mod == 1) {
++      end += 1;
++    } else if (mod == 2 || (mod == 0 && rm == 5)) {
++      end += 4;
++    }
++    if (end == 8) {
++      return true;
++    }
++  }
++  return false;
++}
++
++// Whether the instruction before pc is a system call: `syscall` (0F 05) or
++// `int 2Eh` (CD 2E), which ntdll's stubs use instead on some systems.
++bool AfterSystemCall(uint64_t pc) {
++  if ((pc & 0xFFF) < 2) {
++    return false;
++  }
++  uint8_t bytes[2];
++  if (!CopyMemoryGuarded(bytes, reinterpret_cast<const void*>(pc - 2), 2)) {
++    return false;
++  }
++  return (bytes[0] == 0x0F && bytes[1] == 0x05) ||
++         (bytes[0] == 0xCD && bytes[1] == 0x2E);
++}
++
++// Whether pc (in the code cache) is past the 'add rsp' of an epilog the
++// system unwinder doesn't recognize, which would make it unwind the frame
++// twice; the return address is on top of the stack there:
++// - the stack point pop of translated functions
++//   (enable_host_guest_stack_synchronization), 'dec dword [rsi + disp]'
++//   before 'ret', 'jmp rel32' or 'jmp rax';
++// - 'jmp rax' (indirect tail calls, the function resolve thunk);
++// - the three home slot reloads of the host-to-guest thunk before 'ret'.
++bool PastEpilogStackRelease(uint64_t pc) {
++  uint8_t bytes[16];
++  if (!CopyMemoryGuarded(bytes, reinterpret_cast<const void*>(pc),
++                         sizeof(bytes))) {
++    return false;
++  }
++  if (bytes[0] == 0xFF && bytes[1] == 0xE0) {
++    return true;
++  }
++  static const uint8_t kHomeReloads[3][5] = {{0x48, 0x8B, 0x4C, 0x24, 0x08},
++                                             {0x48, 0x8B, 0x54, 0x24, 0x10},
++                                             {0x4C, 0x8B, 0x44, 0x24, 0x18}};
++  for (size_t first = 0; first < 3; ++first) {
++    if (!std::memcmp(bytes, kHomeReloads[first], 5)) {
++      size_t i = 5;
++      for (size_t next = first + 1; next < 3; ++next, i += 5) {
++        if (std::memcmp(bytes + i, kHomeReloads[next], 5)) {
++          return false;
++        }
++      }
++      return bytes[i] == 0xC3;
++    }
++  }
++  size_t i = 0;
++  if ((bytes[i] & 0xF0) == 0x40) {
++    ++i;
++  }
++  if (bytes[i++] != 0xFF) {
++    return false;
++  }
++  const uint8_t modrm = bytes[i++];
++  const uint8_t mod = modrm >> 6;
++  if (((modrm >> 3) & 7) != 1 || (mod != 1 && mod != 2)) {
++    return false;
++  }
++  if ((modrm & 7) == 4) {
++    ++i;  // SIB
++  }
++  i += mod == 1 ? 1 : 4;
++  return bytes[i] == 0xC3 || bytes[i] == 0xE9 ||
++         (bytes[i] == 0xFF && bytes[i + 1] == 0xE0);
++}
++
++using NtQueryInformationThreadFn = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG,
++                                                PULONG);
++
++NtQueryInformationThreadFn QueryInformationThread() {
++  static const auto query =
++      reinterpret_cast<NtQueryInformationThreadFn>(GetProcAddress(
++          GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
++  return query;
++}
++
++// The thread's name as Windows has it (XThread::set_name forwards there).
++std::string ThreadDescription(HANDLE thread) {
++  using GetThreadDescriptionFn = HRESULT(WINAPI*)(HANDLE, PWSTR*);
++  static const auto get =
++      reinterpret_cast<GetThreadDescriptionFn>(GetProcAddress(
++          GetModuleHandleW(L"kernelbase.dll"), "GetThreadDescription"));
++  PWSTR description = nullptr;
++  if (!get || FAILED(get(thread, &description)) || !description) {
++    return std::string();
++  }
++  std::string name = xe::to_utf8(
++      std::u16string_view(reinterpret_cast<char16_t*>(description)));
++  LocalFree(description);
++  return name;
++}
++
++bool ReadStackBase(HANDLE thread, uint64_t* stack_base) {
++  struct ThreadBasicInformation {
++    LONG exit_status;
++    PVOID teb_base_address;
++    HANDLE client_process;
++    HANDLE client_thread;
++    ULONG_PTR affinity_mask;
++    LONG priority;
++    LONG base_priority;
++  };
++  const NtQueryInformationThreadFn query = QueryInformationThread();
++  ThreadBasicInformation info = {};
++  // 0: ThreadBasicInformation.
++  if (!query || query(thread, 0, &info, sizeof(info), nullptr) < 0 ||
++      !info.teb_base_address) {
++    return false;
++  }
++  NT_TIB tib;
++  if (!CopyMemoryGuarded(&tib, info.teb_base_address, sizeof(tib))) {
++    return false;
++  }
++  *stack_base = uint64_t(uintptr_t(tib.StackBase));
++  return *stack_base != 0;
++}
++
++struct WaitInfo {
++  uint64_t first_argument = 0;
++  uint16_t system_call = 0;
++  bool operator==(const WaitInfo& other) const {
++    return first_argument == other.first_argument &&
++           system_call == other.system_call;
++  }
++};
++
++// Whether the thread is in a kernel wait now, and in which system call
++// (ThreadLastSystemCall answers only for a waiting thread; undocumented, so
++// it's only used once it has answered at least once).
++bool QueryWaiting(HANDLE thread, WaitInfo* wait) {
++  struct LastSystemCall {
++    PVOID first_argument;
++    USHORT system_call;
++    USHORT reserved0;
++    ULONG reserved1;
++    ULONG64 wait_time;
++  };
++  const NtQueryInformationThreadFn query = QueryInformationThread();
++  LastSystemCall info = {};
++  // 21: ThreadLastSystemCall.
++  if (!query || query(thread, 21, &info, sizeof(info), nullptr) < 0) {
++    return false;
++  }
++  wait->first_argument = uint64_t(uintptr_t(info.first_argument));
++  wait->system_call = info.system_call;
++  return true;
++}
++
++// ---------------------------------------------------------------------------
++// Unwinding a stack copy.
++
++// The code the unwinder may look up: the code cache and loaded modules. A
++// garbage pc from a wrong unwind could otherwise make the system call a
++// module's function table callback, which some don't survive.
++class KnownCode {
++ public:
++  KnownCode(uint64_t code_begin, uint64_t code_end)
++      : code_begin_(code_begin), code_end_(code_end) {
++    // The frames above these hold an interrupted context, not a return
++    // address: exceptions (Xenia's MMIO and memory watch faults run on the
++    // faulting thread) and APCs.
++    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
++    for (const char* name :
++         {"KiUserExceptionDispatcher", "KiUserApcDispatcher"}) {
++      const auto pc = uint64_t(uintptr_t(GetProcAddress(ntdll, name)));
++      DWORD64 image_base = 0;
++      PRUNTIME_FUNCTION function =
++          pc ? RtlLookupFunctionEntry(pc, &image_base, nullptr) : nullptr;
++      if (function) {
++        dispatchers_.emplace_back(image_base + function->BeginAddress,
++                                  image_base + function->EndAddress);
++      }
++    }
++  }
++
++  bool InDispatcher(uint64_t pc) const {
++    for (const auto& [begin, end] : dispatchers_) {
++      if (pc >= begin && pc < end) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  bool InCodeCache(uint64_t pc) const {
++    return pc >= code_begin_ && pc < code_end_;
++  }
++
++  bool Contains(uint64_t pc) {
++    if (InCodeCache(pc)) {
++      return true;
++    }
++    for (const auto& [begin, end] : modules_) {
++      if (pc >= begin && pc < end) {
++        return true;
++      }
++    }
++    HMODULE module = nullptr;
++    uint64_t size = 0;
++    if (modules_.size() >= 1024 ||
++        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
++                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                            reinterpret_cast<LPCWSTR>(pc), &module) ||
++        !module || !ReadImageSize(module, &size)) {
++      return false;
++    }
++    const uint64_t begin = uint64_t(uintptr_t(module));
++    modules_.emplace_back(begin, begin + size);
++    return pc < begin + size;
++  }
++
++ private:
++  static bool ReadImageSize(HMODULE module, uint64_t* size) {
++    IMAGE_DOS_HEADER dos;
++    IMAGE_NT_HEADERS64 nt;
++    const auto* base = reinterpret_cast<const uint8_t*>(module);
++    if (!CopyMemoryGuarded(&dos, base, sizeof(dos)) ||
++        dos.e_magic != IMAGE_DOS_SIGNATURE ||
++        !CopyMemoryGuarded(&nt, base + dos.e_lfanew, sizeof(nt)) ||
++        nt.Signature != IMAGE_NT_SIGNATURE) {
++      return false;
++    }
++    *size = nt.OptionalHeader.SizeOfImage;
++    return true;
++  }
++
++  uint64_t code_begin_;
++  uint64_t code_end_;
++  std::vector<std::pair<uint64_t, uint64_t>> modules_;
++  std::vector<std::pair<uint64_t, uint64_t>> dispatchers_;
++};
++
++// Unwinds the copy of a stack taken at context, leaf first, into frames.
++// Every word of the copy and every register that pointed into the original
++// stack is moved to the copy first, so the system unwinder reads only the
++// copy. Returns whether it reached the thread's first frame.
++bool UnwindCopy(CONTEXT* context, uint8_t* copy, size_t size, KnownCode& known,
++                std::vector<uint64_t>* frames) {
++  frames->clear();
++  const uint64_t original_begin = context->Rsp;
++  const uint64_t original_end = original_begin + size;
++  const uint64_t copy_begin = uint64_t(uintptr_t(copy));
++  const uint64_t copy_end = copy_begin + size;
++  const uint64_t delta = copy_begin - original_begin;
++  const auto rewrite = [&](DWORD64& value) {
++    if (value >= original_begin && value < original_end) {
++      value += delta;
++    }
++  };
++  uint64_t* words = reinterpret_cast<uint64_t*>(copy);
++  for (size_t i = 0; i < size / sizeof(uint64_t); ++i) {
++    rewrite(words[i]);
++  }
++  for (DWORD64* reg = &context->Rax; reg <= &context->R15; ++reg) {
++    rewrite(*reg);
++  }
++  const auto in_code_cache = [&](uint64_t pc) { return known.InCodeCache(pc); };
++
++  while (frames->size() < kMaxFrames) {
++    const DWORD64 pc = context->Rip;
++    const DWORD64 previous_sp = context->Rsp;
++    frames->push_back(pc);
++    const bool top = frames->size() == 1;
++    bool found = false;
++    if (!known.Contains(pc)) {
++      return false;
++    }
++    if (top && in_code_cache(pc) && PastEpilogStackRelease(pc)) {
++      found = false;
++    } else if (!UnwindStepGuarded(pc, context, &found)) {
++      return false;
++    }
++    if (!found) {
++      if (!top) {
++        return false;
++      }
++      // A leaf function without unwind information, or past an epilog's
++      // stack release: the return address is on top of the stack.
++      if (context->Rsp < copy_begin || context->Rsp + 8 > copy_end) {
++        return false;
++      }
++      context->Rip = *reinterpret_cast<const DWORD64*>(context->Rsp);
++      context->Rsp += 8;
++    } else if (!top && in_code_cache(pc) && !in_code_cache(context->Rip) &&
++               previous_sp + 0x60 <= copy_end) {
++      // Left translated code into host code: the frame was the host-to-guest
++      // thunk, which saves its caller's nonvolatile registers in its body
++      // (StackLayout::Thunk::r at +0x18) where the unwind information
++      // doesn't describe them.
++      const DWORD64* saved = reinterpret_cast<const DWORD64*>(previous_sp);
++      context->Rbx = saved[3];
++      context->Rbp = saved[4];
++      context->Rsi = saved[6];
++      context->Rdi = saved[7];
++      context->R12 = saved[8];
++      context->R13 = saved[9];
++      context->R14 = saved[10];
++      context->R15 = saved[11];
++    }
++    if (!context->Rip) {
++      // Past the thread's start routine.
++      return true;
++    }
++    // A caller's frame returns to just after a call (except the context an
++    // exception or APC interrupted): anything else is a wrong unwind.
++    if (context->Rsp <= previous_sp || context->Rsp >= copy_end ||
++        (!known.InDispatcher(pc) && !FollowsCall(context->Rip))) {
++      return false;
++    }
++  }
++  return false;
++}
++
++// ---------------------------------------------------------------------------
++// Names.
++
++class Win32Symbolizer : public Symbolizer {
++ public:
++  explicit Win32Symbolizer(backend::CodeCache* code_cache)
++      : code_cache_(code_cache) {
++    if (code_cache_) {
++      code_begin_ = code_cache_->execute_base_address();
++      code_end_ = code_begin_ + code_cache_->total_size();
++    }
++    unknown_ = Intern("(unknown code)");
++    thunk_ = Intern("(JIT thunk)");
++    HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
++    if (dbghelp) {
++      undecorate_ = reinterpret_cast<UndecorateFn>(
++          GetProcAddress(dbghelp, "UnDecorateSymbolName"));
++    }
++    LoadMap();
++  }
++
++  ResolvedFrame Resolve(uint64_t pc, bool leaf) override {
++    // A return address is looked up inside the call before it.
++    const uint64_t lookup = leaf ? pc : pc - 1;
++    auto it = cache_.find(lookup);
++    if (it != cache_.end()) {
++      return it->second;
++    }
++    if (cache_.size() > 4000000) {
++      cache_.clear();
++    }
++    ResolvedFrame frame;
++    if (lookup >= code_begin_ && lookup < code_end_) {
++      // The code cache's function list is reserved up front and only
++      // appended to, so it can be searched without the global lock.
++      GuestFunction* function = code_cache_->LookupFunction(lookup);
++      // A function's end is the next one's start, and the search takes it as
++      // inside: a pc on a function's first byte may find the previous one.
++      if (function && !Contains(function, lookup)) {
++        GuestFunction* next = code_cache_->LookupFunction(lookup + 1);
++        function = next && Contains(next, lookup) ? next : nullptr;
++      }
++      if (function) {
++        frame.kind = FrameKind::kGuest;
++        frame.guest_function = function->address();
++        frame.guest_pc = function->MapMachineCodeToGuestAddress(lookup);
++        frame.fold = function->IsSaverest();
++        if (!function->name().empty() &&
++            !guest_names_.count(function->address())) {
++          guest_names_.emplace(function->address(), function->name());
++        }
++      } else {
++        frame.kind = FrameKind::kThunk;
++        frame.symbol = thunk_;
++      }
++    } else {
++      frame.kind = FrameKind::kHost;
++      frame.symbol = HostSymbol(lookup);
++    }
++    cache_.emplace(lookup, frame);
++    return frame;
++  }
++
++  const std::string& SymbolName(uint32_t symbol) override {
++    return names_[symbol < names_.size() ? symbol : unknown_];
++  }
++
++  const std::string* GuestFunctionName(uint32_t function) override {
++    auto it = guest_names_.find(function);
++    return it != guest_names_.end() ? &it->second : nullptr;
++  }
++
++  size_t map_symbols() const { return map_symbols_.size(); }
++  const std::filesystem::path& map_path() const { return map_path_; }
++  // A map was found but isn't from this executable's link.
++  bool map_stale() const { return map_stale_; }
++
++ private:
++  using UndecorateFn = DWORD(WINAPI*)(PCSTR, PSTR, DWORD, DWORD);
++
++  struct NamedAddress {
++    uint32_t rva;
++    // Into map_names_ (the executable) or the module's export names.
++    uint32_t name;
++  };
++
++  struct Module {
++    uint64_t base = 0;
++    uint64_t end = 0;
++    std::string name;
++    bool executable = false;
++    std::vector<NamedAddress> exports;
++    std::vector<std::string> export_names;
++    // Symbols by name index, interned on first use.
++    std::unordered_map<uint32_t, uint32_t> symbols;
++  };
++
++  static bool Contains(GuestFunction* function, uint64_t pc) {
++    const uint64_t code = uint64_t(uintptr_t(function->machine_code()));
++    return code && pc >= code && pc < code + function->machine_code_length();
++  }
++
++  uint32_t Intern(const std::string& name) {
++    auto it = name_ids_.find(name);
++    if (it != name_ids_.end()) {
++      return it->second;
++    }
++    const uint32_t id = uint32_t(names_.size());
++    names_.push_back(name);
++    name_ids_.emplace(name, id);
++    return id;
++  }
++
++  // The executable's functions from its linker map (link.exe /MAP).
++  void LoadMap() {
++    std::filesystem::path path = filesystem::GetExecutablePath();
++    path.replace_extension(".map");
++    std::ifstream file(path);
++    if (!file) {
++      // A renamed executable: the map keeps the link's name.
++      path = filesystem::GetExecutableFolder() / "xenia_canary.map";
++      file.open(path);
++      if (!file) {
++        return;
++      }
++    }
++    map_path_ = path;
++    // The map must come from the same link as the executable.
++    const auto* image =
++        reinterpret_cast<const uint8_t*>(GetModuleHandleW(nullptr));
++    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(
++        image + reinterpret_cast<const IMAGE_DOS_HEADER*>(image)->e_lfanew);
++    const uint32_t timestamp = nt->FileHeader.TimeDateStamp;
++    uint64_t preferred_base = 0;
++    bool timestamp_seen = false;
++    std::string line;
++    std::vector<std::string_view> tokens;
++    while (std::getline(file, line)) {
++      if (!preferred_base) {
++        size_t at = line.find("Timestamp is ");
++        if (at != std::string::npos) {
++          timestamp_seen = true;
++          const auto map_timestamp =
++              uint32_t(std::strtoul(line.c_str() + at + 13, nullptr, 16));
++          // 0: a reproducible link, which records no time.
++          if (map_timestamp && map_timestamp != timestamp) {
++            map_stale_ = true;
++            return;
++          }
++        }
++        at = line.find("Preferred load address is ");
++        if (at != std::string::npos) {
++          preferred_base = std::strtoull(line.c_str() + at + 26, nullptr, 16);
++        }
++        continue;
++      }
++      // " 0001:00000000       ?name@@...       0000000140001000 f   lib:obj"
++      tokens.clear();
++      size_t i = 0;
++      while (i < line.size() && tokens.size() < 4) {
++        while (i < line.size() && line[i] == ' ') {
++          ++i;
++        }
++        const size_t begin = i;
++        while (i < line.size() && line[i] != ' ') {
++          ++i;
++        }
++        if (i > begin) {
++          tokens.emplace_back(line.data() + begin, i - begin);
++        }
++      }
++      if (tokens.size() < 4 || tokens[0].size() != 13 || tokens[0][4] != ':' ||
++          tokens[0].substr(0, 4) == "0000" || tokens[2].size() != 16 ||
++          tokens[3] != "f") {
++        continue;
++      }
++      const uint64_t address =
++          std::strtoull(std::string(tokens[2]).c_str(), nullptr, 16);
++      if (address <= preferred_base || address - preferred_base > UINT32_MAX) {
++        continue;
++      }
++      map_symbols_.push_back(
++          {uint32_t(address - preferred_base), uint32_t(map_names_.size())});
++      map_names_.emplace_back(tokens[1]);
++    }
++    if (!timestamp_seen) {
++      map_symbols_.clear();
++      map_names_.clear();
++      map_stale_ = true;
++      return;
++    }
++    // Identical functions folded into one (/OPT:ICF) share an address: keep
++    // the first name listed.
++    std::stable_sort(map_symbols_.begin(), map_symbols_.end(),
++                     [](const NamedAddress& a, const NamedAddress& b) {
++                       return a.rva < b.rva;
++                     });
++    map_symbols_.erase(
++        std::unique(map_symbols_.begin(), map_symbols_.end(),
++                    [](const NamedAddress& a, const NamedAddress& b) {
++                      return a.rva == b.rva;
++                    }),
++        map_symbols_.end());
++  }
++
++  std::string Undecorate(const std::string& name) {
++    std::string result = name;
++    if (undecorate_ && !name.empty() && name[0] == '?') {
++      char buffer[1024];
++      std::lock_guard<std::mutex> lock(DbgHelpMutex());
++      // UNDNAME_NAME_ONLY
++      if (undecorate_(name.c_str(), buffer, DWORD(sizeof(buffer)), 0x1000)) {
++        result = buffer;
++      }
++    }
++    if (result.size() > 160) {
++      result.resize(157);
++      result += "...";
++    }
++    return result;
++  }
++
++  Module* FindModule(uint64_t pc) {
++    for (auto& module : modules_) {
++      if (pc >= module->base && pc < module->end) {
++        return module.get();
++      }
++    }
++    // A reference keeps the module loaded while its headers are read.
++    HMODULE handle = nullptr;
++    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
++                            reinterpret_cast<LPCWSTR>(pc), &handle) ||
++        !handle) {
++      return nullptr;
++    }
++    auto module = std::make_unique<Module>();
++    module->base = uint64_t(uintptr_t(handle));
++    const auto* base = reinterpret_cast<const uint8_t*>(handle);
++    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
++    const auto* nt =
++        reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
++    module->end = module->base + nt->OptionalHeader.SizeOfImage;
++    std::vector<wchar_t> file_name(32768);
++    const DWORD length =
++        GetModuleFileNameW(handle, file_name.data(), DWORD(file_name.size()));
++    module->name = xe::path_to_utf8(
++        std::filesystem::path(std::wstring(file_name.data(), length))
++            .filename());
++    module->executable = handle == GetModuleHandleW(nullptr);
++    if (!module->executable) {
++      ReadExports(base, nt, module.get());
++    }
++    FreeLibrary(handle);
++    modules_.push_back(std::move(module));
++    return modules_.back().get();
++  }
++
++  static void ReadExports(const uint8_t* base, const IMAGE_NT_HEADERS64* nt,
++                          Module* module) {
++    const IMAGE_DATA_DIRECTORY& directory =
++        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
++    if (!directory.VirtualAddress || !directory.Size) {
++      return;
++    }
++    const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
++        base + directory.VirtualAddress);
++    const auto* functions =
++        reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
++    const auto* names =
++        reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
++    const auto* ordinals =
++        reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
++    for (DWORD i = 0; i < exports->NumberOfNames; ++i) {
++      if (ordinals[i] >= exports->NumberOfFunctions) {
++        continue;
++      }
++      const DWORD rva = functions[ordinals[i]];
++      // Forwarders point into the export directory.
++      if (rva >= directory.VirtualAddress &&
++          rva < directory.VirtualAddress + directory.Size) {
++        continue;
++      }
++      module->exports.push_back({rva, uint32_t(module->export_names.size())});
++      module->export_names.emplace_back(
++          reinterpret_cast<const char*>(base + names[i]));
++    }
++    std::sort(module->exports.begin(), module->exports.end(),
++              [](const NamedAddress& a, const NamedAddress& b) {
++                return a.rva < b.rva;
++              });
++  }
++
++  uint32_t HostSymbol(uint64_t pc) {
++    Module* module = FindModule(pc);
++    if (!module) {
++      // Executable memory outside any module (overlay and hook trampolines,
++      // other JITs): name it by its allocation.
++      MEMORY_BASIC_INFORMATION info;
++      if (VirtualQuery(reinterpret_cast<const void*>(pc), &info,
++                       sizeof(info)) &&
++          info.State == MEM_COMMIT &&
++          (info.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
++                           PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
++        return Intern(fmt::format("(code at {:X})",
++                                  uint64_t(uintptr_t(info.AllocationBase))));
++      }
++      return unknown_;
++    }
++    const uint32_t rva = uint32_t(pc - module->base);
++    const std::vector<NamedAddress>& table =
++        module->executable ? map_symbols_ : module->exports;
++    auto it = std::upper_bound(table.begin(), table.end(), rva,
++                               [](uint32_t value, const NamedAddress& entry) {
++                                 return value < entry.rva;
++                               });
++    if (it == table.begin()) {
++      // Before every name: group by 4 KB.
++      return Intern(fmt::format("{}+{:X}", module->name, rva & ~0xFFFu));
++    }
++    --it;
++    const uint32_t offset = rva - it->rva;
++    auto symbol = module->symbols.find(it->name);
++    if (symbol == module->symbols.end() || offset >= 0x10000) {
++      std::string name;
++      if (module->executable) {
++        name = Undecorate(map_names_[it->name]);
++      } else {
++        name = module->name + "!" + module->export_names[it->name];
++      }
++      if (offset >= 0x10000) {
++        // Far past the nearest name (an unnamed function): group by 4 KB.
++        return Intern(fmt::format("{}+{:X}", name, offset & ~0xFFFu));
++      }
++      symbol = module->symbols.emplace(it->name, Intern(name)).first;
++    }
++    return symbol->second;
++  }
++
++  backend::CodeCache* code_cache_ = nullptr;
++  uint64_t code_begin_ = 0;
++  uint64_t code_end_ = 0;
++  UndecorateFn undecorate_ = nullptr;
++  uint32_t unknown_ = 0;
++  uint32_t thunk_ = 0;
++  std::vector<std::string> names_;
++  std::unordered_map<std::string, uint32_t> name_ids_;
++  std::unordered_map<uint64_t, ResolvedFrame> cache_;
++  std::unordered_map<uint32_t, std::string> guest_names_;
++  std::vector<std::unique_ptr<Module>> modules_;
++  std::filesystem::path map_path_;
++  bool map_stale_ = false;
++  std::vector<NamedAddress> map_symbols_;
++  std::vector<std::string> map_names_;
++};
++
++// ---------------------------------------------------------------------------
++// The sampler, and a thread that turns windows of samples into reports.
++
++class Win32GuestProfiler : public GuestProfiler {
++ public:
++  explicit Win32GuestProfiler(Processor* processor)
++      : processor_(processor),
++        code_cache_(processor->backend() ? processor->backend()->code_cache()
++                                         : nullptr),
++        known_code_(code_cache_ ? code_cache_->execute_base_address() : 0,
++                    code_cache_ ? code_cache_->execute_base_address() +
++                                      code_cache_->total_size()
++                                : 0) {}
++  ~Win32GuestProfiler() override { Stop(); }
++
++  bool Start() {
++    stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
++    // 2: CREATE_WAITABLE_TIMER_HIGH_RESOLUTION (Windows 10 1803).
++    timer_ = CreateWaitableTimerExW(nullptr, nullptr, 2, TIMER_ALL_ACCESS);
++    if (!timer_) {
++      timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
++    }
++    stack_copy_ = static_cast<uint8_t*>(
++        VirtualAlloc(nullptr, kStackCopySize + 16, MEM_COMMIT | MEM_RESERVE,
++                     PAGE_READWRITE));
++    if (!stop_event_ || !timer_ || !stack_copy_) {
++      XELOGE("guest_profile: couldn't create the sampler's resources");
++      return false;
++    }
++    period_us_ = std::clamp(cvars::guest_profile_period_us, 100u, 100000u);
++    EnableFrameMarks(true);
++    reporter_ = std::thread([this]() { ReporterMain(); });
++    sampler_ = std::thread([this]() { SamplerMain(); });
++    return true;
++  }
++
++  void Stop() override {
++    if (sampler_.joinable()) {
++      SetEvent(stop_event_);
++      sampler_.join();
++    }
++    if (reporter_.joinable()) {
++      {
++        std::lock_guard<std::mutex> lock(report_mutex_);
++        report_stop_ = true;
++      }
++      report_cv_.notify_all();
++      reporter_.join();
++    }
++    EnableFrameMarks(false);
++    for (Slot& slot : slots_) {
++      if (slot.handle) {
++        CloseHandle(slot.handle);
++        slot.handle = nullptr;
++      }
++    }
++    if (timer_) {
++      CloseHandle(timer_);
++      timer_ = nullptr;
++    }
++    if (stop_event_) {
++      CloseHandle(stop_event_);
++      stop_event_ = nullptr;
++    }
++    if (stack_copy_) {
++      VirtualFree(stack_copy_, 0, MEM_RELEASE);
++      stack_copy_ = nullptr;
++    }
++  }
++
++ private:
++  struct Slot {
++    uint32_t thread_id = 0;
++    uint32_t host_id = 0;
++    std::string name;
++    HANDLE handle = nullptr;
++    uint64_t stack_base = 0;
++    bool alive = false;
++    uint64_t last_sample = 0;
++    // The thread's CPU cycles at the last capture, or once it settled after
++    // it; settling: the first tick after a capture that stopped in a system
++    // call, when the capture's own cost is still in the count.
++    uint64_t cycles = 0;
++    bool settling = false;
++    // The wait it settled in (when the system answers wait probes).
++    WaitInfo wait;
++    bool wait_known = false;
++    // The last capture: its frames in the current window, and whether it
++    // was in a system call.
++    bool in_system_call = false;
++    bool truncated = false;
++    uint32_t window = UINT32_MAX;
++    uint32_t frame_begin = 0;
++    uint16_t frame_count = 0;
++  };
++
++  void SamplerMain() {
++    threading::set_name("Guest Profiler");
++    // A sampler preempted while a thread is stopped would keep it stopped:
++    // stay above the game's threads (some run at the highest normal
++    // priority).
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++    frequency_ = Clock::QueryHostTickFrequency();
++    random_ = Clock::QueryHostTickCount() | 1;
++    const uint64_t report_ticks =
++        frequency_ * std::max<uint32_t>(cvars::guest_profile_report_s, 1);
++    StartWindow(Clock::QueryHostTickCount());
++    uint64_t next_refresh = 0;
++    for (;;) {
++      // Between half and one and a half periods, so samples don't lock to
++      // anything periodic in the threads.
++      random_ ^= random_ << 13;
++      random_ ^= random_ >> 7;
++      random_ ^= random_ << 17;
++      const uint64_t wait_us =
++          period_us_ / 2 + random_ % std::max<uint32_t>(period_us_, 1);
++      LARGE_INTEGER due;
++      due.QuadPart = -int64_t(wait_us * 10);
++      SetWaitableTimer(timer_, &due, 0, nullptr, nullptr, FALSE);
++      const HANDLE handles[] = {stop_event_, timer_};
++      if (WaitForMultipleObjects(2, handles, FALSE, INFINITE) !=
++          WAIT_OBJECT_0 + 1) {
++        break;
++      }
++      const uint64_t now = Clock::QueryHostTickCount();
++      if (now >= next_refresh) {
++        RefreshThreads(now);
++        next_refresh = now + frequency_;
++      }
++      ++window_.stats.ticks;
++      for (uint16_t i = 0; i < slots_.size(); ++i) {
++        if (slots_[i].alive && !TakeSample(i, now)) {
++          // A thread couldn't be resumed: stop sampling at once.
++          XELOGE(
++              "guest_profile: couldn't resume thread {:X} ({}); sampling "
++              "stopped",
++              slots_[i].thread_id, slots_[i].name);
++          QueueReport(Clock::QueryHostTickCount());
++          return;
++        }
++      }
++      window_.swaps_lost +=
++          TakeFrameMarks(&swap_cursor_, &window_.swaps, &window_.swap_threads);
++      if (now - window_.start >= report_ticks) {
++        QueueReport(now);
++      }
++    }
++    QueueReport(Clock::QueryHostTickCount());
++  }
++
++  void RefreshThreads(uint64_t now) {
++    for (Slot& slot : slots_) {
++      slot.alive = false;
++    }
++    std::vector<size_t> added;
++    processor_->VisitThreadDebugInfos([&](const ThreadDebugInfo& info) {
++      if (!info.thread || info.state == ThreadDebugInfo::State::kExited ||
++          info.state == ThreadDebugInfo::State::kZombie) {
++        return;
++      }
++      threading::Thread* thread = info.thread->thread();
++      if (!thread) {
++        return;
++      }
++      HANDLE native = static_cast<HANDLE>(thread->native_handle());
++      // A pseudo-handle (GetCurrentThread) would name this thread.
++      if (!native || native == GetCurrentThread()) {
++        return;
++      }
++      for (Slot& slot : slots_) {
++        if (slot.handle && slot.thread_id == info.thread_id) {
++          slot.alive = true;
++          return;
++        }
++      }
++      HANDLE handle = nullptr;
++      if (!DuplicateHandle(GetCurrentProcess(), native, GetCurrentProcess(),
++                           &handle, 0, FALSE, DUPLICATE_SAME_ACCESS)) {
++        return;
++      }
++      if (slots_.size() >= UINT16_MAX ||
++          GetThreadId(handle) == GetCurrentThreadId()) {
++        CloseHandle(handle);
++        return;
++      }
++      Slot slot;
++      slot.thread_id = info.thread_id;
++      slot.host_id = GetThreadId(handle);
++      slot.handle = handle;
++      slot.alive = true;
++      added.push_back(slots_.size());
++      slots_.push_back(std::move(slot));
++    });
++    for (size_t index : added) {
++      Slot& slot = slots_[index];
++      if (!ReadStackBase(slot.handle, &slot.stack_base)) {
++        slot.alive = false;
++      }
++      slot.last_sample = now;
++    }
++    for (Slot& slot : slots_) {
++      if (!slot.alive && slot.handle) {
++        CloseHandle(slot.handle);
++        slot.handle = nullptr;
++      } else if (slot.alive) {
++        // Names change (the game names its threads after starting them).
++        slot.name = ThreadDescription(slot.handle);
++        if (slot.name.empty()) {
++          slot.name = fmt::format("thread {:X}", slot.thread_id);
++        }
++      }
++    }
++  }
++
++  // Returns false if the thread couldn't be resumed.
++  bool TakeSample(uint16_t index, uint64_t now) {
++    Slot& slot = slots_[index];
++    const uint64_t period_ticks = frequency_ * period_us_ / 1000000;
++    uint64_t weight = now - slot.last_sample;
++    if (!weight || weight > period_ticks * 50) {
++      weight = period_ticks;
++    }
++    slot.last_sample = now;
++    ULONG64 cycles = 0;
++    if (!QueryThreadCycleTime(slot.handle, &cycles)) {
++      ++window_.stats.failures;
++      return true;
++    }
++    // Hasn't run since the last capture (but for what the capture itself
++    // cost it): still waiting in the same system call, or stopped by
++    // something else (paused, suspended by the guest, created suspended).
++    // A running thread's cycle count may lag, so it must also be in a wait
++    // now: the system's wait probe once it has answered, else a stop in a
++    // system call.
++    if (slot.window == window_id_ && slot.frame_count) {
++      WaitInfo wait;
++      const bool waiting = QueryWaiting(slot.handle, &wait);
++      if (waiting) {
++        wait_probe_ = true;
++      }
++      bool same = false;
++      if (wait_probe_ ? waiting : slot.in_system_call) {
++        if (slot.settling) {
++          const uint64_t cost = cycles - slot.cycles;
++          same = cost <= kCaptureCycleAllowance;
++          if (same) {
++            window_.stats.max_capture_cycles =
++                std::max(window_.stats.max_capture_cycles, cost);
++            slot.settling = false;
++            slot.cycles = cycles;
++            slot.wait = wait;
++            slot.wait_known = waiting;
++          }
++        } else {
++          same = cycles == slot.cycles &&
++                 (!slot.wait_known || !waiting || wait == slot.wait);
++        }
++      }
++      if (same) {
++        AddSample(
++            index, now, weight,
++            kSampleRepeated |
++                (slot.in_system_call ? kSampleSystemCall : kSampleStopped) |
++                (slot.truncated ? kSampleTruncated : 0),
++            slot.frame_begin, slot.frame_count);
++        ++window_.stats.repeats;
++        return true;
++      }
++    }
++    slot.cycles = cycles;
++    const uint64_t stop_start = Clock::QueryHostTickCount();
++    const Capture capture =
++        CaptureStopped(slot.handle, &context_, slot.stack_base, stack_copy_);
++    const uint64_t stopped = Clock::QueryHostTickCount() - stop_start;
++    if (capture.resume_failed) {
++      return false;
++    }
++    window_.stats.stopped_ticks += stopped;
++    window_.stats.max_stopped_ticks =
++        std::max(window_.stats.max_stopped_ticks, stopped);
++    if (!capture.size) {
++      ++window_.stats.failures;
++      slot.frame_count = 0;
++      slot.in_system_call = false;
++      return true;
++    }
++    ++window_.stats.captures;
++    const uint64_t leaf = context_.Rip;
++    const bool complete = UnwindCopy(&context_, stack_copy_ + capture.offset,
++                                     capture.size, known_code_, &frames_);
++    slot.in_system_call = AfterSystemCall(leaf);
++    slot.settling = true;
++    slot.wait_known = false;
++    slot.truncated = !complete;
++    slot.window = window_id_;
++    slot.frame_begin = uint32_t(window_.frames.size());
++    slot.frame_count = uint16_t(frames_.size());
++    window_.frames.insert(window_.frames.end(), frames_.begin(), frames_.end());
++    AddSample(index, now, weight,
++              (slot.in_system_call ? kSampleSystemCall : 0) |
++                  (complete ? 0 : kSampleTruncated),
++              slot.frame_begin, slot.frame_count);
++    return true;
++  }
++
++  void AddSample(uint16_t thread, uint64_t now, uint64_t weight, uint8_t flags,
++                 uint32_t frame_begin, uint16_t frame_count) {
++    Sample sample;
++    sample.time = now;
++    sample.thread = thread;
++    sample.weight = uint32_t(std::min<uint64_t>(weight, UINT32_MAX));
++    sample.flags = flags;
++    sample.frame_begin = frame_begin;
++    sample.frame_count = frame_count;
++    window_.samples.push_back(sample);
++  }
++
++  uint64_t ThreadCpuTicks() {
++    FILETIME creation, exit, kernel, user;
++    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit, &kernel, &user)) {
++      return 0;
++    }
++    const uint64_t hundred_ns =
++        (uint64_t(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
++        (uint64_t(user.dwHighDateTime) << 32 | user.dwLowDateTime);
++    return hundred_ns * frequency_ / 10000000;
++  }
++
++  void StartWindow(uint64_t now) {
++    window_ = Window();
++    ++window_id_;
++    window_.tick_frequency = frequency_;
++    window_.period_us = period_us_;
++    window_.start = now;
++    window_cpu_start_ = ThreadCpuTicks();
++    for (Slot& slot : slots_) {
++      // Repeats point into the window's frames.
++      slot.window = UINT32_MAX;
++    }
++  }
++
++  // Hands the window to the report thread and starts the next one.
++  void QueueReport(uint64_t now) {
++    if (!window_.samples.empty()) {
++      window_.end = now;
++      window_.stats.sampler_cpu_ticks = ThreadCpuTicks() - window_cpu_start_;
++      window_.stats.report_ticks =
++          last_report_ticks_.load(std::memory_order_relaxed);
++      window_.stats.wait_probe = wait_probe_;
++      window_.threads.clear();
++      for (const Slot& slot : slots_) {
++        window_.threads.push_back({slot.name, slot.thread_id, slot.host_id});
++      }
++      {
++        std::lock_guard<std::mutex> lock(report_mutex_);
++        if (report_queue_.size() >= 2) {
++          ++windows_dropped_;
++        } else {
++          window_.stats.windows_dropped = windows_dropped_;
++          windows_dropped_ = 0;
++          report_queue_.push_back(std::make_unique<Window>(std::move(window_)));
++        }
++      }
++      report_cv_.notify_one();
++    }
++    StartWindow(now);
++  }
++
++  void ReporterMain() {
++    threading::set_name("Guest Profiler Reports");
++    Win32Symbolizer symbolizer(code_cache_);
++    if (symbolizer.map_symbols()) {
++      XELOGI("guest_profile: {} functions from {}", symbolizer.map_symbols(),
++             xe::path_to_utf8(symbolizer.map_path()));
++    } else if (symbolizer.map_stale()) {
++      XELOGW(
++          "guest_profile: {} is from another build of the executable; "
++          "Xenia's own functions are named by address",
++          xe::path_to_utf8(symbolizer.map_path()));
++    } else {
++      XELOGW(
++          "guest_profile: no linker map next to the executable; Xenia's own "
++          "functions are named by address");
++    }
++    ReportOptions options;
++    options.slow_frame_ms = cvars::guest_profile_slow_frame_ms;
++    for (;;) {
++      std::unique_ptr<Window> window;
++      {
++        std::unique_lock<std::mutex> lock(report_mutex_);
++        report_cv_.wait(
++            lock, [&]() { return report_stop_ || !report_queue_.empty(); });
++        if (report_queue_.empty()) {
++          return;
++        }
++        window = std::move(report_queue_.front());
++        report_queue_.pop_front();
++      }
++      const uint64_t start = Clock::QueryHostTickCount();
++      for (const std::string& line :
++           BuildReport(*window, symbolizer, options)) {
++        XELOGI("Guest profile: {}", line);
++      }
++      last_report_ticks_.store(Clock::QueryHostTickCount() - start,
++                               std::memory_order_relaxed);
++    }
++  }
++
++  Processor* processor_;
++  backend::CodeCache* code_cache_ = nullptr;
++  KnownCode known_code_;
++  std::thread sampler_;
++  std::thread reporter_;
++  HANDLE stop_event_ = nullptr;
++  HANDLE timer_ = nullptr;
++  uint8_t* stack_copy_ = nullptr;
++  CONTEXT context_;
++  std::vector<uint64_t> frames_;
++  uint32_t period_us_ = 1000;
++  uint64_t frequency_ = 1;
++  uint64_t random_ = 1;
++  bool wait_probe_ = false;
++  std::vector<Slot> slots_;
++  Window window_;
++  uint32_t window_id_ = 0;
++  uint64_t window_cpu_start_ = 0;
++  uint64_t swap_cursor_ = 0;
++
++  std::mutex report_mutex_;
++  std::condition_variable report_cv_;
++  std::deque<std::unique_ptr<Window>> report_queue_;
++  bool report_stop_ = false;
++  uint32_t windows_dropped_ = 0;
++  std::atomic<uint64_t> last_report_ticks_{0};
++};
++
++}  // namespace
++
++std::unique_ptr<GuestProfiler> GuestProfiler::Create(Processor* processor) {
++  if (!cvars::guest_profile) {
++    return nullptr;
++  }
++  auto profiler = std::make_unique<Win32GuestProfiler>(processor);
++  if (!profiler->Start()) {
++    return nullptr;
++  }
++  XELOGI("guest_profile: sampling every {} us, a report every {} s",
++         cvars::guest_profile_period_us, cvars::guest_profile_report_s);
++  return profiler;
++}
++
++#else  // XE_ARCH_AMD64
++
++std::unique_ptr<GuestProfiler> GuestProfiler::Create(Processor* processor) {
++  if (cvars::guest_profile) {
++    XELOGW("guest_profile: not supported on this platform");
++  }
++  return nullptr;
++}
++
++#endif  // XE_ARCH_AMD64
++
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/cpu/processor.cc b/src/xenia/cpu/processor.cc
+index c8064d0..e25b7cb 100644
+--- a/src/xenia/cpu/processor.cc
++++ b/src/xenia/cpu/processor.cc
+@@ -25,6 +25,7 @@
+ #include "xenia/cpu/breakpoint.h"
+ #include "xenia/cpu/cpu_flags.h"
+ #include "xenia/cpu/export_resolver.h"
++#include "xenia/cpu/guest_profiler.h"
+ #include "xenia/cpu/module.h"
+ #include "xenia/cpu/ppc/ppc_decode_data.h"
+ #include "xenia/cpu/ppc/ppc_frontend.h"
+@@ -90,6 +91,7 @@ Processor::Processor(xe::Memory* memory, ExportResolver* export_resolver)
+     : memory_(memory), export_resolver_(export_resolver) {}
+ 
+ Processor::~Processor() {
++  StopGuestProfiler();
+   {
+     auto global_lock = global_critical_region_.Acquire();
+     modules_.clear();
+@@ -158,9 +160,17 @@ bool Processor::Setup(std::unique_ptr<backend::Backend> backend) {
+         ChunkedMappedMemoryWriter::Open(functions_trace_path_, 32_MiB, true);
+   }
+ 
++  guest_profiler_ = GuestProfiler::Create(this);
++
+   return true;
+ }
+ 
++void Processor::StopGuestProfiler() {
++  if (guest_profiler_) {
++    guest_profiler_->Stop();
++  }
++}
++
+ void Processor::PreLaunch() {
+   if (cvars::break_on_start) {
+     // Start paused.
+@@ -536,6 +546,14 @@ std::vector<ThreadDebugInfo*> Processor::QueryThreadDebugInfos() {
+   return result;
+ }
+ 
++void Processor::VisitThreadDebugInfos(
++    const std::function<void(const ThreadDebugInfo&)>& fn) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (const auto& it : thread_debug_infos_) {
++    fn(*it.second);
++  }
++}
++
+ ThreadDebugInfo* Processor::QueryThreadDebugInfo(uint32_t thread_id) {
+   auto global_lock = global_critical_region_.Acquire();
+   const auto& it = thread_debug_infos_.find(thread_id);
+diff --git a/src/xenia/cpu/processor.h b/src/xenia/cpu/processor.h
+index 55e1890..ff630a1 100644
+--- a/src/xenia/cpu/processor.h
++++ b/src/xenia/cpu/processor.h
+@@ -37,6 +37,7 @@ namespace cpu {
+ constexpr fourcc_t kProcessorSaveSignature = make_fourcc("PROC");
+ 
+ class Breakpoint;
++class GuestProfiler;
+ class StackWalker;
+ class XexModule;
+ 
+@@ -135,6 +136,15 @@ class Processor {
+   // Returns the debugger info for the given thread.
+   ThreadDebugInfo* QueryThreadDebugInfo(uint32_t thread_id);
+ 
++  // Calls fn with each thread's debugger info under the global lock, so the
++  // threads can't be destroyed meanwhile.
++  void VisitThreadDebugInfos(
++      const std::function<void(const ThreadDebugInfo&)>& fn);
++
++  // Stops the guest profiler (guest_profile) if it runs: before the threads
++  // and the code cache go away.
++  void StopGuestProfiler();
++
+   // Adds a breakpoint to the debugger and activates it (if enabled).
+   // The given breakpoint will not be owned by the debugger and must remain
+   // allocated so long as it is added.
+@@ -251,6 +261,7 @@ class Processor {
+ 
+   Memory* memory_ = nullptr;
+   std::unique_ptr<StackWalker> stack_walker_;
++  std::unique_ptr<GuestProfiler> guest_profiler_;
+ 
+   std::function<DebugListener*(Processor*)> debug_listener_handler_;
+   DebugListener* debug_listener_ = nullptr;
+diff --git a/src/xenia/cpu/stack_walker.h b/src/xenia/cpu/stack_walker.h
+index 3006c28..d113fdd 100644
+--- a/src/xenia/cpu/stack_walker.h
++++ b/src/xenia/cpu/stack_walker.h
+@@ -11,6 +11,7 @@
+ #define XENIA_CPU_STACK_WALKER_H_
+ 
+ #include <memory>
++#include <mutex>
+ #include <string>
+ 
+ #include "xenia/base/host_thread_context.h"
+@@ -55,6 +56,10 @@ struct StackFrame {
+   };
+ };
+ 
++// dbghelp is single-threaded: everything in the process that calls it
++// (the stack walker, the guest profiler) holds this.
++std::mutex& DbgHelpMutex();
++
+ class StackWalker {
+  public:
+   // Creates a stack walker. Only one should exist within a process.
+diff --git a/src/xenia/cpu/stack_walker_win.cc b/src/xenia/cpu/stack_walker_win.cc
+index 1312048..f6e4047 100644
+--- a/src/xenia/cpu/stack_walker_win.cc
++++ b/src/xenia/cpu/stack_walker_win.cc
+@@ -61,6 +61,11 @@ LPSYMGETSYMFROMADDR64 sym_get_sym_from_addr_64_ = nullptr;
+ namespace xe {
+ namespace cpu {
+ 
++std::mutex& DbgHelpMutex() {
++  static std::mutex mutex;
++  return mutex;
++}
++
+ bool InitializeStackWalker() {
+   if (sym_get_options_) {
+     // Already initialized.
+@@ -126,7 +131,7 @@ class Win32StackWalker : public StackWalker {
+   }
+ 
+   bool Initialize() {
+-    std::lock_guard<std::mutex> lock(dbghelp_mutex_);
++    std::lock_guard<std::mutex> lock(DbgHelpMutex());
+     return InitializeStackWalker();
+   }
+ 
+@@ -234,6 +239,7 @@ class Win32StackWalker : public StackWalker {
+     // TODO(has207): verify StackWalk64 + dbghelp callbacks work for JIT'd
+     // ARM64 code with dynamically registered unwind info
+     // (RtlAddGrowableFunctionTable).
++    std::lock_guard<std::mutex> lock(DbgHelpMutex());
+     size_t frame_index = 0;
+     while (frame_index < frame_count &&
+            stack_walk_64_(machine_type, GetCurrentProcess(), thread_handle,
+@@ -253,7 +259,7 @@ class Win32StackWalker : public StackWalker {
+                     size_t frame_count) override {
+     // TODO(benvanik): collect symbols to resolve with dbghelp and resolve
+     // afterward in a smaller lock.
+-    std::lock_guard<std::mutex> lock(dbghelp_mutex_);
++    std::lock_guard<std::mutex> lock(DbgHelpMutex());
+ 
+     for (size_t i = 0; i < frame_count; ++i) {
+       auto& frame = frames[i];
+@@ -329,8 +335,6 @@ class Win32StackWalker : public StackWalker {
+     return sym_get_module_base_64_(hProcess, dwAddr);
+   }
+ 
+-  std::mutex dbghelp_mutex_;
+-
+   static xe::cpu::backend::CodeCache* code_cache_;
+   static uintptr_t code_cache_min_;
+   static uintptr_t code_cache_max_;
+diff --git a/src/xenia/cpu/testing/guest_profiler_test.cc b/src/xenia/cpu/testing/guest_profiler_test.cc
+new file mode 100644
+index 0000000..1442d24
+--- /dev/null
++++ b/src/xenia/cpu/testing/guest_profiler_test.cc
+@@ -0,0 +1,234 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include <string>
++#include <vector>
++
++#include "third_party/catch/include/catch.hpp"
++#include "xenia/cpu/guest_profiler.h"
++
++namespace xe {
++namespace cpu {
++namespace testing {
++namespace {
++
++using namespace guest_profile;
++
++// Host PCs: 1 << 40 plus a guest instruction (its function is the address
++// rounded down to 0x100) for translated code, 2 << 40 plus a symbol for
++// emulator code; 3 << 40 is a syscall stub.
++constexpr uint64_t kGuest = uint64_t(1) << 40;
++constexpr uint64_t kHost = uint64_t(2) << 40;
++
++class FakeSymbolizer : public Symbolizer {
++ public:
++  ResolvedFrame Resolve(uint64_t pc, bool leaf) override {
++    ResolvedFrame frame;
++    if ((pc >> 40) == 1) {
++      frame.kind = FrameKind::kGuest;
++      frame.guest_pc = uint32_t(pc);
++      frame.guest_function = uint32_t(pc) & ~uint32_t(0xFF);
++      // 820F0000: a register save/restore helper.
++      frame.fold = frame.guest_function == 0x820F0000;
++    } else if ((pc >> 40) == 2) {
++      frame.kind = FrameKind::kHost;
++      frame.symbol = uint32_t(pc & 0xFF);
++    } else {
++      frame.kind = FrameKind::kUnknown;
++      frame.symbol = 99;
++    }
++    return frame;
++  }
++  const std::string* GuestFunctionName(uint32_t function) override {
++    static const std::string kWait = "KeWaitForSingleObject";
++    return function == 0x820D0000 ? &kWait : nullptr;
++  }
++  const std::string& SymbolName(uint32_t symbol) override {
++    names_.resize(100);
++    if (names_[symbol].empty()) {
++      names_[symbol] =
++          symbol == 99 ? "(unknown code)" : "host" + std::to_string(symbol);
++    }
++    return names_[symbol];
++  }
++
++ private:
++  std::vector<std::string> names_;
++};
++
++void AddSample(Window& window, uint16_t thread, uint64_t time, uint32_t weight,
++               uint8_t flags, std::vector<uint64_t> frames) {
++  Sample sample;
++  sample.time = time;
++  sample.thread = thread;
++  sample.weight = weight;
++  sample.flags = flags;
++  sample.frame_begin = uint32_t(window.frames.size());
++  sample.frame_count = uint16_t(frames.size());
++  window.frames.insert(window.frames.end(), frames.begin(), frames.end());
++  window.samples.push_back(sample);
++}
++
++bool Contains(const std::vector<std::string>& lines, const std::string& text) {
++  for (const std::string& line : lines) {
++    if (line.find(text) != std::string::npos) {
++      return true;
++    }
++  }
++  return false;
++}
++
++}  // namespace
++
++TEST_CASE("Guest profiler frame marks", "[guest_profiler]") {
++  uint64_t cursor = 0;
++  std::vector<uint64_t> swaps;
++  std::vector<uint32_t> threads;
++  EnableFrameMarks(false);
++  GuestProfiler::MarkFrame();
++  REQUIRE(TakeFrameMarks(&cursor, &swaps, &threads) == 0);
++  REQUIRE(swaps.empty());
++  EnableFrameMarks(true);
++  for (int i = 0; i < 3; ++i) {
++    GuestProfiler::MarkFrame();
++  }
++  REQUIRE(TakeFrameMarks(&cursor, &swaps, &threads) == 0);
++  REQUIRE(swaps.size() == 3);
++  REQUIRE(threads.size() == 3);
++  REQUIRE(threads[0] == threads[2]);
++  REQUIRE(swaps[0] <= swaps[1]);
++  REQUIRE(swaps[1] <= swaps[2]);
++  // Overflow: only the last ring's worth is kept.
++  for (int i = 0; i < 5000; ++i) {
++    GuestProfiler::MarkFrame();
++  }
++  swaps.clear();
++  threads.clear();
++  REQUIRE(TakeFrameMarks(&cursor, &swaps, &threads) == 5000 - 4096);
++  REQUIRE(swaps.size() == 4096);
++  EnableFrameMarks(false);
++}
++
++TEST_CASE("Guest profiler report", "[guest_profiler]") {
++  Window window;
++  // 1000 ticks a millisecond.
++  window.tick_frequency = 1000000;
++  window.start = 0;
++  window.end = 1000000;  // 1 s
++  window.period_us = 1000;
++  window.threads = {{"Main", 0x10, 1}, {"Idle", 0x20, 2}, {"Stopped", 0x30, 3}};
++  // Frames of 10 ms over the whole second, except one of 50 ms (slow) from
++  // 100 to 150 ms: 96 frames, from host thread 1 (Main); one swap from
++  // thread 2 in between doesn't count.
++  for (uint64_t time = 0; time <= 1000000; time += 10000) {
++    if (time > 100000 && time < 150000) {
++      continue;
++    }
++    window.swaps.push_back(time);
++    window.swap_threads.push_back(1);
++    if (time == 50000) {
++      window.swaps.push_back(55000);
++      window.swap_threads.push_back(2);
++    }
++  }
++
++  // Main, in the 10 ms frames: 820A0010 (own code) called from 820B0020,
++  // 60 samples of 1 ms; 820A0010 calling emulator function host1, 20 samples.
++  for (uint64_t i = 0; i < 60; ++i) {
++    AddSample(window, 0, 1000 + i * 1000, 1000, 0,
++              {kGuest | 0x820A0010, kGuest | 0x820B0024});
++  }
++  for (uint64_t i = 0; i < 20; ++i) {
++    AddSample(window, 0, 61000 + i * 1000, 1000, 0,
++              {kHost | 1, kGuest | 0x820A0040, kGuest | 0x820B0024});
++  }
++  // In the slow frame: 820C0000 runs 40 ms.
++  for (uint64_t i = 0; i < 40; ++i) {
++    AddSample(window, 0, 105000 + i * 1000, 1000, 0,
++              {kGuest | 0x820C0008, kGuest | 0x820B0024});
++  }
++  // A wait: 10 samples in a system call under the named import stub
++  // 820D0000, called from 820B0000.
++  for (uint64_t i = 0; i < 10; ++i) {
++    AddSample(window, 0, 200000 + i * 1000, 1000,
++              kSampleSystemCall | (i ? kSampleRepeated : 0),
++              {kHost | 7, kHost | 2, kGuest | 0x820D0004, kGuest | 0x820B0030});
++  }
++  // The idle thread: only system calls.
++  AddSample(window, 1, 500000, 1000000, kSampleSystemCall, {kHost | 7});
++  // A thread stopped in guest code for half of the window counts as
++  // waiting, not running.
++  AddSample(window, 2, 600000, 500000, kSampleStopped | kSampleRepeated,
++            {kGuest | 0x820E0010});
++
++  FakeSymbolizer symbolizer;
++  ReportOptions options;
++  std::vector<std::string> lines = BuildReport(window, symbolizer, options);
++  // Shown with any failing check below.
++  std::string report;
++  for (const std::string& line : lines) {
++    report += line;
++    report += '\n';
++  }
++  INFO(report);
++  // 96 frames: per-frame figures divide by 96.
++  REQUIRE(Contains(lines, "96 frames"));
++  REQUIRE(Contains(lines,
++                   "frames are Main's swaps, 1 from other threads "
++                   "left out"));
++  REQUIRE(Contains(lines, "1 slow frames over 15.00 ms"));
++  REQUIRE(Contains(lines, "Main: 1.250 ms/frame running, 0.104 waiting"));
++  // Own time: 820A0000 80 samples (60 own code + 20 in host1).
++  REQUIRE(Contains(lines,
++                   "    0.833  66.7%  820A0000  emulator 0.208 "
++                   "(host1 100%)  from 820B0000 100%"));
++  REQUIRE(Contains(lines, "    0.417  33.3%  820C0000  from 820B0000 100%"));
++  // Call trees: 820B0000 is under everything that ran.
++  REQUIRE(Contains(lines, "820B0000 1.250 100%;"));
++  // Waits: the import stub 820D0000 in host7 (a system call).
++  REQUIRE(Contains(lines,
++                   "Main waiting (ms/frame; where it waited, in system calls "
++                   "or stopped): 820D0000 KeWaitForSingleObject 0.104 "
++                   "(host7);"));
++  // Emulator code: host1 for 820A0000.
++  REQUIRE(Contains(lines, "    0.208 /   0.208  host1  for 820A0000 100%"));
++  // Hot instructions: 820A0010 own code 60/80, 820A0040 a call 20/80.
++  REQUIRE(Contains(lines, "  820A0000: 820A0010 75% 820A0040c 25%"));
++  // Slow frames: 820C0000 used 40 ms in the slow frame, nothing in others.
++  REQUIRE(Contains(lines, "own 820C0000 40.00 / 0.00;"));
++  // The idle thread is summarized only.
++  REQUIRE(Contains(lines, "Idle [20] 0/100;"));
++  REQUIRE(Contains(lines, "Stopped [30] 0/50;"));
++  REQUIRE(!Contains(lines, "Idle own time"));
++}
++
++TEST_CASE("Guest profiler folds helpers into their callers",
++          "[guest_profiler]") {
++  Window window;
++  window.tick_frequency = 1000000;
++  window.end = 100000;
++  window.period_us = 1000;
++  window.threads = {{"Main", 0x10}};
++  // Stopped in a save helper called from 820A0010, called from 820B0024.
++  for (uint64_t i = 0; i < 100; ++i) {
++    AddSample(window, 0, i * 1000, 1000, 0,
++              {kGuest | 0x820F0008, kGuest | 0x820A0010, kGuest | 0x820B0024});
++  }
++  FakeSymbolizer symbolizer;
++  std::vector<std::string> lines =
++      BuildReport(window, symbolizer, ReportOptions());
++  // All own time goes to 820A0000 (no swaps: figures per second), and the
++  // helper doesn't show anywhere.
++  REQUIRE(Contains(lines, "  1000.000 100.0%  820A0000  from 820B0000 100%"));
++  REQUIRE(!Contains(lines, "820F0000"));
++}
++
++}  // namespace testing
++}  // namespace cpu
++}  // namespace xe
+diff --git a/src/xenia/emulator.cc b/src/xenia/emulator.cc
+index eadd15c..2f1f3d7 100644
+--- a/src/xenia/emulator.cc
++++ b/src/xenia/emulator.cc
+@@ -169,6 +169,11 @@ Emulator::Emulator(const std::filesystem::path& command_line,
+ Emulator::~Emulator() {
+   // Note that we delete things in the reverse order they were initialized.
+ 
++  // The profiler samples the threads that go away below.
++  if (processor_) {
++    processor_->StopGuestProfiler();
++  }
++
+   // Give the systems time to shutdown before we delete them.
+   if (graphics_system_) {
+     graphics_system_->Shutdown();
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
+index 1283523..cc9aa16 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_video.cc
+@@ -10,6 +10,7 @@
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_video.h"
+ 
+ #include "xenia/base/logging.h"
++#include "xenia/cpu/guest_profiler.h"
+ #include "xenia/emulator.h"
+ #include "xenia/gpu/graphics_system.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -472,6 +473,8 @@ void VdSwap_entry(
+     lpdword_t frontbuffer_ptr,  // ptr to frontbuffer address
+     lpdword_t texture_format_ptr, lpdword_t color_space_ptr, lpdword_t width,
+     lpdword_t height) {
++  cpu::GuestProfiler::MarkFrame();
++
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+   assert(fetch_ptr);

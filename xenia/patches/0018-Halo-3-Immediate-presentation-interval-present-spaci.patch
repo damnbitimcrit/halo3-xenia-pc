@@ -1,0 +1,295 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Immediate presentation interval; present spacing;
+ flip and GPU wait stats
+
+Busy scenes sat at about 82 presents/s with framerate_limit 165 and about
+100 with 200: two emulated vblanks per frame.
+
+Every present runs D3D's presentation interval sync (sub_821929C8) before
+the swap. Its PM4 interrupt runs the guest callback sub_825A95B8 on Xenia's
+GPU command thread, which retires the sync at once only if the target
+vblank is the current one; otherwise it queues the flip and the GPU waits
+(WAIT_REG_MEM at 82192B08, 1 ms sleeps) until the D3D vblank handler clears
+it. Halo uses interval 1 with an immediate threshold of 10% of a 60 Hz
+frame, so a frame slightly longer than one vblank takes two, and frames are
+capped at the vblank rate.
+
+- halo3_immediate_present (default on): OnPresent (821924EC) arms a
+  per-thread flag, and the next sync on that thread with r28 == 0 (the
+  present's argument) gets interval code 0, immediate, at 82192AD4 (`slwi
+  r8, r10, 8`, reached only by falling through 82192AD0 after the interval
+  mapping). The callback then flips at once; one flip per swap remains.
+  Presents that never went through sub_821924C0 (sub_821AA498, sub_821AD0F0,
+  D3D's own thread) keep their vblank sync.
+- halo3_present_spacing (default off): the render thread holds a present
+  back until one halo3_framerate_limit period after the previous one, so
+  a late frame followed by an early one can't exceed the cap now that
+  the vblank no longer spaces swaps. Off by default because, once a
+  frame is late, the hold keeps later frames at its phase (estimated:
+  about +4 ms latency and -10 presents/s at the cap); it spaces the
+  game's presents, not the host Present. The hold is kept out of the
+  render times that pacing uses.
+- Stats, a "Halo 3 present" line: flips done at once and queued for a later
+  vblank (825A96FC / 825A96D8 in the callback), the render thread's waits
+  for the GPU command thread inside D3D (begin / end helpers 825A7D18 /
+  825A7D48, all six wait sites), and the spacing waits. The first stats
+  interval no longer includes the GPU thread time since Xenia started.
+---
+ src/xenia/kernel/title/halo3/halo3.cc       |  25 ++++
+ src/xenia/kernel/title/halo3/halo3.h        |  11 ++
+ src/xenia/kernel/title/halo3/halo3_frame.cc | 125 ++++++++++++++++++++
+ 3 files changed, 161 insertions(+)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 0ef2bdf..8f5dd43 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -62,7 +62,17 @@ void LogStats() {
+   const uint64_t now = Clock::QueryHostTickCount();
+   const uint64_t frequency = Clock::QueryHostTickFrequency();
+   if (!last) {
++    // The counters that measure time ran since Xenia started; start the
++    // first interval clean.
+     last = now;
++    gpu::GpuThreadStats& g = gpu::gpu_thread_stats();
++    for (std::atomic<uint64_t>* ticks :
++         {&g.idle_ticks, &g.execute_ticks, &g.swap_ticks, &g.present_ticks,
++          &g.gpu_wait_ticks, &g.wait_reg_mem_ticks}) {
++      ticks->store(0, std::memory_order_relaxed);
++    }
++    apu::audio_stats().min_queued_frames.store(UINT32_MAX,
++                                               std::memory_order_relaxed);
+     return;
+   }
+   if (now - last < kStatsIntervalSeconds * frequency) {
+@@ -141,6 +151,21 @@ void LogStats() {
+       double(s.cap_sleep_us.exchange(0)) / 1000.0,
+       double(s.cap_spin_us.exchange(0)) / 1000.0,
+       per(s.cap_late_us.exchange(0), cap_waits));
++  const uint32_t render_gpu_waits = s.render_gpu_waits.exchange(0);
++  const uint64_t render_gpu_wait_us = s.render_gpu_wait_us.exchange(0);
++  const uint32_t flips_immediate = s.flips_immediate.exchange(0);
++  const uint32_t flips_deferred = s.flips_deferred.exchange(0);
++  const uint32_t spacing_waits = s.present_spacing_waits.exchange(0);
++  XELOGI(
++      "Halo 3 present: {:.1f} flips/s at once, {:.1f}/s held for a later "
++      "vblank (immediate present {}); render thread waited for the GPU "
++      "thread {:.2f} ms per frame ({} waits); {} presents held back "
++      "{:.2f} ms avg to keep the cap's spacing",
++      flips_immediate / seconds, flips_deferred / seconds,
++      cvars::halo3_immediate_present,
++      takes ? double(render_gpu_wait_us) / 1000.0 / takes : 0.0,
++      render_gpu_waits, spacing_waits,
++      per(s.present_spacing_us.exchange(0), spacing_waits));
+   apu::AudioStats& a = apu::audio_stats();
+   const uint32_t min_queued = a.min_queued_frames.exchange(UINT32_MAX);
+   XELOGI(
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 1855b51..ea212f7 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -21,6 +21,7 @@ DECLARE_int32(halo3_framerate_limit);
+ DECLARE_bool(halo3_interpolation);
+ DECLARE_bool(halo3_log_stats);
+ DECLARE_bool(halo3_smooth_shader_time);
++DECLARE_bool(halo3_immediate_present);
+ 
+ namespace xe {
+ namespace kernel {
+@@ -114,6 +115,16 @@ struct Stats {
+   std::atomic<uint64_t> cap_sleep_us{0};
+   std::atomic<uint64_t> cap_spin_us{0};
+   std::atomic<uint64_t> cap_late_us{0};
++  // Render thread: presents held back to keep them a cap period apart, and
++  // its waits for the GPU command thread inside D3D (fences, ring space).
++  std::atomic<uint32_t> present_spacing_waits{0};
++  std::atomic<uint64_t> present_spacing_us{0};
++  std::atomic<uint32_t> render_gpu_waits{0};
++  std::atomic<uint64_t> render_gpu_wait_us{0};
++  // GPU command thread: presentation interval flips done at once and queued
++  // for a later vblank (each of those makes the GPU wait for that vblank).
++  std::atomic<uint32_t> flips_immediate{0};
++  std::atomic<uint32_t> flips_deferred{0};
+ };
+ Stats& stats();
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index e2e54f4..156b269 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -106,6 +106,19 @@ DEFINE_bool(halo3_render_thread_sleep, true,
+             "frame and while the main thread draws (loads), instead of "
+             "spinning on a CPU core.",
+             "Halo3");
++DEFINE_bool(halo3_immediate_present, true,
++            "Halo 3: while the frame rate is unlocked, present frames as soon "
++            "as they are drawn instead of on the next emulated vblank. "
++            "Otherwise a frame that takes a little longer than one vblank "
++            "waits for the next (82 FPS at framerate_limit 165).",
++            "Halo3");
++DEFINE_bool(halo3_present_spacing, false,
++            "Halo 3: hold the render thread's presents (the game's, before "
++            "the frame's last GPU work) at least one halo3_framerate_limit "
++            "period apart, so a late frame followed by an early one doesn't "
++            "exceed the cap. Off by default: once a frame is late, the hold "
++            "keeps later frames at its phase, which adds latency.",
++            "Halo3");
+ 
+ namespace xe {
+ namespace kernel {
+@@ -152,6 +165,26 @@ constexpr uint32_t kRenderTakeReturn = 0x821A866C;
+ // The mode word, in r11, isn't 1; reached only by the `bne` at 821A8564. In
+ // mode 0 the thread loops back here without a call.
+ constexpr uint32_t kRenderModeNotOne = 0x821A8730;
++// D3D's presentation interval sync (sub_821929C8), run before every swap:
++// `slwi r8, r10, 8` with r10 = the interval code (0 immediate, 1 one vblank)
++// mapped from D3DRS_PRESENTINTERVAL. Reached only by falling through
++// 82192AD0, which all five mapping paths branch to; r28 = the second argument,
++// 0 for the presents (via 821929C0, 825A998C). The guest CP interrupt callback
++// sub_825A95B8 then retires the sync at once only when its target vblank is
++// the current one; otherwise the GPU waits (WAIT_REG_MEM at 82192B08) for a
++// later vblank. Halo's interval 1 with an immediate threshold of 10% of a 60 Hz
++// frame makes a frame slightly longer than one emulated vblank take two.
++constexpr uint32_t kPresentIntervalCode = 0x82192AD4;
++// In that callback (GPU command thread): a flip queued for a later vblank
++// (reached only by falling through 825A96D4) and a flip done at once (reached
++// only from the `beq`s at 825A96C8 and 825A96D4).
++constexpr uint32_t kFlipDeferred = 0x825A96D8;
++constexpr uint32_t kFlipImmediate = 0x825A96FC;
++// D3D's wait for the GPU: the begin (sub_825A7D18) and end (sub_825A7D48)
++// helpers around each spin, called in pairs at its six wait sites (fences,
++// ring and segment space).
++constexpr uint32_t kD3DWaitBegin = 0x825A7D18;
++constexpr uint32_t kD3DWaitEnd = 0x825A7D48;
+ // Main thread. sub_82080278 after its publish (`bl sub_821D5888` at
+ // 820802C8): the low byte of r3 is whether it published.
+ constexpr uint32_t kPublishReturn = 0x820802CC;
+@@ -646,15 +679,59 @@ void ForceNotEqual(cpu::ppc::PPCContext* ctx, void*) {
+   }
+ }
+ 
++// Set by OnPresent, taken by the next presentation interval sync on the same
++// thread: sub_821924C0's callers call the present (sub_82192880) right after
++// it, and only those presents had their vblank waits removed by the unlock.
++thread_local bool immediate_present_armed = false;
++// The render thread's last present for halo3_present_spacing, in host ticks.
++thread_local uint64_t last_spaced_present = 0;
++// The start of a D3D wait for the GPU on the render thread, in host ticks.
++thread_local uint64_t d3d_wait_start = 0;
++
++// Render thread: keeps presents at least one cap period apart.
++void SpacePresent() {
++  const int32_t limit = cvars::halo3_framerate_limit;
++  if (!cvars::halo3_present_spacing || limit <= 0) {
++    last_spaced_present = 0;
++    return;
++  }
++  const uint64_t frequency = Clock::QueryHostTickFrequency();
++  const uint64_t period = frequency / uint64_t(limit);
++  const uint64_t now = Clock::QueryHostTickCount();
++  if (!last_spaced_present || now >= last_spaced_present + period) {
++    last_spaced_present = now;
++    return;
++  }
++  // Too soon after the last one: wait, and count from the target, so the
++  // spacing holds the cap rate exactly rather than adding wake-up delays.
++  const uint64_t target = last_spaced_present + period;
++  SleepUntil(target, frequency);
++  last_spaced_present = target;
++  const uint64_t held = Clock::QueryHostTickCount() - now;
++  // The hold isn't drawing time: keep it out of the render times that pacing
++  // and the stats use.
++  if (render.take_ticks) {
++    render.take_ticks += held;
++  }
++  if (LogStatsOn()) {
++    Stats& s = stats();
++    s.present_spacing_waits.fetch_add(1, std::memory_order_relaxed);
++    s.present_spacing_us.fetch_add(TicksToUs(held, frequency),
++                                   std::memory_order_relaxed);
++  }
++}
++
+ // The present's wait branch runs once per present: on the render thread in
+ // game, on the main thread while the game draws single-threaded.
+ void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
+   Stats& s = stats();
+   s.presents++;
++  immediate_present_armed = Unlocked() && cvars::halo3_immediate_present;
+   if (!OnMainThread(ctx)) {
+     SetRenderThread(ctx);
+     s.render_thread_presents++;
+     if (Unlocked()) {
++      SpacePresent();
+       const uint64_t now = Clock::QueryGuestTickCount();
+       frame_delta_seconds = last_present_ticks
+                                 ? float(double(now - last_present_ticks) /
+@@ -664,11 +741,54 @@ void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
+     } else {
+       frame_delta_seconds = 0.0f;
+       last_present_ticks = 0;
++      last_spaced_present = 0;
+     }
+   }
+   ForceEqual(ctx, nullptr);
+ }
+ 
++// Presentation interval sync: interval code 0 (immediate) for a present armed
++// by OnPresent. The callback then targets the current vblank and flips at
++// once, so the GPU's wait passes on its first poll; there is still one flip
++// per swap.
++void OnPresentIntervalCode(cpu::ppc::PPCContext* ctx, void*) {
++  if (!immediate_present_armed || static_cast<uint32_t>(ctx->r[28])) {
++    return;
++  }
++  immediate_present_armed = false;
++  ctx->r[10] = 0;
++}
++
++// GPU command thread, inside the guest interrupt callback.
++void OnFlipDeferred(cpu::ppc::PPCContext*, void*) {
++  if (LogStatsOn()) {
++    stats().flips_deferred.fetch_add(1, std::memory_order_relaxed);
++  }
++}
++void OnFlipImmediate(cpu::ppc::PPCContext*, void*) {
++  if (LogStatsOn()) {
++    stats().flips_immediate.fetch_add(1, std::memory_order_relaxed);
++  }
++}
++
++// The render thread's waits for the GPU command thread (fences, ring space).
++void OnD3DWaitBegin(cpu::ppc::PPCContext* ctx, void*) {
++  d3d_wait_start =
++      LogStatsOn() && OnRenderThread(ctx) ? Clock::QueryHostTickCount() : 0;
++}
++void OnD3DWaitEnd(cpu::ppc::PPCContext*, void*) {
++  if (!d3d_wait_start) {
++    return;
++  }
++  Stats& s = stats();
++  s.render_gpu_waits.fetch_add(1, std::memory_order_relaxed);
++  s.render_gpu_wait_us.fetch_add(
++      TicksToUs(Clock::QueryHostTickCount() - d3d_wait_start,
++                Clock::QueryHostTickFrequency()),
++      std::memory_order_relaxed);
++  d3d_wait_start = 0;
++}
++
+ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+   if (!cvars::halo3_unlock_framerate) {
+     pacer = {};
+@@ -731,6 +851,11 @@ void InstallFramePacing(KernelState* kernel_state) {
+   hooks.Add(processor, kMainTimeWaitBranch, ForceEqual);
+   hooks.Add(processor, kMainTimeDtComputed, OnMainTimeDtComputed);
+   hooks.Add(processor, kPresentWaitBranch, OnPresent);
++  hooks.Add(processor, kPresentIntervalCode, OnPresentIntervalCode);
++  hooks.Add(processor, kFlipDeferred, OnFlipDeferred);
++  hooks.Add(processor, kFlipImmediate, OnFlipImmediate);
++  hooks.Add(processor, kD3DWaitBegin, OnD3DWaitBegin);
++  hooks.Add(processor, kD3DWaitEnd, OnD3DWaitEnd);
+   hooks.Add(processor, kOuterLoopWaitBranch, ForceNotEqual);
+   hooks.Add(processor, kRenderReasonBranch, ForceEqual);
+   if (!take_event) {

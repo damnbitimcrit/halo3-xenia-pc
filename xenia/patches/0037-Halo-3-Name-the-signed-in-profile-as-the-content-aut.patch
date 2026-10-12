@@ -1,0 +1,261 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Name the signed-in profile as the content author;
+ log film desyncs
+
+Halo 3 writes the author of a film, clip, screenshot or map or game
+variant (sub_821E8A58, the content metadata) only for a profile signed in
+to Xbox Live: the gamertag the game keeps in the player's slot
+(slot+0x990). Xenia signs profiles in locally, so everything made in
+Xenia had no author, as on a console with an offline profile.
+
+- halo3_author_from_profile (default on): hook 821E8B48 (once the
+  author's name source r26 is chosen; reached from 821E8B40 and by
+  fall-through from 821E8B44): if r26 is still the empty name, the slot
+  r30 is one of the four user slots and isn't a player without a profile
+  (flag 0x4, which has a random name), and its gamertag isn't empty,
+  point r26 at it, as the Live path does. The XUID and the online flag
+  are left as the game sets them.
+- Theater film desync log: hook 820A4268 (sub_820A4098, reached only by
+  falling through after a recorded update didn't match) logs the updates
+  played, the film mode, and the recorded and current film tick, game
+  tick and random seed, once per film; hook 823BD140 (entry, five calls)
+  logs a film stopped because it couldn't be read or decoded (reason 0).
+---
+ src/xenia/kernel/title/halo3/halo3.cc         |   1 +
+ src/xenia/kernel/title/halo3/halo3.h          |   2 +
+ src/xenia/kernel/title/halo3/halo3_content.cc | 199 ++++++++++++++++++
+ 3 files changed, 202 insertions(+)
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_content.cc
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index b08e8e8..752497b 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -735,6 +735,7 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   InstallInput(kernel_state);
+   InstallTiming(kernel_state);
+   InstallTheaterSnapshots(kernel_state);
++  InstallContent(kernel_state);
+   auto& hooks = cpu::GuestHooks::Get();
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBodyEntry);
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index cd9711d..a9ce046 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -179,6 +179,8 @@ void InstallTiming(KernelState* kernel_state);
+ void InstallInput(KernelState* kernel_state);
+ // halo3_theater.cc
+ void InstallTheaterSnapshots(KernelState* kernel_state);
++// halo3_content.cc
++void InstallContent(KernelState* kernel_state);
+ // Takes the mouse motion for this frame.
+ void OnInputFrameStart(cpu::ppc::PPCContext* ctx);
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3_content.cc b/src/xenia/kernel/title/halo3/halo3_content.cc
+new file mode 100644
+index 0000000..08b9f47
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_content.cc
+@@ -0,0 +1,199 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// The author of the content players make, and Theater film desyncs.
++//
++// Halo 3 names the author of a film, clip, screenshot or map or game variant
++// (sub_821E8A58, the content metadata) only when its profile is signed in to
++// Xbox Live: then the author is the gamertag the game keeps in the player's
++// slot. Xenia signs profiles in locally, so everything Xenia made had no
++// author, as on a console with an offline profile. The author is shown in
++// the file browser and Theater; the XUID and the online flag the game writes
++// next to it are left as they are.
++//
++// A Theater film plays back by running the game's simulation again with the
++// recorded input; every update also carries the film tick, the game tick and
++// the random seed it was recorded at, and a mismatch makes the game stop the
++// film (sub_820A4098). The log says which of the three differed first.
++
++#include <cstdint>
++#include <string>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/base/cvar.h"
++#include "xenia/base/logging.h"
++#include "xenia/base/string.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++
++DEFINE_bool(halo3_author_from_profile, true,
++            "Halo 3: name the signed-in profile as the author of the films, "
++            "clips, screenshots and map and game variants it makes, as a "
++            "console signed in to Xbox Live does (Xenia signs in locally, and "
++            "the game writes the author's name only for a Live sign-in). The "
++            "author's XUID and online flag stay as the game sets them. Off: "
++            "no author name, as on a console with an offline profile.",
++            "Halo3");
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// sub_821E8A58 (fills the 0xF8-byte content metadata), at `lhz r11,
++// 2(r30)` once the author's name source r26 is chosen. Reached from
++// 821E8B40 (not signed in to Live: r26 = kEmptyName) and by fall-through
++// from 821E8B44 (Live: r26 = r30 + kUserSlotGamertag), only for content a
++// player made (unique id r29 != 0) in a user slot r30 that sub_821B7030
++// accepts: a signed-in profile, or a player without one (flag
++// kUserSlotUnsigned, with a random name). 821E8C14-821E8C6C then copy *r26
++// as the ASCII author at +0xA8.
++constexpr uint32_t kAuthorChosen = 0x821E8B48;
++// An empty wide string in .rdata.
++constexpr uint32_t kEmptyName = 0x82000A74;
++// The four user slots.
++constexpr uint32_t kUserSlots = 0x831401E8;
++constexpr uint32_t kUserSlotSize = 0x9D0;
++constexpr uint32_t kUserSlotCount = 4;
++// u16 flags; 0x4: a player without a profile (sub_8247BD98(slot, 1)).
++constexpr uint32_t kUserSlotFlags = 0x0;
++constexpr uint16_t kUserSlotUnsigned = 0x4;
++// wchar[16]: the profile's gamertag (copied from XamUserGetSigninInfo by
++// sub_82094AC8 and sub_82089AE8), or the random name of a player without
++// one.
++constexpr uint32_t kUserSlotGamertag = 0x990;
++constexpr uint32_t kGamertagChars = 16;
++
++// sub_820A4098 (a Theater film's update), at `li r4, 1` before
++// sub_823BD140(film, 1): reached only by falling through when the recorded
++// update didn't match the game (820A4214-820A4264). r27 = the film, r29 =
++// the recorded update.
++constexpr uint32_t kFilmOutOfSync = 0x820A4268;
++// sub_823BD140(film r3, reason r4): stops the film once (u8 film+0x30 latches
++// it). Reason 1 comes only from the desync check; the other four callers
++// pass 0 when the film couldn't be read or decoded.
++constexpr uint32_t kFilmStopped = 0x823BD140;
++constexpr uint32_t kFilmMode = 0x8;
++constexpr uint32_t kFilmTick = 0x28;
++constexpr uint32_t kFilmStopReported = 0x30;
++// Updates played, this one included.
++constexpr uint32_t kFilmUpdatesPlayed = 0x1398;
++constexpr uint32_t kUpdateFilmTick = 0x0;
++constexpr uint32_t kUpdateGameTick = 0x1440;
++constexpr uint32_t kUpdateRandomSeed = 0x1444;
++// Thread-local globals (*r13 + offset): the game time globals (+0xC: ticks
++// elapsed) and a pointer to the simulation's random seed.
++constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
++constexpr uint32_t kGameTimeElapsedTicks = 0xC;
++constexpr uint32_t kTlsRandomSeed = 0x2BC;
++
++uint8_t LoadU8(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return *ctx->TranslateVirtual<uint8_t*>(address);
++}
++
++uint16_t LoadU16(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<uint16_t>(ctx->TranslateVirtual(address));
++}
++
++uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
++}
++
++// Reads *(address) + offset as a pointer, 0 if address is 0.
++uint32_t Follow(cpu::ppc::PPCContext* ctx, uint32_t address, uint32_t offset) {
++  if (!address) {
++    return 0;
++  }
++  const uint32_t pointer = LoadU32(ctx, address);
++  return pointer ? pointer + offset : 0;
++}
++
++void OnAuthorChosen(cpu::ppc::PPCContext* ctx, void*) {
++  // Signed in to Live (the game chose the gamertag itself), or not this
++  // function's player path.
++  if (!cvars::halo3_author_from_profile ||
++      static_cast<uint32_t>(ctx->r[26]) != kEmptyName) {
++    return;
++  }
++  const uint32_t slot = static_cast<uint32_t>(ctx->r[30]);
++  if (slot < kUserSlots ||
++      slot >= kUserSlots + kUserSlotCount * kUserSlotSize ||
++      (slot - kUserSlots) % kUserSlotSize) {
++    return;
++  }
++  // A player without a profile: no author on a console either.
++  if (LoadU16(ctx, slot + kUserSlotFlags) & kUserSlotUnsigned) {
++    return;
++  }
++  const uint32_t name = slot + kUserSlotGamertag;
++  if (!LoadU16(ctx, name)) {
++    return;
++  }
++  ctx->r[26] = name;
++  std::u16string gamertag;
++  for (uint32_t i = 0; i < kGamertagChars - 1; ++i) {
++    const char16_t c = LoadU16(ctx, name + i * 2);
++    if (!c) {
++      break;
++    }
++    gamertag.push_back(c);
++  }
++  XELOGD("Halo 3: content author from the profile: user {}, file type {}, {}",
++         (slot - kUserSlots) / kUserSlotSize, static_cast<int32_t>(ctx->r[22]),
++         xe::to_utf8(gamertag));
++}
++
++void OnFilmOutOfSync(cpu::ppc::PPCContext* ctx, void*) {
++  const uint32_t film = static_cast<uint32_t>(ctx->r[27]);
++  const uint32_t update = static_cast<uint32_t>(ctx->r[29]);
++  if (!film || !update || LoadU8(ctx, film + kFilmStopReported)) {
++    return;
++  }
++  const uint32_t tls = static_cast<uint32_t>(ctx->r[13]);
++  const uint32_t time = Follow(ctx, Follow(ctx, tls, kTlsGameTimeGlobals), 0);
++  const uint32_t seed = Follow(ctx, Follow(ctx, tls, kTlsRandomSeed), 0);
++  XELOGW(
++      "Halo 3: Theater film out of sync after {} updates played (film mode "
++      "{}): film tick recorded {} / playing {}, game tick recorded {} / here "
++      "{}, random seed recorded {:08X} / here {:08X}",
++      LoadU32(ctx, film + kFilmUpdatesPlayed), LoadU32(ctx, film + kFilmMode),
++      LoadU32(ctx, update + kUpdateFilmTick), LoadU32(ctx, film + kFilmTick),
++      LoadU32(ctx, update + kUpdateGameTick),
++      time ? LoadU32(ctx, time + kGameTimeElapsedTicks) : 0,
++      LoadU32(ctx, update + kUpdateRandomSeed), seed ? LoadU32(ctx, seed) : 0);
++}
++
++void OnFilmStopped(cpu::ppc::PPCContext* ctx, void*) {
++  const uint32_t film = static_cast<uint32_t>(ctx->r[3]);
++  if (!film || static_cast<uint32_t>(ctx->r[4]) ||
++      LoadU8(ctx, film + kFilmStopReported)) {
++    return;
++  }
++  XELOGW(
++      "Halo 3: Theater film stopped after {} updates played: it couldn't be "
++      "read or decoded (not a desync)",
++      LoadU32(ctx, film + kFilmUpdatesPlayed));
++}
++
++}  // namespace
++
++void InstallContent(KernelState* kernel_state) {
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  hooks.Add(processor, kAuthorChosen, OnAuthorChosen);
++  hooks.Add(processor, kFilmOutOfSync, OnFilmOutOfSync);
++  hooks.Add(processor, kFilmStopped, OnFilmStopped);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe

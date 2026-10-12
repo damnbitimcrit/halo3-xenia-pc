@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [APU] Count XMA stream resets and split frames, and XAudio2
+ glitches
+
+Occasional pops happen while the output queue never runs dry, so they
+come from somewhere a full queue doesn't see. Counters for the
+candidates, in audio_stats():
+
+- XmaContextNew: Clear register writes, new streams started by zeroing
+  the work buffer and those of them that dropped the rest of a frame,
+  frames dropped because their header continues in an input buffer that
+  isn't valid yet, and waits for the next buffer in the middle of a frame.
+- XAudio2: the engine's GlitchesSinceEngineStarted (passes that reached
+  the device late), read about once a second from SubmitFrame through
+  GetPerformanceData (2.8 layout of XAUDIO2_PERFORMANCE_DATA).
+---
+ src/xenia/apu/audio_stats.h                   | 13 +++++++++++++
+ src/xenia/apu/xaudio2/xaudio2_api.h           | 18 +++++++++++++++++-
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.cc | 11 +++++++++++
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.h  |  5 +++++
+ src/xenia/apu/xma_context_new.cc              | 11 +++++++++++
+ 5 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/apu/audio_stats.h b/src/xenia/apu/audio_stats.h
+index e4419fb..e0bfc9f 100644
+--- a/src/xenia/apu/audio_stats.h
++++ b/src/xenia/apu/audio_stats.h
+@@ -38,6 +38,19 @@ struct AudioStats {
+   std::atomic<uint32_t> hard_underruns{0};
+   std::atomic<uint32_t> resumes{0};
+   std::atomic<uint32_t> min_queued_frames{UINT32_MAX};
++  // The XAudio2 engine's glitches (IXAudio2::GetPerformanceData), passes it
++  // couldn't deliver to the device in time, whatever was queued.
++  std::atomic<uint32_t> engine_glitches{0};
++  // XMA decoder (the new one): contexts cleared through the register, new
++  // streams started by zeroing a context's work buffer, and of those, the
++  // ones that dropped the rest of a frame of the previous sound; frames
++  // whose header continues in an input buffer that wasn't valid yet
++  // (dropped), and waits for the next input buffer in the middle of a frame.
++  std::atomic<uint32_t> xma_clears{0};
++  std::atomic<uint32_t> xma_work_buffer_resets{0};
++  std::atomic<uint32_t> xma_reset_drops{0};
++  std::atomic<uint32_t> xma_split_header_drops{0};
++  std::atomic<uint32_t> xma_split_body_waits{0};
+ };
+ 
+ inline AudioStats& audio_stats() {
+diff --git a/src/xenia/apu/xaudio2/xaudio2_api.h b/src/xenia/apu/xaudio2/xaudio2_api.h
+index 00c4234..8d986c9 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_api.h
++++ b/src/xenia/apu/xaudio2/xaudio2_api.h
+@@ -94,7 +94,23 @@ struct XAUDIO2_VOICE_STATE {
+   UINT64 SamplesPlayed;
+ };
+ 
+-struct XAUDIO2_PERFORMANCE_DATA;
++// 2.8+ layout.
++struct XAUDIO2_PERFORMANCE_DATA {
++  UINT64 AudioCyclesSinceLastQuery;
++  UINT64 TotalCyclesSinceLastQuery;
++  UINT32 MinimumCyclesPerQuantum;
++  UINT32 MaximumCyclesPerQuantum;
++  UINT32 MemoryUsageInBytes;
++  UINT32 CurrentLatencyInSamples;
++  UINT32 GlitchesSinceEngineStarted;
++  UINT32 ActiveSourceVoiceCount;
++  UINT32 TotalSourceVoiceCount;
++  UINT32 ActiveSubmixVoiceCount;
++  UINT32 ActiveResamplerCount;
++  UINT32 ActiveMatrixMixCount;
++  UINT32 ActiveXmaSourceVoices;
++  UINT32 ActiveXmaStreams;
++};
+ 
+ struct XAUDIO2_DEBUG_CONFIGURATION {
+   UINT32 TraceMask;
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+index 9465a8c..6ca3681 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+@@ -354,6 +354,17 @@ void XAudio2AudioDriver::SubmitFrame(float* frame) {
+   }
+ 
+   AudioStats& stats = audio_stats();
++  // About once a second, collect the engine's glitches: passes that reached
++  // the device late, which a full queue here doesn't rule out.
++  if (api_minor_version_ >= 8 && ++performance_query_frames_ >= 188) {
++    performance_query_frames_ = 0;
++    api::XAUDIO2_PERFORMANCE_DATA performance;
++    objects_.api_2_8.audio->GetPerformanceData(&performance);
++    stats.engine_glitches.fetch_add(
++        performance.GlitchesSinceEngineStarted - engine_glitches_,
++        std::memory_order_relaxed);
++    engine_glitches_ = performance.GlitchesSinceEngineStarted;
++  }
+   std::lock_guard<std::mutex> lock(smoothing_mutex_);
+   // The semaphore keeps the frames in flight, held ones included, at most
+   // frame_count_, so this slot has finished playing.
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+index ad57069..b0692d7 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+@@ -126,6 +126,11 @@ class XAudio2AudioDriver : public AudioDriver {
+   float frames_[frame_count_][kFrameSamplesMax];
+   uint32_t current_frame_ = 0;
+ 
++  // SubmitFrame (smoothing path): frames since the engine's performance data
++  // was last read, and its glitch count then.
++  uint32_t performance_query_frames_ = 0;
++  uint32_t engine_glitches_ = 0;
++
+   // Underrun smoothing, set up before Initialize.
+   bool smoothing_ = false;
+   uint32_t prebuffer_frames_ = 0;
+diff --git a/src/xenia/apu/xma_context_new.cc b/src/xenia/apu/xma_context_new.cc
+index 3fee9c6..18b5d68 100644
+--- a/src/xenia/apu/xma_context_new.cc
++++ b/src/xenia/apu/xma_context_new.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/apu/xma_context_new.h"
+ #include "xenia/apu/apu_flags.h"
++#include "xenia/apu/audio_stats.h"
+ #include "xenia/apu/xma_helpers.h"
+ 
+ #include "xenia/base/byte_order.h"
+@@ -253,6 +254,7 @@ void XmaContextNew::Enable() { set_is_enabled(true); }
+ 
+ void XmaContextNew::Clear() {
+   std::lock_guard<xe_mutex> lock(lock_);
++  audio_stats().xma_clears.fetch_add(1, std::memory_order_relaxed);
+ 
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+@@ -296,6 +298,11 @@ void XmaContextNew::CheckWorkBufferResetLocked(const XMA_CONTEXT_DATA& data) {
+   if (work_buffer_marked_ && *mark != kWorkBufferMark) {
+     XELOGAPU("XmaContext {}: Work buffer reset, {} subframes dropped", id(),
+              current_frame_remaining_subframes_);
++    AudioStats& stats = audio_stats();
++    stats.xma_work_buffer_resets.fetch_add(1, std::memory_order_relaxed);
++    if (current_frame_remaining_subframes_) {
++      stats.xma_reset_drops.fetch_add(1, std::memory_order_relaxed);
++    }
+     current_frame_remaining_subframes_ = 0;
+     loop_frame_output_limit_ = 0;
+     loop_start_skip_pending_ = false;
+@@ -541,6 +548,8 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
+           "XmaContext {}: Split frame header at packet {}, next buffer "
+           "unavailable — swapping input buffer",
+           id(), packet_index);
++      audio_stats().xma_split_header_drops.fetch_add(1,
++                                                     std::memory_order_relaxed);
+       SwapInputBuffer(data);
+       return;
+     }
+@@ -589,6 +598,8 @@ void XmaContextNew::Decode(XMA_CONTEXT_DATA* data) {
+         // Error path
+         // Decoder probably should return error here
+         // Not sure what error code should be returned
++        audio_stats().xma_split_body_waits.fetch_add(1,
++                                                     std::memory_order_relaxed);
+         data->error_status = 4;
+         return;
+       }

@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Optional stats logging (halo3_log_stats)
+
+Every 5 seconds, logs the main loop rate, simulation ticks and presents
+per second, how many frames the mouse turned the view in, how many
+objects and first-person poses were blended per frame, and whether the
+unlock, interpolation and hooks are active. Meant for diagnosing
+machines where the log is the only diagnostic.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        | 46 ++++++++++++++++++++
+ src/xenia/kernel/title/halo3/halo3.h         | 13 ++++++
+ src/xenia/kernel/title/halo3/halo3_frame.cc  |  9 +++-
+ src/xenia/kernel/title/halo3/halo3_input.cc  |  1 +
+ src/xenia/kernel/title/halo3/halo3_interp.cc |  3 ++
+ 5 files changed, 71 insertions(+), 1 deletion(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 336a35d..6aca5c2 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++#include "xenia/base/clock.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/cpu/guest_hooks.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -22,6 +23,10 @@ DEFINE_int32(halo3_framerate_limit, 0,
+              "Halo 3: frame-rate cap used when halo3_unlock_framerate is on. "
+              "0 means no cap.",
+              "Halo3");
++DEFINE_bool(halo3_log_stats, false,
++            "Halo 3: log frame, tick and present rates and what the mouse "
++            "and interpolation did, every 5 seconds.",
++            "Halo3");
+ 
+ namespace xe {
+ namespace kernel {
+@@ -33,7 +38,43 @@ namespace {
+ // and before the simulation runs.
+ constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
+ 
++constexpr uint64_t kStatsIntervalSeconds = 5;
++
++void LogStats() {
++  static uint64_t last = 0;
++  const uint64_t now = Clock::QueryHostTickCount();
++  const uint64_t frequency = Clock::QueryHostTickFrequency();
++  if (!last) {
++    last = now;
++    return;
++  }
++  if (now - last < kStatsIntervalSeconds * frequency) {
++    return;
++  }
++  const double seconds = double(now - last) / double(frequency);
++  last = now;
++  Stats& s = stats();
++  const uint32_t frames = s.frames.exchange(0);
++  const uint32_t ticks = s.ticks.exchange(0);
++  const uint32_t presents = s.presents.exchange(0);
++  const uint32_t mouse_frames = s.mouse_frames.exchange(0);
++  const uint32_t objects = s.blended_objects.exchange(0);
++  const uint32_t poses = s.blended_poses.exchange(0);
++  XELOGI(
++      "Halo 3: {:.1f} frames/s, {:.1f} ticks/s, {:.1f} presents/s; mouse "
++      "turned the view in {} frames; {:.1f} objects and {:.1f} first-person "
++      "poses blended per frame (unlock {}, interpolation {}, hooks {})",
++      frames / seconds, ticks / seconds, presents / seconds, mouse_frames,
++      frames ? double(objects) / frames : 0.0,
++      frames ? double(poses) / frames : 0.0, cvars::halo3_unlock_framerate,
++      cvars::halo3_interpolation, cpu::GuestHooks::Get().active());
++}
++
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
++  if (cvars::halo3_log_stats) {
++    stats().frames++;
++    LogStats();
++  }
+   // Wait first so input is sampled as late as possible.
+   OnPacingFrameStart(ctx);
+   OnInterpolationFrameStart(ctx);
+@@ -42,6 +83,11 @@ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ }  // namespace
+ 
++Stats& stats() {
++  static Stats instance;
++  return instance;
++}
++
+ void Install(KernelState* kernel_state, UserModule* module) {
+   XELOGI("Halo 3 (TU0) detected; installing hooks");
+   InstallFramePacing(kernel_state);
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index acd7e6a..247af42 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -10,6 +10,7 @@
+ #ifndef XENIA_KERNEL_TITLE_HALO3_HALO3_H_
+ #define XENIA_KERNEL_TITLE_HALO3_HALO3_H_
+ 
++#include <atomic>
+ #include <cstdint>
+ 
+ #include "xenia/base/cvar.h"
+@@ -18,6 +19,7 @@
+ DECLARE_bool(halo3_unlock_framerate);
+ DECLARE_int32(halo3_framerate_limit);
+ DECLARE_bool(halo3_interpolation);
++DECLARE_bool(halo3_log_stats);
+ 
+ namespace xe {
+ namespace kernel {
+@@ -33,6 +35,17 @@ constexpr uint64_t kModuleHash = 0x19EB90F06A070ED6ull;
+ 
+ void Install(KernelState* kernel_state, UserModule* module);
+ 
++// Counters behind halo3_log_stats, which logs them every few seconds.
++struct Stats {
++  std::atomic<uint32_t> frames{0};        // main loop body runs
++  std::atomic<uint32_t> ticks{0};         // simulation ticks
++  std::atomic<uint32_t> presents{0};      // frames handed to the GPU
++  std::atomic<uint32_t> mouse_frames{0};  // frames that turned the view
++  std::atomic<uint32_t> blended_objects{0};
++  std::atomic<uint32_t> blended_poses{0};
++};
++Stats& stats();
++
+ // Each title file installs its own hooks. The start of the main loop body
+ // (once per frame, before input and the simulation) is shared, so halo3.cc
+ // hooks it and calls the On*FrameStart functions in order.
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index 6125781..43eb2c6 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -117,6 +117,13 @@ void ForceNotEqual(cpu::ppc::PPCContext* ctx, void*) {
+   }
+ }
+ 
++// The present's wait branch runs once per present, on the main thread in
++// game and on the render thread for loading screens.
++void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
++  stats().presents++;
++  ForceEqual(ctx, nullptr);
++}
++
+ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+   if (!cvars::halo3_unlock_framerate) {
+     pacer = {};
+@@ -147,7 +154,7 @@ void InstallFramePacing(KernelState* kernel_state) {
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kMainTimeWaitBranch, ForceEqual);
+   hooks.Add(processor, kMainTimeDtComputed, OnMainTimeDtComputed);
+-  hooks.Add(processor, kPresentWaitBranch, ForceEqual);
++  hooks.Add(processor, kPresentWaitBranch, OnPresent);
+   hooks.Add(processor, kOuterLoopWaitBranch, ForceNotEqual);
+   hooks.Add(processor, kRenderReasonBranch, ForceEqual);
+ }
+diff --git a/src/xenia/kernel/title/halo3/halo3_input.cc b/src/xenia/kernel/title/halo3/halo3_input.cc
+index 31a8120..7333c44 100644
+--- a/src/xenia/kernel/title/halo3/halo3_input.cc
++++ b/src/xenia/kernel/title/halo3/halo3_input.cc
+@@ -104,6 +104,7 @@ void OnActionBuilt(cpu::ppc::PPCContext* ctx, void*) {
+       cvars::halo3_mouse_invert_y ? -frame_mouse.dy : frame_mouse.dy;
+   *yaw = *yaw - float(frame_mouse.dx * scale);
+   *pitch = *pitch - float(dy * scale);
++  stats().mouse_frames++;
+   frame_mouse.dx = 0;
+   frame_mouse.dy = 0;
+ }
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 66feafc..8ecceef 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -418,6 +418,7 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+     }
+     StoreTransform(ctx, o.address, o.written);
+     o.applied = true;
++    stats().blended_objects++;
+   }
+ }
+ 
+@@ -591,6 +592,7 @@ void BlendFirstPerson(cpu::ppc::PPCContext* ctx, float alpha) {
+     });
+     StorePose(ctx, slot, p, p.written);
+     p.applied = true;
++    stats().blended_poses++;
+   }
+ }
+ 
+@@ -656,6 +658,7 @@ void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) {
+ }
+ 
+ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
++  stats().ticks++;
+   if (!Enabled()) {
+     if (state) {
+       state->have_tick = false;

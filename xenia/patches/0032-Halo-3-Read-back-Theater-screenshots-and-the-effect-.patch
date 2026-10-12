@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Read back Theater screenshots and the effect state
+ in saves
+
+halo3_gpu_readback (default on) uses the guest readback at the two
+moments the game reads GPU results on the CPU:
+
+- Theater screenshots were black: the game exports the frame with memory
+  export in tiles (sub_822A5D70, sub_822A5658) and JPEG-encodes it on
+  the CPU (sub_824E0BE0) once the export's fence (*8315FBB0) passed.
+  Hook 824E0BE0 (the encoder's entry, called only from 824DFE24 after
+  that check) reads back the image at *8315FB80, *8315FB84 bytes.
+- Saves carried stale effect state, so effects alive at a checkpoint
+  glitched after a revert. Hook 821D67E4 (sub_821D67A0, the before-save
+  procs, right after the wait for the fence after the last effect pass,
+  with the render thread parked; r29 = flags, reached by fall-through
+  only) reads back the four effect storages before the procs, the hash
+  and every caller's copy or write. Flags 0x100 are skipped: the hash
+  brackets copy nothing, and Theater's rewind snapshot (every 300 ticks
+  while a multiplayer film plays, into cache1:\sf_history.blob for
+  seeking, not into the film) would mean waiting for the GPU every 10
+  seconds.
+
+The game's memory layout and checksums don't change, so console saves
+and films load as before. One log line per readback (bytes, pause).
+---
+ src/xenia/kernel/title/halo3/halo3.cc | 129 ++++++++++++++++++++++++++
+ 1 file changed, 129 insertions(+)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 3e91bee..caaf259 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -10,8 +10,10 @@
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cmath>
+ #include <iterator>
++#include <string>
+ 
+ #include "xenia/apu/audio_stats.h"
+ #include "xenia/base/byte_order.h"
+@@ -19,6 +21,7 @@
+ #include "xenia/base/logging.h"
+ #include "xenia/cpu/guest_hooks.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
++#include "xenia/gpu/guest_readback.h"
+ #include "xenia/gpu/memexport_keep.h"
+ #include "xenia/kernel/kernel_state.h"
+ 
+@@ -35,6 +38,14 @@ DEFINE_bool(halo3_log_stats, false,
+             "Halo 3: log frame, tick and present rates and what the mouse "
+             "and interpolation did, every 5 seconds.",
+             "Halo3");
++DEFINE_bool(halo3_gpu_readback, true,
++            "Halo 3: copy what the GPU wrote into the game's memory when the "
++            "game reads it on the CPU: the image of a Theater screenshot "
++            "(black otherwise) and the GPU effect state in checkpoints and "
++            "saves (stale otherwise: effects alive at a checkpoint glitch "
++            "after a revert). Each pauses the game briefly at that moment "
++            "only.",
++            "Halo3");
+ 
+ namespace xe {
+ namespace kernel {
+@@ -82,6 +93,37 @@ constexpr uint32_t kEffectStorageStride = 0x01;
+ constexpr uint32_t kEffectStorageCount = 0x02;
+ constexpr uint32_t kEffectStorageAddress = 0x28;
+ 
++// Before-save procs (sub_821D67A0), the first step of every game state save:
++// `lwsync` right after BlockOnFence (821D67E0) on the fence after the last GPU
++// effect pass (*82737664), with the render thread parked by sub_82142720
++// (821D67BC) until the after-save procs. It comes before the procs
++// (8274B120), the hash (821D6884) and every caller's copy, hash, write or
++// compression of the game state. Reached by fall-through only; r29 = flags.
++// Flags 0x100, skipped: the hash brackets, which copy nothing (820A4200,
++// 820A6A10, and 820A46AC every 300 ticks outside Theater playback), and
++// Theater's rewind snapshot (820A457C): every 300 ticks while a multiplayer
++// film plays, the game copies its state into cache1:\sf_history.blob for
++// seeking. Reading it back here would wait for the GPU every 10 seconds.
++constexpr uint32_t kBeforeSaveFenceWaited = 0x821D67E4;
++constexpr uint32_t kSaveFlagsBracketOrFilmSnapshot = 0x100;
++// Theater screenshot: entry of sub_824E0BE0, called only from 824DFE24
++// (sub_824DFCC8 state 1, main thread) once the fence after the tiled export
++// (*8315FBB0) has passed. It JPEG-encodes the exported image, LIN_A8R8G8B8
++// 1920x1088 or 1536x1152, at *8315FB80 (size *8315FB84).
++constexpr uint32_t kScreenshotEncode = 0x824E0BE0;
++constexpr uint32_t kScreenshotBuffer = 0x8315FB80;
++constexpr uint32_t kScreenshotBytes = 0x8315FB84;
++constexpr uint32_t kScreenshotBytesMax = 0x1000000;
++// The export's stream constant (sub_822A5D70, 822A5E78 / 822A5E94): physical
++// address >> 2 in bits 0-29 of word 0, 4-byte elements in bits 0-22 of word
++// 3. Logged as a cross-check.
++constexpr uint32_t kScreenshotStreamConstant = 0x828C4394;
++// Never expected to expire: the GPU thread takes a request within a primary
++// buffer (or 2 ms when idle).
++constexpr auto kReadbackTimeout = std::chrono::milliseconds(5000);
++static_assert(gpu::MemExportKeepWindows::kMaxWindows <=
++              gpu::GuestReadback::kMaxRanges);
++
+ constexpr uint32_t kExposureReadback = 0x8216B53C;
+ constexpr uint32_t kExposureTarget = 0x8216B5AC;
+ constexpr uint32_t kExposureCurrent = 0xC;
+@@ -567,6 +609,91 @@ void RegisterEffectStorage(cpu::ppc::PPCContext* ctx) {
+       starts[3], ends[3] - 1);
+ }
+ 
++// Copies what the GPU wrote into guest memory for the physical ranges and
++// logs the outcome. Blocks (see RequestGuestReadback).
++void ReadBackGpuResults(const std::string& what, const uint32_t* starts,
++                        const uint32_t* lengths, uint32_t count) {
++  const uint64_t start = Clock::QueryHostTickCount();
++  const gpu::GuestReadbackOutcome outcome =
++      gpu::RequestGuestReadback(starts, lengths, count, kReadbackTimeout);
++  const double ms = double(Clock::QueryHostTickCount() - start) * 1000.0 /
++                    double(Clock::QueryHostTickFrequency());
++  switch (outcome.result) {
++    case gpu::GuestReadbackResult::kCopied:
++      XELOGI(
++          "Halo 3: {}: {} bytes of GPU results read back into guest memory; "
++          "paused {:.1f} ms ({:.1f} ms on the GPU thread)",
++          what, outcome.bytes, ms, double(outcome.service_us) / 1000.0);
++      break;
++    case gpu::GuestReadbackResult::kFailed:
++      XELOGW(
++          "Halo 3: {}: GPU readback failed after {:.1f} ms (unsupported GPU "
++          "backend or host GPU error); guest memory unchanged",
++          what, ms);
++      break;
++    case gpu::GuestReadbackResult::kNotTaken:
++      XELOGW(
++          "Halo 3: {}: the GPU thread didn't take the readback within {:.0f} "
++          "ms; guest memory unchanged",
++          what, ms);
++      break;
++  }
++}
++
++void OnBeforeSaveFenceWaited(cpu::ppc::PPCContext* ctx, void*) {
++  const uint32_t flags = static_cast<uint32_t>(ctx->r[29]);
++  if (!cvars::halo3_gpu_readback || (flags & kSaveFlagsBracketOrFilmSnapshot)) {
++    return;
++  }
++  const gpu::MemExportKeepWindows& windows = gpu::memexport_keep_windows();
++  const uint32_t count = std::min(windows.count.load(std::memory_order_acquire),
++                                  gpu::MemExportKeepWindows::kMaxWindows);
++  if (!count) {
++    return;
++  }
++  uint32_t starts[gpu::MemExportKeepWindows::kMaxWindows];
++  uint32_t lengths[gpu::MemExportKeepWindows::kMaxWindows];
++  for (uint32_t i = 0; i < count; ++i) {
++    starts[i] = windows.start[i].load(std::memory_order_relaxed);
++    lengths[i] = windows.end[i].load(std::memory_order_relaxed) - starts[i];
++  }
++  ReadBackGpuResults(fmt::format("game state save (flags 0x{:X})", flags),
++                     starts, lengths, count);
++}
++
++void OnScreenshotEncode(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_gpu_readback) {
++    return;
++  }
++  const uint32_t buffer =
++      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(kScreenshotBuffer));
++  const uint32_t bytes =
++      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(kScreenshotBytes));
++  const uint32_t physical =
++      buffer ? ctx->kernel_state->memory()->GetPhysicalAddress(buffer)
++             : UINT32_MAX;
++  const uint32_t export_physical =
++      (xe::load_and_swap<uint32_t>(
++           ctx->TranslateVirtual(kScreenshotStreamConstant)) &
++       0x3FFFFFFF)
++      << 2;
++  const uint32_t export_bytes =
++      (xe::load_and_swap<uint32_t>(
++           ctx->TranslateVirtual(kScreenshotStreamConstant + 12)) &
++       0x7FFFFF) *
++      4;
++  if (!bytes || bytes > kScreenshotBytesMax || physical == UINT32_MAX) {
++    XELOGW("Halo 3: Theater screenshot: no image buffer ({:08X}, {} bytes)",
++           buffer, bytes);
++    return;
++  }
++  ReadBackGpuResults(
++      fmt::format("Theater screenshot ({:08X}, {} bytes; exported to {:08X}, "
++                  "{} bytes)",
++                  physical, bytes, export_physical, export_bytes),
++      &physical, &bytes, 1);
++}
++
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
+   main_thread_id.store(ctx->thread_id, std::memory_order_relaxed);
+   RegisterEffectStorage(ctx);
+@@ -611,6 +738,8 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   hooks.Add(processor, kExposureReadback, OnExposureReadback);
+   hooks.Add(processor, kVoiceFrameShort, OnVoiceFrameShort);
+   hooks.Add(processor, kExposureTarget, OnExposureTarget);
++  hooks.Add(processor, kBeforeSaveFenceWaited, OnBeforeSaveFenceWaited);
++  hooks.Add(processor, kScreenshotEncode, OnScreenshotEncode);
+ }
+ 
+ }  // namespace halo3

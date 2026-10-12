@@ -1,0 +1,18 @@
+# Game data (copyrighted, and too large for git).
+*.iso
+*.xex
+*.xexp
+*.xiso
+*.map
+*.mapinfo
+*.blf
+*.god
+*.zip
+*.rar
+*.7z
+
+# Build output and local checkouts
+/build/
+/out/
+/_xenia/
+*.log
