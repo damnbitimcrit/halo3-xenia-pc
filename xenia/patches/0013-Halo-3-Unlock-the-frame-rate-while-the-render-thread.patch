@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Unlock the frame rate while the render thread draws
+
+In game Halo 3 draws on its RENDER thread: the main thread simulates and
+publishes a copy of the frame to a queue, and the mode word 82948F68 is 1.
+The unlock was gated on that word being 0, so in game every wait stayed in
+place (60 main loop passes, 30 presents per second). Gate on the cvar only.
+
+Code the render thread runs gets its own state: frame time is the time
+between its presents, the timing fixes keep per-thread carries, and the
+render node hook and the tick fraction's simulation check only apply on the
+main thread. Stats count the presents made by the render thread.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        | 21 ++++-
+ src/xenia/kernel/title/halo3/halo3.h         | 24 +++--
+ src/xenia/kernel/title/halo3/halo3_frame.cc  | 96 +++++++++++++-------
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 10 +-
+ src/xenia/kernel/title/halo3/halo3_timing.cc | 21 +++--
+ 5 files changed, 113 insertions(+), 59 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 87c3b2f..e13a74c 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -40,6 +40,9 @@ constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
+ 
+ constexpr uint64_t kStatsIntervalSeconds = 5;
+ 
++// Guest thread ID of the main thread; 0 until the main loop runs.
++std::atomic<uint32_t> main_thread_id{0};
++
+ void LogStats() {
+   static uint64_t last = 0;
+   const uint64_t now = Clock::QueryHostTickCount();
+@@ -57,17 +60,20 @@ void LogStats() {
+   const uint32_t frames = s.frames.exchange(0);
+   const uint32_t ticks = s.ticks.exchange(0);
+   const uint32_t presents = s.presents.exchange(0);
++  const uint32_t render_thread_presents = s.render_thread_presents.exchange(0);
+   const uint32_t mouse_frames = s.mouse_frames.exchange(0);
+   const uint32_t objects = s.blended_objects.exchange(0);
+   const uint32_t poses = s.blended_poses.exchange(0);
+   const uint32_t rebuilds = s.render_rebuilds.exchange(0);
+   const uint32_t adjusted = s.adjusted_nodes.exchange(0);
+   XELOGI(
+-      "Halo 3: {:.1f} frames/s, {:.1f} ticks/s, {:.1f} presents/s; mouse "
+-      "turned the view in {} frames; {:.1f} objects and {:.1f} first-person "
+-      "poses blended per frame; {} render node rebuilds, {} look-at node "
+-      "turns (unlock {}, interpolation {}, hooks {})",
+-      frames / seconds, ticks / seconds, presents / seconds, mouse_frames,
++      "Halo 3: {:.1f} frames/s, {:.1f} ticks/s, {:.1f} presents/s ({:.1f} "
++      "from the render thread); mouse turned the view in {} frames; {:.1f} "
++      "objects and {:.1f} first-person poses blended per frame; {} render "
++      "node rebuilds, {} look-at node turns (unlock {}, interpolation {}, "
++      "hooks {})",
++      frames / seconds, ticks / seconds, presents / seconds,
++      render_thread_presents / seconds, mouse_frames,
+       frames ? double(objects) / frames : 0.0,
+       frames ? double(poses) / frames : 0.0, rebuilds, adjusted,
+       cvars::halo3_unlock_framerate, cvars::halo3_interpolation,
+@@ -75,6 +81,7 @@ void LogStats() {
+ }
+ 
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
++  main_thread_id.store(ctx->thread_id, std::memory_order_relaxed);
+   if (cvars::halo3_log_stats) {
+     stats().frames++;
+     LogStats();
+@@ -92,6 +99,10 @@ Stats& stats() {
+   return instance;
+ }
+ 
++bool OnMainThread(const cpu::ppc::PPCContext* ctx) {
++  return ctx->thread_id == main_thread_id.load(std::memory_order_relaxed);
++}
++
+ void Install(KernelState* kernel_state, UserModule* module) {
+   XELOGI("Halo 3 (TU0) detected; installing hooks");
+   InstallFramePacing(kernel_state);
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 885390a..14ca816 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -37,9 +37,12 @@ void Install(KernelState* kernel_state, UserModule* module);
+ 
+ // Counters behind halo3_log_stats, which logs them every few seconds.
+ struct Stats {
+-  std::atomic<uint32_t> frames{0};        // main loop body runs
+-  std::atomic<uint32_t> ticks{0};         // simulation ticks
+-  std::atomic<uint32_t> presents{0};      // frames handed to the GPU
++  std::atomic<uint32_t> frames{0};    // main loop body runs
++  std::atomic<uint32_t> ticks{0};     // simulation ticks
++  std::atomic<uint32_t> presents{0};  // frames handed to the GPU
++  // The presents made by the render thread (in game) rather than the main
++  // thread (single-threaded drawing).
++  std::atomic<uint32_t> render_thread_presents{0};
+   std::atomic<uint32_t> mouse_frames{0};  // frames that turned the view
+   std::atomic<uint32_t> blended_objects{0};
+   std::atomic<uint32_t> blended_poses{0};
+@@ -50,6 +53,11 @@ struct Stats {
+ };
+ Stats& stats();
+ 
++// Whether ctx is the game's main thread, the one running the main loop (and
++// the simulation). The other thread that runs our hooks is the render thread,
++// which draws published copies of the game state.
++bool OnMainThread(const cpu::ppc::PPCContext* ctx);
++
+ // Each title file installs its own hooks. The start of the main loop body
+ // (once per frame, before input and the simulation) is shared, so halo3.cc
+ // hooks it and calls the On*FrameStart functions in order.
+@@ -58,15 +66,17 @@ Stats& stats();
+ void InstallFramePacing(KernelState* kernel_state);
+ // Waits for the frame-rate cap.
+ void OnPacingFrameStart(cpu::ppc::PPCContext* ctx);
+-// Real time since the previous frame in seconds, as given to the game this
+-// frame (0 until the frame rate is unlocked).
++// Real time since the calling thread's previous frame in seconds (0 until the
++// frame rate is unlocked): main_time_update's dt on the main thread, the time
++// between presents on the render thread.
+ float FrameDeltaSeconds();
+ // halo3_interp.cc
+ void InstallInterpolation(KernelState* kernel_state);
+ // Puts the real simulation state back over the previous frame's blend.
+ void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx);
+-// Whether game_update, which runs the simulation ticks, is running.
+-bool InGameUpdate();
++// Whether ctx is the main thread and game_update, which runs the simulation
++// ticks, is running on it.
++bool InGameUpdate(const cpu::ppc::PPCContext* ctx);
+ // halo3_timing.cc
+ void InstallTiming(KernelState* kernel_state);
+ // halo3_input.cc
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index 8c585d6..e8f345b 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -11,26 +11,36 @@
+ //
+ // Halo 3 measures real time in vblanks. main_time_update (82088640) waits for
+ // at least one vblank since the previous frame, then returns
+-// dt = vblanks elapsed / refresh rate. The renderer's present (821924C0) then
+-// waits until two vblanks after the frame started, which is what holds the
+-// game at 30 FPS on a 60 Hz display. The simulation itself is driven by real
+-// elapsed time: game_time_update (820983E0) converts dt into whole 30 Hz ticks
+-// and carries the fraction in game_time_globals+0x14.
++// dt = vblanks elapsed / refresh rate. The present (821924C0) then waits for
++// the frame's target vblank. The simulation itself is driven by real elapsed
++// time: game_time_update (820983E0) converts dt into whole 30 Hz ticks and
++// carries the fraction in game_time_globals+0x14.
+ //
+-// Two more gates hold gameplay at 30 / 60 FPS: the outer main loop
+-// (sub_821A9790) waits for a vblank whenever none has happened since its
+-// previous pass, and a pass only renders if the frame has a reason to
+-// (TLS[0xD0] flags); in a game that is only when a tick ran.
++// In game the work is split over two threads. The main thread runs the main
++// loop (sub_821A9790): input, the simulation and the camera, then it
++// publishes the frame, a copy of what the renderer needs (the object pool
++// among it), to a queue. The RENDER thread (sub_821A8500) takes frames from
++// the queue, draws them from the copy and presents. The mode word 82948F68 is
++// 1 while it does that; 0 means single-threaded, the main thread drawing each
++// frame itself, which the game only switches to briefly (some loads).
+ //
+-// To unlock the frame rate we skip the three vblank waits, render on every
+-// pass, and feed main_time_update's result from the host clock instead of the
+-// vblank counter, so dt stays exact at any frame rate and the simulation
+-// speed is unchanged. The frame-rate cap is a host-side wait at the start of
+-// the frame, before input is read. Loading screens, drawn by the render
+-// thread, keep the original pacing. Everything is decided per frame from
+-// cvars, because the per-game config is only loaded after the title module
+-// (and these hooks) are set up.
+-
++// Three more gates hold the game at 30 FPS: the main loop waits for a vblank
++// whenever none has happened since its previous pass, so it runs at most at
++// 60 Hz, and a pass only publishes a frame if it has a reason to (TLS[0xD0]
++// flags), which in a game is only when a tick ran.
++//
++// To unlock the frame rate we skip the three vblank waits, publish a frame on
++// every pass, and feed main_time_update's result from the host clock instead
++// of the vblank counter, so dt stays exact at any frame rate and the
++// simulation speed is unchanged. The frame-rate cap is a host-side wait at the
++// start of the main loop body, before input is read; the render thread draws
++// as fast as frames are published. Presents outside the main loop (loading
++// screens drawn while the main thread loads) are already spaced out by the
++// code that triggers them. Everything is decided per frame from cvars,
++// because the per-game config is only loaded after the title module (and
++// these hooks) are set up.
++
++#include <atomic>
+ #include <cstdint>
+ 
+ #include "xenia/base/byte_order.h"
+@@ -54,15 +64,15 @@ constexpr uint32_t kMainTimeWaitBranch = 0x8208870C;
+ // dt from vblanks; the [0, 10 s] clamp follows.
+ constexpr uint32_t kMainTimeDtComputed = 0x820887B0;
+ // Present (821924C0): `beq cr6, present`, taken when throttling is disabled.
++// It skips both of the present's waits.
+ constexpr uint32_t kPresentWaitBranch = 0x821924EC;
+ // Main loop (sub_821A9790): `bne cr6, no_wait` after testing the never-set
+ // debug byte 828A1EF3; taken skips the wait for the next vblank.
+ constexpr uint32_t kOuterLoopWaitBranch = 0x821A9810;
+-// sub_821A9558: `bne cr6` after `bl sub_82088800`; not taken sets render
+-// reason 0x100 (as in menus), so the pass renders even without a new tick.
++// Main loop body (sub_821A8ED8): `bne cr6` after `bl sub_82088800`; not
++// taken sets reason 0x100 ("frame rate unthrottled"), so the pass publishes
++// a frame even without a new tick.
+ constexpr uint32_t kRenderReasonBranch = 0x821A9524;
+-// 1 while the render thread draws a loading screen, 0 in game and menus.
+-constexpr uint32_t kRenderThreadModeAddress = 0x82948F68;
+ 
+ // Only the game's main thread runs main_time_update.
+ struct FramePacer {
+@@ -70,7 +80,12 @@ struct FramePacer {
+   uint64_t deadline = 0;
+ };
+ FramePacer pacer;
+-float frame_delta_seconds = 0.0f;
++
++// Each guest thread runs on its own host thread. The main thread's frame time
++// is main_time_update's dt; the render thread's is the time between its
++// presents.
++thread_local float frame_delta_seconds = 0.0f;
++thread_local uint64_t last_present_ticks = 0;
+ 
+ void WaitForFrameDeadline(uint64_t frequency) {
+   const int32_t limit = cvars::halo3_framerate_limit;
+@@ -99,29 +114,40 @@ void WaitForFrameDeadline(uint64_t frequency) {
+   pacer.deadline += period;
+ }
+ 
+-bool Unlocked(cpu::ppc::PPCContext* ctx) {
+-  return cvars::halo3_unlock_framerate &&
+-         !xe::load_and_swap<uint32_t>(
+-             ctx->TranslateVirtual(kRenderThreadModeAddress));
+-}
++bool Unlocked() { return cvars::halo3_unlock_framerate; }
+ 
+ // Run right before a conditional branch on CR6[EQ] to pick its direction:
+ // ForceEqual takes a `beq` / falls through a `bne`, ForceNotEqual the reverse.
+ void ForceEqual(cpu::ppc::PPCContext* ctx, void*) {
+-  if (Unlocked(ctx)) {
++  if (Unlocked()) {
+     ctx->cr6.cr6_none_equal = 1;  // CR6[EQ]
+   }
+ }
+ void ForceNotEqual(cpu::ppc::PPCContext* ctx, void*) {
+-  if (Unlocked(ctx)) {
++  if (Unlocked()) {
+     ctx->cr6.cr6_none_equal = 0;
+   }
+ }
+ 
+-// The present's wait branch runs once per present, on the main thread in
+-// game and on the render thread for loading screens.
++// The present's wait branch runs once per present: on the render thread in
++// game, on the main thread while the game draws single-threaded.
+ void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
+-  stats().presents++;
++  Stats& s = stats();
++  s.presents++;
++  if (!OnMainThread(ctx)) {
++    s.render_thread_presents++;
++    if (Unlocked()) {
++      const uint64_t now = Clock::QueryGuestTickCount();
++      frame_delta_seconds = last_present_ticks
++                                ? float(double(now - last_present_ticks) /
++                                        double(Clock::guest_tick_frequency()))
++                                : 0.0f;
++      last_present_ticks = now;
++    } else {
++      frame_delta_seconds = 0.0f;
++      last_present_ticks = 0;
++    }
++  }
+   ForceEqual(ctx, nullptr);
+ }
+ 
+@@ -146,8 +172,8 @@ void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ float FrameDeltaSeconds() { return frame_delta_seconds; }
+ 
+-void OnPacingFrameStart(cpu::ppc::PPCContext* ctx) {
+-  if (Unlocked(ctx)) {
++void OnPacingFrameStart(cpu::ppc::PPCContext*) {
++  if (Unlocked()) {
+     WaitForFrameDeadline(Clock::guest_tick_frequency());
+   } else {
+     pacer.deadline = 0;
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 2055b00..171b4dc 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -504,9 +504,11 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+ }
+ 
+ // The renderer's once-per-tick node update ran for an object (after our
+-// blend, on the first frame after the tick that computed its nodes).
++// blend, on the first frame after the tick that computed its nodes). Only
++// while the game draws single-threaded: in game the render thread runs it on
++// its published copy of the objects, which we neither blend nor restore.
+ void OnRenderNodesUpdated(cpu::ppc::PPCContext* ctx, void*) {
+-  if (!state || !Enabled() || !state->object_array) {
++  if (!OnMainThread(ctx) || !state || !Enabled() || !state->object_array) {
+     return;
+   }
+   const uint32_t index = static_cast<uint32_t>(ctx->r[20]) & 0xFFFF;
+@@ -802,7 +804,9 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ void OnInterpolationFrameStart(cpu::ppc::PPCContext* ctx) { Restore(ctx); }
+ 
+-bool InGameUpdate() { return in_game_update; }
++bool InGameUpdate(const cpu::ppc::PPCContext* ctx) {
++  return OnMainThread(ctx) && in_game_update;
++}
+ 
+ void InstallInterpolation(KernelState* kernel_state) {
+   // A relaunch starts from a clean slate.
+diff --git a/src/xenia/kernel/title/halo3/halo3_timing.cc b/src/xenia/kernel/title/halo3/halo3_timing.cc
+index 3abec6a..2514a48 100644
+--- a/src/xenia/kernel/title/halo3/halo3_timing.cc
++++ b/src/xenia/kernel/title/halo3/halo3_timing.cc
+@@ -85,16 +85,18 @@ constexpr uint32_t kGameTimeSecondsPerTick = 0x08;
+ constexpr uint32_t kGameTimeElapsedTicks = 0x0C;
+ constexpr uint32_t kGameTimeTicksLeftover = 0x14;
+ 
+-// Main thread state (the hooks below run on it, except the tick time
+-// providers, which loading screens also call from the render thread).
+-float ui_clock_carry = 0.0f;
+-float hud_clock_carry = 0.0f;
+-struct {
++// Some of this code runs on the main thread and some on the render thread,
++// which draws published copies of the game state (with its own TLS, game
++// time included), so the state is kept per thread.
++thread_local float ui_clock_carry = 0.0f;
++thread_local float hud_clock_carry = 0.0f;
++struct DebrisReset {
+   bool pending = false;
+   uint32_t address = 0;
+   float value = 0.0f;
+-} debris_reset;
+-uint32_t wind_step_tick = 0;
++};
++thread_local DebrisReset debris_reset;
++thread_local uint32_t wind_step_tick = 0;
+ 
+ uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
+   return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
+@@ -114,14 +116,15 @@ uint32_t GameTimeGlobals(cpu::ppc::PPCContext* ctx) {
+ // Fraction of a tick elapsed since the last one, or -1 while the simulation
+ // runs (the value is from the previous frame then) or if there is none.
+ float TickFraction(cpu::ppc::PPCContext* ctx, uint32_t time_globals) {
+-  if (!time_globals || InGameUpdate()) {
++  if (!time_globals || InGameUpdate(ctx)) {
+     return -1.0f;
+   }
+   const float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
+   return alpha >= 0.0f && alpha < 1.0f ? alpha : -1.0f;
+ }
+ 
+-// Frame time relative to a 30 FPS frame, for steps meant per 30 Hz frame.
++// The calling thread's frame time relative to a 30 FPS frame, for steps meant
++// per 30 Hz frame.
+ float FrameScale() {
+   return std::clamp(FrameDeltaSeconds() * 30.0f, 0.0f, 4.0f);
+ }

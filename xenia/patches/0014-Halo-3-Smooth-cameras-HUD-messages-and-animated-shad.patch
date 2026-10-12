@@ -1,0 +1,976 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Smooth cameras, HUD messages and animated shaders;
+ more stats
+
+- Cutscene cameras (scripted camera modes 2, 3 and 5) advance in whole
+  ticks. Keep the camera of the last two ticks and draw their blend, one
+  tick late like the objects, at the common tail of the scripted camera
+  update (822928F8). Cuts (a new camera command, a different scene, shot or
+  animation, or a big jump) are shown as is.
+- A driver seat's third-person camera focus, and the following camera's
+  collision start, are the vehicle's centre of mass from its physics body,
+  which only changes in ticks while the vehicle is drawn blended. Move both
+  points by the blend of the root object's node 0 (820A0820, 822959D4).
+- HUD messages time their pop-in zoom and fades by age in whole ticks: add
+  the tick fraction. Their scroll and one compounding fade step once per
+  main loop pass: scale them by frame time. The medal animation's time in
+  the draw gets the fraction too.
+- The game time render_method animated parameters read, the tree sway
+  timer and one pass's constant are whole ticks: add the fraction on the
+  thread that draws (halo3_smooth_shader_time, on by default).
+- Steps taken once per main loop pass (HUD fades, the cinematic HUD
+  fade) are scaled for the original's 60 passes per second, not 30.
+- Stats: blend drops by reason and object type, frames without a blend,
+  whether player 0's vehicle is blended, camera blends and cuts, shader
+  times smoothed, and the auto exposure readback (the scene brightness the
+  game reads back from the GPU and the exposure it picks).
+---
+ src/xenia/kernel/title/halo3/halo3.cc        |  73 ++++-
+ src/xenia/kernel/title/halo3/halo3.h         |  35 ++
+ src/xenia/kernel/title/halo3/halo3_frame.cc  |   1 +
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 326 ++++++++++++++++++-
+ src/xenia/kernel/title/halo3/halo3_math.h    |   7 +
+ src/xenia/kernel/title/halo3/halo3_timing.cc | 227 ++++++++++++-
+ 6 files changed, 659 insertions(+), 10 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index e13a74c..6295beb 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++#include "xenia/base/byte_order.h"
+ #include "xenia/base/clock.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/cpu/guest_hooks.h"
+@@ -40,8 +41,19 @@ constexpr uint32_t kMainLoopBodyEntry = 0x821A8ED8;
+ 
+ constexpr uint64_t kStatsIntervalSeconds = 5;
+ 
++// Auto exposure update (sub_8216B4B8, render thread in game), for the stats:
++// `bl` to the half to float conversion of the scene brightness just read back
++// from the GPU (`lhz r3` at 8216B538; only reached by fall-through, with auto
++// exposure on), and the point all three paths reach with the clamped target
++// in f13, the area's range in f29 / f28 and the exposure at r30 + 0xC.
++constexpr uint32_t kExposureReadback = 0x8216B53C;
++constexpr uint32_t kExposureTarget = 0x8216B5AC;
++constexpr uint32_t kExposureCurrent = 0xC;
++
+ // Guest thread ID of the main thread; 0 until the main loop runs.
+ std::atomic<uint32_t> main_thread_id{0};
++// Guest thread ID of the render thread; 0 until it presents.
++std::atomic<uint32_t> render_thread_id{0};
+ 
+ void LogStats() {
+   static uint64_t last = 0;
+@@ -78,6 +90,52 @@ void LogStats() {
+       frames ? double(poses) / frames : 0.0, rebuilds, adjusted,
+       cvars::halo3_unlock_framerate, cvars::halo3_interpolation,
+       cpu::GuestHooks::Get().active());
++  const uint32_t biped = s.mismatches_biped.exchange(0);
++  const uint32_t vehicle = s.mismatches_vehicle.exchange(0);
++  const uint32_t other = s.mismatches_other.exchange(0);
++  XELOGI(
++      "Halo 3 details: not blended: {} teleports, {} restore mismatches "
++      "(biped {}, vehicle {}, other {}), {} frames with no blend; player 0 "
++      "vehicle blended in {} of {} frames; cameras: {} scripted blends, {} "
++      "cuts ({} by a jump), {} driver focus moves; {:.0f} shader times "
++      "smoothed/s",
++      s.teleports.exchange(0), biped + vehicle + other, biped, vehicle, other,
++      s.frames_without_blend.exchange(0), s.vehicle_blended_frames.exchange(0),
++      s.vehicle_frames.exchange(0), s.scripted_camera_blends.exchange(0),
++      s.scripted_camera_cuts.exchange(0), s.scripted_camera_jumps.exchange(0),
++      s.driver_focus_moves.exchange(0),
++      s.smoothed_shader_times.exchange(0) / seconds);
++  XELOGI(
++      "Halo 3 exposure: {:.3f} (target {:.3f}, range {:.3f} to {:.3f}); {} "
++      "brightness readbacks, raw value {:04X} changed {} times",
++      s.exposure.load(), s.exposure_target.load(), s.exposure_min.load(),
++      s.exposure_max.load(), s.exposure_reads.exchange(0),
++      s.exposure_raw.load(), s.exposure_raw_changes.exchange(0));
++}
++
++void OnExposureReadback(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_log_stats) {
++    return;
++  }
++  Stats& s = stats();
++  const uint32_t raw = static_cast<uint32_t>(ctx->r[3]) & 0xFFFF;
++  if (s.exposure_raw.exchange(raw) != raw) {
++    s.exposure_raw_changes++;
++  }
++  s.exposure_reads++;
++}
++
++void OnExposureTarget(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_log_stats) {
++    return;
++  }
++  Stats& s = stats();
++  const uint32_t exposure =
++      static_cast<uint32_t>(ctx->r[30]) + kExposureCurrent;
++  s.exposure = xe::load_and_swap<float>(ctx->TranslateVirtual(exposure));
++  s.exposure_target = static_cast<float>(ctx->f[13]);
++  s.exposure_min = static_cast<float>(ctx->f[29]);
++  s.exposure_max = static_cast<float>(ctx->f[28]);
+ }
+ 
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
+@@ -103,14 +161,25 @@ bool OnMainThread(const cpu::ppc::PPCContext* ctx) {
+   return ctx->thread_id == main_thread_id.load(std::memory_order_relaxed);
+ }
+ 
++bool OnRenderThread(const cpu::ppc::PPCContext* ctx) {
++  return ctx->thread_id == render_thread_id.load(std::memory_order_relaxed);
++}
++
++void SetRenderThread(const cpu::ppc::PPCContext* ctx) {
++  render_thread_id.store(ctx->thread_id, std::memory_order_relaxed);
++}
++
+ void Install(KernelState* kernel_state, UserModule* module) {
+   XELOGI("Halo 3 (TU0) detected; installing hooks");
+   InstallFramePacing(kernel_state);
+   InstallInterpolation(kernel_state);
+   InstallInput(kernel_state);
+   InstallTiming(kernel_state);
+-  cpu::GuestHooks::Get().Add(kernel_state->processor(), kMainLoopBodyEntry,
+-                             OnMainLoopBodyEntry);
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBodyEntry);
++  hooks.Add(processor, kExposureReadback, OnExposureReadback);
++  hooks.Add(processor, kExposureTarget, OnExposureTarget);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 14ca816..c6fb754 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -20,6 +20,7 @@ DECLARE_bool(halo3_unlock_framerate);
+ DECLARE_int32(halo3_framerate_limit);
+ DECLARE_bool(halo3_interpolation);
+ DECLARE_bool(halo3_log_stats);
++DECLARE_bool(halo3_smooth_shader_time);
+ 
+ namespace xe {
+ namespace kernel {
+@@ -50,6 +51,36 @@ struct Stats {
+   // single nodes it turned (biped head look-at) on top of a blend.
+   std::atomic<uint32_t> render_rebuilds{0};
+   std::atomic<uint32_t> adjusted_nodes{0};
++  // Why objects weren't blended: moved further than the teleport distance in
++  // a tick, or changed between our blend and the next frame start (restore
++  // mismatch), by object type; and frames after the simulation that had no
++  // blend at all (a tick we didn't see).
++  std::atomic<uint32_t> teleports{0};
++  std::atomic<uint32_t> mismatches_biped{0};
++  std::atomic<uint32_t> mismatches_vehicle{0};
++  std::atomic<uint32_t> mismatches_other{0};
++  std::atomic<uint32_t> frames_without_blend{0};
++  // Local player 0 in a vehicle: frames, and frames its vehicle was blended.
++  std::atomic<uint32_t> vehicle_frames{0};
++  std::atomic<uint32_t> vehicle_blended_frames{0};
++  // Cameras: scripted (cutscene) camera blends and cuts it showed as is, and
++  // vehicle centres of mass moved into the blended frame for driver seats.
++  std::atomic<uint32_t> scripted_camera_blends{0};
++  std::atomic<uint32_t> scripted_camera_cuts{0};
++  // Cuts found only by the camera jumping or turning (no scripted signal).
++  std::atomic<uint32_t> scripted_camera_jumps{0};
++  std::atomic<uint32_t> driver_focus_moves{0};
++  // Shader time inputs given the time between ticks (halo3_timing.cc).
++  std::atomic<uint32_t> smoothed_shader_times{0};
++  // Auto exposure (render thread): the scene brightness the game read back
++  // from the GPU (raw half float), how often it changed, and the exposure.
++  std::atomic<uint32_t> exposure_reads{0};
++  std::atomic<uint32_t> exposure_raw_changes{0};
++  std::atomic<uint32_t> exposure_raw{0};
++  std::atomic<float> exposure{0.0f};
++  std::atomic<float> exposure_target{0.0f};
++  std::atomic<float> exposure_min{0.0f};
++  std::atomic<float> exposure_max{0.0f};
+ };
+ Stats& stats();
+ 
+@@ -57,6 +88,10 @@ Stats& stats();
+ // the simulation). The other thread that runs our hooks is the render thread,
+ // which draws published copies of the game state.
+ bool OnMainThread(const cpu::ppc::PPCContext* ctx);
++// Whether ctx is the thread that presented the last frame drawn from a
++// published copy (the RENDER thread in game).
++bool OnRenderThread(const cpu::ppc::PPCContext* ctx);
++void SetRenderThread(const cpu::ppc::PPCContext* ctx);
+ 
+ // Each title file installs its own hooks. The start of the main loop body
+ // (once per frame, before input and the simulation) is shared, so halo3.cc
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+index e8f345b..5211dd8 100644
+--- a/src/xenia/kernel/title/halo3/halo3_frame.cc
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -135,6 +135,7 @@ void OnPresent(cpu::ppc::PPCContext* ctx, void*) {
+   Stats& s = stats();
+   s.presents++;
+   if (!OnMainThread(ctx)) {
++    SetRenderThread(ctx);
+     s.render_thread_presents++;
+     if (Unlocked()) {
+       const uint64_t now = Clock::QueryGuestTickCount();
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 171b4dc..29c5662 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -34,6 +34,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <cmath>
+ #include <cstring>
+ #include <vector>
+ 
+@@ -77,6 +78,45 @@ constexpr uint32_t kAfterGameUpdate = 0x821A91C4;
+ // path only lets bipeds turn their head and neck nodes toward a look target
+ // (sub_823625F8).
+ constexpr uint32_t kRenderNodesUpdated = 0x8215B480;
++// object_get_center_of_mass (sub_8209FCB8) gives the root object's centre of
++// mass from its physics body or bounding sphere, which only change in ticks,
++// while the object is drawn blended. Two camera callers, both right after the
++// call (reached by fall-through only):
++// - sub_820A0738 (unit_get_camera_info), only for seats with the driver and
++//   third-person camera flags (0x4 | 0x10): r31 = the camera info, whose +0 is
++//   the vehicle's handle and +0xC the focus point just written;
++// - the following camera (sub_82295318): r29 = the target's handle, r31 + 0x88
++//   = the point its collision test starts from.
++constexpr uint32_t kDriverCameraFocus = 0x820A0820;
++constexpr uint32_t kCameraInfoObject = 0x0;
++constexpr uint32_t kCameraInfoFocus = 0xC;
++constexpr uint32_t kFollowingCameraCenter = 0x822959D4;
++constexpr uint32_t kFollowingCameraCenterPoint = 0x88;
++// The scripted (cutscene) camera's update, sub_82291B40, rebuilds its camera
++// command every frame (on the main thread, from the director after our
++// blend), but in modes 2 (point transitions), 3 (animated camera) and 5
++// (cinematic scene) the camera only advances in game_tick, in whole ticks.
++// Every mode ends in the common tail 822928F8 with r31 = the command, its
++// pose complete, and the globals' "new command" byte (set by every
++// camera_set_* call) not yet cleared. The command is a stack local of the
++// director's update, the same for every local player.
++constexpr uint32_t kScriptedCameraTail = 0x822928F8;
++constexpr uint32_t kTlsScriptedCamera = 0x8C;
++constexpr uint32_t kScriptedCameraNewCommand = 0x1;  // u8
++constexpr uint32_t kScriptedCameraMode = 0x2;        // s16
++// Camera command.
++constexpr uint32_t kCameraCommandFlags = 0x00;  // bit 0: the director uses it
++constexpr uint32_t kCameraCommandPosition = 0x04;
++constexpr uint32_t kCameraCommandFov = 0x28;
++constexpr uint32_t kCameraCommandForward = 0x2C;
++constexpr uint32_t kCameraCommandUp = 0x38;
++// A scripted camera jumping further or turning more than this in one tick is
++// a cut; show it as is. Scripted cuts also set the new command byte or change
++// the mode's parameters, so this is a safety net: generous enough for fast
++// camera moves (360 world units per second).
++constexpr float kCameraCutDistance = 12.0f;
++constexpr float kCameraCutCosine = 0.5f;  // 60 degrees
++constexpr float kCameraCutFov = 0.35f;    // radians
+ 
+ // Thread-local game globals are reached through r13 (KPCR); its first word is
+ // the TLS block holding pointers to every subsystem's globals.
+@@ -94,9 +134,12 @@ constexpr uint32_t kDataArrayInUseBits = 0x48;
+ // Object header, 0x10 bytes per object.
+ constexpr uint32_t kObjectHeaderSize = 0x10;
+ constexpr uint32_t kObjectHeaderSalt = 0x0;
+-constexpr uint32_t kObjectHeaderType = 0x3;  // u8, 0 = biped
++constexpr uint32_t kObjectHeaderType = 0x3;  // u8, 0 = biped, 1 = vehicle
+ constexpr uint32_t kObjectHeaderAddress = 0xC;
++constexpr uint8_t kObjectTypeBiped = 0;
++constexpr uint8_t kObjectTypeVehicle = 1;
+ // Object data.
++constexpr uint32_t kObjectParent = 0x10;  // handle, or kNoObject
+ constexpr uint32_t kObjectPosition = 0x54;
+ constexpr uint32_t kObjectForward = 0x60;
+ constexpr uint32_t kObjectUp = 0x6C;
+@@ -125,6 +168,9 @@ constexpr uint32_t kPlayerControlUnit = 0x0;
+ constexpr uint32_t kPlayerControlYaw = 0xC;
+ constexpr uint32_t kPlayerControlPitch = 0x10;
+ constexpr uint32_t kNoUnit = 0xFFFFFFFF;
++constexpr uint32_t kNoObject = 0xFFFFFFFF;
++// Parent chains are short (a rider, its seat's vehicle, a turret).
++constexpr uint32_t kMaxParentDepth = 8;
+ 
+ // First-person weapons (TLS[0x2D8]): per local player, two weapon slots (for
+ // dual wielding) whose node matrices are rebuilt once per tick, in camera
+@@ -164,6 +210,7 @@ struct ObjectSnapshot {
+   uint16_t nodes_size = 0;
+   uint16_t nodes_offset = 0;
+   uint32_t node_count = 0;
++  uint8_t type = 0;  // object header type: 0 biped, 1 vehicle
+   bool biped = false;
+   bool has_previous = false;
+   bool moved = false;
+@@ -182,6 +229,23 @@ struct ObjectSnapshot {
+   std::vector<std::pair<uint32_t, Matrix4x3>> node_adjustments;
+ };
+ 
++struct CameraPose {
++  Vector3 position;
++  float fov = 0.0f;
++  Vector3 forward;
++  Vector3 up;
++};
++
++struct ScriptedCameraSnapshot {
++  bool valid = false;
++  bool has_previous = false;
++  uint32_t tick = 0;
++  // What the camera plays: the mode and the mode's parameters.
++  std::array<uint32_t, 7> key = {};
++  CameraPose previous;
++  CameraPose current;
++};
++
+ struct PoseSnapshot {
+   // What the pose belongs to: unit, weapon, models, animation, node count,
+   // camera node index and slot flags. A change means a different pose.
+@@ -207,6 +271,7 @@ struct InterpolationState {
+   std::array<ObjectSnapshot, kMaxObjects> objects;
+   uint32_t first_person = 0;
+   std::array<PoseSnapshot, kLocalPlayers * kFpSlots> poses;
++  ScriptedCameraSnapshot scripted_camera;
+ };
+ InterpolationState* state = nullptr;
+ // Whether the simulation is running: game_update, or a tick from another
+@@ -421,24 +486,84 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+       o.node_count = node_count;
+     }
+     LoadNodes(ctx, address + nodes_offset, node_count, o.current_nodes);
+-    o.biped = LoadU8(ctx, header + kObjectHeaderType) == 0;
++    o.type = LoadU8(ctx, header + kObjectHeaderType);
++    o.biped = o.type == kObjectTypeBiped;
+     o.current = LoadTransform(ctx, address, o.biped);
+ 
+     // Position is relative to the parent for attached objects (held weapons,
+     // passengers); the root node is in world space, so check both.
+     const float teleport_squared = kTeleportDistance * kTeleportDistance;
+-    o.has_previous =
++    // (NaN positions count as a teleport.)
++    const bool within_reach =
+         same_object &&
+         DistanceSquared(o.previous.position, o.current.position) <=
+             teleport_squared &&
+         (!node_count ||
+          DistanceSquared(o.previous_nodes[0].position,
+                          o.current_nodes[0].position) <= teleport_squared);
++    if (same_object && !within_reach) {
++      stats().teleports++;
++    }
++    o.has_previous = within_reach;
+     o.moved = o.has_previous && (!SameBits(o.previous, o.current) ||
+                                  !SameBits(o.previous_nodes, o.current_nodes));
+   }
+ }
+ 
++// The object a handle (salt << 16 | index) refers to, or 0.
++uint32_t ObjectFromHandle(cpu::ppc::PPCContext* ctx, uint32_t data,
++                          uint32_t handle) {
++  const uint32_t index = handle & 0xFFFF;
++  if (handle == kNoObject || index >= state->high_water_mark) {
++    return 0;
++  }
++  const uint32_t header = data + index * kObjectHeaderSize;
++  if (LoadU16(ctx, header + kObjectHeaderSalt) != handle >> 16) {
++    return 0;
++  }
++  return LoadU32(ctx, header + kObjectHeaderAddress);
++}
++
++// Index of the object at the top of handle's parent chain (the vehicle a
++// rider sits in), handle's own index if it has no parent, or -1.
++int32_t RootObjectIndex(cpu::ppc::PPCContext* ctx, uint32_t data,
++                        uint32_t handle) {
++  for (uint32_t depth = 0; depth < kMaxParentDepth; ++depth) {
++    const uint32_t object = ObjectFromHandle(ctx, data, handle);
++    if (!object) {
++      return -1;
++    }
++    const uint32_t parent = LoadU32(ctx, object + kObjectParent);
++    if (parent == kNoObject) {
++      return static_cast<int32_t>(handle & 0xFFFF);
++    }
++    handle = parent;
++  }
++  return -1;
++}
++
++// Moves a point computed from the last tick's state of object `index` (a
++// root object) into the frame being drawn, by the blend of its root node.
++// Returns false if the object isn't blended in this frame.
++bool MoveIntoBlendedFrame(int32_t index, Vector3* point) {
++  if (index < 0 || static_cast<uint32_t>(index) >= state->high_water_mark) {
++    return false;
++  }
++  const ObjectSnapshot& o = state->objects[index];
++  if (!o.applied) {
++    return false;
++  }
++  if (o.node_count) {
++    *point = TransformPoint(
++        Multiply(o.written_nodes[0], Inverse(o.current_nodes[0])), *point);
++  } else {
++    *point = {point->x + o.written.position.x - o.current.position.x,
++              point->y + o.written.position.y - o.current.position.y,
++              point->z + o.written.position.z - o.current.position.z};
++  }
++  return true;
++}
++
+ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+   if (!state->object_array ||
+       TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
+@@ -492,6 +617,10 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+                   o.written_nodes)) {
+       // Changed since we blended it: keep that, and don't blend from the old
+       // state next tick.
++      Stats& s = stats();
++      (o.type == kObjectTypeBiped     ? s.mismatches_biped
++       : o.type == kObjectTypeVehicle ? s.mismatches_vehicle
++                                      : s.mismatches_other)++;
+       o.salt = 0;
+       o.has_previous = false;
+       continue;
+@@ -734,6 +863,186 @@ void RestoreExactFacing(cpu::ppc::PPCContext* ctx) {
+   }
+ }
+ 
++// Stats: whether local player 0's vehicle (the top of its unit's parent
++// chain) was blended in this frame.
++void CountPlayerVehicle(cpu::ppc::PPCContext* ctx) {
++  const uint32_t controls = TlsSlot(ctx, kTlsPlayerControl);
++  if (!controls || !state->object_array ||
++      TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
++    return;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  const uint32_t unit_handle =
++      LoadU32(ctx, controls + kPlayerControlLive + kPlayerControlUnit);
++  const uint32_t unit = ObjectFromHandle(ctx, data, unit_handle);
++  if (!unit || LoadU32(ctx, unit + kObjectParent) == kNoObject) {
++    return;
++  }
++  Stats& s = stats();
++  s.vehicle_frames++;
++  const int32_t root = RootObjectIndex(ctx, data, unit_handle);
++  if (root >= 0 && state->objects[root].applied) {
++    s.vehicle_blended_frames++;
++  }
++}
++
++// Cameras.
++
++// Moves a point the game computed from the last tick's state of the object at
++// the top of handle's parent chain into the frame being drawn.
++bool MovePointIntoBlendedFrame(cpu::ppc::PPCContext* ctx, uint32_t handle,
++                               uint32_t point) {
++  if (!OnMainThread(ctx) || !state || !Enabled() || !state->object_array ||
++      TlsSlot(ctx, kTlsObjectDataArray) != state->object_array) {
++    return false;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  Vector3 p = LoadVector3(ctx, point);
++  if (!MoveIntoBlendedFrame(RootObjectIndex(ctx, data, handle), &p)) {
++    return false;
++  }
++  StoreVector3(ctx, point, p);
++  return true;
++}
++
++void OnDriverCameraFocus(cpu::ppc::PPCContext* ctx, void*) {
++  const uint32_t info = static_cast<uint32_t>(ctx->r[31]);
++  if (MovePointIntoBlendedFrame(ctx, LoadU32(ctx, info + kCameraInfoObject),
++                                info + kCameraInfoFocus)) {
++    stats().driver_focus_moves++;
++  }
++}
++
++void OnFollowingCameraCenter(cpu::ppc::PPCContext* ctx, void*) {
++  MovePointIntoBlendedFrame(
++      ctx, static_cast<uint32_t>(ctx->r[29]),
++      static_cast<uint32_t>(ctx->r[31]) + kFollowingCameraCenterPoint);
++}
++
++CameraPose LoadCameraPose(cpu::ppc::PPCContext* ctx, uint32_t command) {
++  return {LoadVector3(ctx, command + kCameraCommandPosition),
++          LoadF32(ctx, command + kCameraCommandFov),
++          LoadVector3(ctx, command + kCameraCommandForward),
++          LoadVector3(ctx, command + kCameraCommandUp)};
++}
++void StoreCameraPose(cpu::ppc::PPCContext* ctx, uint32_t command,
++                     const CameraPose& pose) {
++  StoreVector3(ctx, command + kCameraCommandPosition, pose.position);
++  StoreF32(ctx, command + kCameraCommandFov, pose.fov);
++  StoreVector3(ctx, command + kCameraCommandForward, pose.forward);
++  StoreVector3(ctx, command + kCameraCommandUp, pose.up);
++}
++
++bool IsCameraCut(const CameraPose& a, const CameraPose& b) {
++  return DistanceSquared(a.position, b.position) >
++             kCameraCutDistance * kCameraCutDistance ||
++         !(Dot(a.forward, b.forward) >= kCameraCutCosine) ||
++         !(std::abs(a.fov - b.fov) <= kCameraCutFov);
++}
++
++// What a scripted camera mode plays, from the globals its setters fill: a
++// change is a cut.
++std::array<uint32_t, 7> ScriptedCameraKey(cpu::ppc::PPCContext* ctx,
++                                          uint32_t globals, int16_t mode) {
++  auto word = [&](uint32_t offset) { return LoadU32(ctx, globals + offset); };
++  switch (mode) {
++    case 2:  // point transition: start tick, target
++      return {2, word(0x5C), word(0x40), word(0x44), word(0x48), 0, 0};
++    case 3:  // animated camera: synced unit, start, graph, animation, flags,
++             // speed
++      return {3,          word(0x3C), word(0x40),
++              word(0x44), word(0x48), LoadU16(ctx, globals + 0x4C),
++              word(0x50)};
++    case 5:  // cinematic scene: scene, shot, cutscene flag, alternate track
++      return {5, word(0x40), word(0x44), word(0x50), word(0x58), 0, 0};
++    default:
++      return {static_cast<uint32_t>(mode), 0, 0, 0, 0, 0, 0};
++  }
++}
++
++void OnScriptedCameraTail(cpu::ppc::PPCContext* ctx, void*) {
++  if (!OnMainThread(ctx) || !state || !Enabled() || InGameUpdate(ctx)) {
++    return;
++  }
++  ScriptedCameraSnapshot& camera = state->scripted_camera;
++  const uint32_t command = static_cast<uint32_t>(ctx->r[31]);
++  const uint32_t globals = TlsSlot(ctx, kTlsScriptedCamera);
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  if (!globals || !time_globals) {
++    camera.valid = false;
++    return;
++  }
++  const int16_t mode =
++      static_cast<int16_t>(LoadU16(ctx, globals + kScriptedCameraMode));
++  if ((mode != 2 && mode != 3 && mode != 5) ||
++      !(LoadU32(ctx, command + kCameraCommandFlags) & 1)) {
++    camera.valid = false;
++    return;
++  }
++  const bool new_command =
++      LoadU8(ctx, globals + kScriptedCameraNewCommand) != 0;
++  const uint32_t tick = ElapsedTicks(ctx, time_globals);
++  const std::array<uint32_t, 7> key = ScriptedCameraKey(ctx, globals, mode);
++  const CameraPose pose = LoadCameraPose(ctx, command);
++  if (!camera.valid || new_command || key != camera.key) {
++    // A new camera (a cut the script made).
++    if (camera.valid) {
++      stats().scripted_camera_cuts++;
++    }
++    camera.valid = true;
++    camera.has_previous = false;
++    camera.tick = tick;
++    camera.key = key;
++    camera.current = pose;
++    return;
++  }
++  if (tick != camera.tick) {
++    // The first frame after a tick: the command holds the new tick's camera.
++    const bool jumped = IsCameraCut(camera.current, pose);
++    const bool cut = tick != camera.tick + 1 || jumped;
++    if (cut) {
++      stats().scripted_camera_cuts++;
++    }
++    if (jumped) {
++      stats().scripted_camera_jumps++;
++    }
++    camera.previous = camera.current;
++    camera.current = pose;
++    camera.has_previous = !cut;
++    camera.tick = tick;
++  } else if (!SameBits(pose, camera.current)) {
++    // Not the tick's camera: show it as is.
++    camera.current = pose;
++    camera.has_previous = false;
++  }
++  if (!camera.has_previous) {
++    return;
++  }
++  // The objects were blended with the same factor (the director runs after
++  // our blend, in the same frame).
++  const float alpha = BlendFactor(ctx);
++  if (alpha < 0.0f) {
++    return;
++  }
++  CameraPose blend;
++  blend.position =
++      Lerp(camera.previous.position, camera.current.position, alpha);
++  blend.fov =
++      camera.previous.fov + (camera.current.fov - camera.previous.fov) * alpha;
++  if (IsUnitVector(camera.previous.forward) &&
++      IsUnitVector(camera.previous.up) &&
++      IsUnitVector(camera.current.forward) && IsUnitVector(camera.current.up)) {
++    InterpolateOrientation(camera.previous.forward, camera.previous.up,
++                           camera.current.forward, camera.current.up, alpha,
++                           &blend.forward, &blend.up);
++  } else {
++    blend.forward = camera.current.forward;
++    blend.up = camera.current.up;
++  }
++  StoreCameraPose(ctx, command, blend);
++  stats().scripted_camera_blends++;
++}
++
+ // Hooks.
+ 
+ void Restore(cpu::ppc::PPCContext* ctx) {
+@@ -775,6 +1084,10 @@ void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
+   // game_tick only counts ticks in which game time advanced (820A3E48).
+   const bool consecutive =
+       state->have_tick && (tick == state->tick || tick == state->tick + 1);
++  if (state->have_tick && tick == state->tick) {
++    // No game time passed: the objects hold still, so does the camera.
++    state->scripted_camera.previous = state->scripted_camera.current;
++  }
+   state->have_tick = true;
+   state->tick = tick;
+   SnapshotObjects(ctx, consecutive);
+@@ -794,10 +1107,14 @@ void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
+   }
+   const float alpha = BlendFactor(ctx);
+   if (alpha < 0.0f) {
++    stats().frames_without_blend++;
+     return;
+   }
+   BlendObjects(ctx, alpha);
+   BlendFirstPerson(ctx, alpha);
++  if (cvars::halo3_log_stats) {
++    CountPlayerVehicle(ctx);
++  }
+ }
+ 
+ }  // namespace
+@@ -821,6 +1138,9 @@ void InstallInterpolation(KernelState* kernel_state) {
+   hooks.Add(processor, kAfterNetworkTick, OnAfterGameTick);
+   hooks.Add(processor, kAfterGameUpdate, OnAfterGameUpdate);
+   hooks.Add(processor, kRenderNodesUpdated, OnRenderNodesUpdated);
++  hooks.Add(processor, kDriverCameraFocus, OnDriverCameraFocus);
++  hooks.Add(processor, kFollowingCameraCenter, OnFollowingCameraCenter);
++  hooks.Add(processor, kScriptedCameraTail, OnScriptedCameraTail);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3_math.h b/src/xenia/kernel/title/halo3/halo3_math.h
+index 1d92e9e..b279c25 100644
+--- a/src/xenia/kernel/title/halo3/halo3_math.h
++++ b/src/xenia/kernel/title/halo3/halo3_math.h
+@@ -132,6 +132,13 @@ inline Vector3 Rotate(const Matrix4x3& m, const Vector3& v) {
+           m.forward.z * v.x + m.left.z * v.y + m.up.z * v.z};
+ }
+ 
++// m applied to the point p: s R p + t.
++inline Vector3 TransformPoint(const Matrix4x3& m, const Vector3& p) {
++  const Vector3 r = Rotate(m, p);
++  return {m.scale * r.x + m.position.x, m.scale * r.y + m.position.y,
++          m.scale * r.z + m.position.z};
++}
++
+ // a * b: transforms by b, then by a (a point p maps to s R p + t).
+ inline Matrix4x3 Multiply(const Matrix4x3& a, const Matrix4x3& b) {
+   Matrix4x3 r;
+diff --git a/src/xenia/kernel/title/halo3/halo3_timing.cc b/src/xenia/kernel/title/halo3/halo3_timing.cc
+index 2514a48..7d090d2 100644
+--- a/src/xenia/kernel/title/halo3/halo3_timing.cc
++++ b/src/xenia/kernel/title/halo3/halo3_timing.cc
+@@ -15,8 +15,15 @@
+ //
+ // - Shader and effect "time" inputs are computed from the tick counter, so
+ //   anything animated by them moves in 30 Hz steps. Add the fraction of a
+-//   tick elapsed since the last one, as the interpolation does.
++//   tick elapsed since the last one, as the interpolation does. That includes
++//   the game time render_method animated parameters read (scrolling,
++//   pulsing and flipbook surfaces: shields, plasma, holograms, water), the
++//   tree sway timer and one pass's constant (halo3_smooth_shader_time).
+ // - Two HUD fades step a fixed 1/15 per frame: scale the step by frame time.
++// - HUD messages (chud messaging, chud persistent user data + 0x1FB0) time
++//   their pop-in zoom and fades by age in whole ticks, and step their scroll
++//   and one fade per main loop pass: add the tick fraction to the ages and
++//   scale the per-pass steps.
+ // - The UI and HUD millisecond clocks truncate each frame's time, so short
+ //   frames lose a large share of it: carry the fraction to the next frame.
+ // - Debris ("muffins") takes a 1/30 s step once that much time has
+@@ -40,6 +47,14 @@
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++DEFINE_bool(halo3_smooth_shader_time, true,
++            "Halo 3: give time-animated surfaces (shields, plasma, holograms, "
++            "water, foliage) the time between ticks while the frame rate is "
++            "unlocked. Its hooks run for most draws; set this to false in "
++            "xenia-canary.config.toml (read when the game starts, before the "
++            "per-game config) to remove them if they cost frame rate.",
++            "Halo3");
++
+ namespace xe {
+ namespace kernel {
+ namespace title {
+@@ -80,6 +95,54 @@ constexpr uint32_t kWindStepGate = 0x82369A98;
+ // `fadds f0, f13, f0`: gust += f0, on every call.
+ constexpr uint32_t kWindGustAdd = 0x82369C34;
+ 
++// HUD messages, updated once per main loop pass per local user by the chud
++// update (sub_8212CDF0) on the main thread, after game_update.
++// `fdivs` of an age in ticks (the register named) by an animation length:
++// - sub_821349A8 (message lines): pop-in scale and fade-in (f0 / 5 ticks),
++//   fade-out (f0 / 45), and the text zoom from 2x to 1x (f12 / 15);
++// - sub_82134F08 (medals): fade-out (f0 / 45);
++// - sub_82135258 (state messages): the action prompt's zoom from 2x to 1x
++//   (f13 / 5) and a timed message's fade (f13 / 60).
++constexpr uint32_t kHudAgeF0[] = {0x82134D10, 0x82134D90, 0x821351F0};
++constexpr uint32_t kHudAgeF12 = 0x82134E24;
++constexpr uint32_t kHudAgeF13[] = {0x82135398, 0x8213541C};
++// `fdivs` of a scroll step, 1 / (tick rate * 0.25) per pass: 1.0 / f0, for
++// the message lines (sub_821349A8) and the medals (sub_82134F08).
++constexpr uint32_t kHudScrollSteps[] = {0x82134B74, 0x821350F4};
++// sub_82135258: `fmuls f0, f0, f13`, a timed message's alpha (f13) times
++// f0 = 1 - x on every pass, so the fade compounds per pass.
++constexpr uint32_t kHudFadeCompound = 0x8213545C;
++// Messaging draw (sub_8218D498, render thread in game): `bl` to the medal
++// animation (sub_8249C9D8) with f1 = the medal's age in milliseconds, from
++// whole ticks: r10 = elapsed ticks since the medal started * 1000.
++constexpr uint32_t kHudMedalAnimation = 0x8218DDC4;
++// The chud update's cinematic HUD fade (chud user + 0x238: current, target,
++// step per tick) moves the HUD alpha by |step| once per pass: `fadds f13,
++// f13, f12` with f13 = |step| when fading in, `fsubs f13, f13, f12` with
++// f12 = |step| when fading out.
++constexpr uint32_t kHudCinematicFadeIn = 0x8212CF68;
++constexpr uint32_t kHudCinematicFadeOut = 0x8212CF8C;
++constexpr uint32_t kGameTimeTickRate = 0x04;  // s16
++
++// game_time_get_seconds (sub_8217A670) returns elapsed ticks * seconds per
++// tick of the calling thread's game time, with no fraction. The instructions
++// that consume its f1 in drawing code (all reached by fall-through only):
++// - sub_82172FA8 (render_method animated parameter): the time input
++//   (`fmuls f31, f1, f12`, t / period) and the unique_id input (`fadds f0,
++//   f1, f0`, t + the draw's context word);
++// - sub_824696B0 (a per-object pass's constant c101.x): `stfs f1`.
++// sub_82172FA8 is also reached from collision material lookups, so these only
++// apply on the render thread (in game). They are installed only if
++// halo3_smooth_shader_time is set when the game starts: a hook costs a call
++// even when it does nothing, and these run for most draws.
++constexpr uint32_t kDrawGameSeconds[] = {0x82173098, 0x821730C4, 0x82469894};
++// Render_method extern 48 (tree animation timer) in sub_8244E008:
++// frac(0.6 * ticks * seconds per tick), cached per tick in a global. Its two
++// `stfs f0` to the output, after a fresh computation and on a cache hit.
++constexpr uint32_t kTreeTimerStores[] = {0x8244E610, 0x8244E624};
++constexpr float kTreeTimerRate = 0.6f;
++constexpr uint32_t kGameTimeInitialized = 0x00;  // u8
++
+ constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
+ constexpr uint32_t kGameTimeSecondsPerTick = 0x08;
+ constexpr uint32_t kGameTimeElapsedTicks = 0x0C;
+@@ -123,13 +186,49 @@ float TickFraction(cpu::ppc::PPCContext* ctx, uint32_t time_globals) {
+   return alpha >= 0.0f && alpha < 1.0f ? alpha : -1.0f;
+ }
+ 
++bool Unlocked() { return cvars::halo3_unlock_framerate; }
++
+ // The calling thread's frame time relative to a 30 FPS frame, for steps meant
+-// per 30 Hz frame.
++// per 30 Hz frame (drawn frames: the original draws 30 per second).
+ float FrameScale() {
+   return std::clamp(FrameDeltaSeconds() * 30.0f, 0.0f, 4.0f);
+ }
+ 
+-bool Unlocked() { return cvars::halo3_unlock_framerate; }
++// The same for steps taken once per main loop pass: the original runs 60
++// passes per second (two per tick while the frame rate is locked).
++float PassScale() {
++  return std::clamp(FrameDeltaSeconds() * 60.0f, 0.0f, 8.0f);
++}
++
++// Seconds to add to game time in drawing code, or 0: the fraction of a tick
++// since the last one, on the render thread. (While the main thread draws, in
++// some loads, it also runs collision lookups that reach the same code.)
++float DrawSubTickSeconds(cpu::ppc::PPCContext* ctx) {
++  if (!Unlocked() || !cvars::halo3_smooth_shader_time || !OnRenderThread(ctx)) {
++    return 0.0f;
++  }
++  const uint32_t time_globals = GameTimeGlobals(ctx);
++  if (!time_globals ||
++      !*ctx->TranslateVirtual<uint8_t*>(time_globals + kGameTimeInitialized)) {
++    return 0.0f;
++  }
++  const float alpha = TickFraction(ctx, time_globals);
++  const float seconds_per_tick =
++      LoadF32(ctx, time_globals + kGameTimeSecondsPerTick);
++  if (!(alpha > 0.0f) ||
++      !(seconds_per_tick > 0.0f && seconds_per_tick < 1.0f)) {
++    return 0.0f;
++  }
++  return alpha * seconds_per_tick;
++}
++
++// The tick fraction to add to an age counted in whole ticks, or 0.
++float AgeFraction(cpu::ppc::PPCContext* ctx) {
++  if (!Unlocked()) {
++    return 0.0f;
++  }
++  return std::max(TickFraction(ctx, GameTimeGlobals(ctx)), 0.0f);
++}
+ 
+ void OnTickTimeStore(cpu::ppc::PPCContext* ctx, void*) {
+   if (!Unlocked()) {
+@@ -145,7 +244,7 @@ void OnTickTimeStore(cpu::ppc::PPCContext* ctx, void*) {
+ 
+ void OnHudFadeStep(cpu::ppc::PPCContext* ctx, void*) {
+   if (Unlocked()) {
+-    ctx->f[0] *= FrameScale();
++    ctx->f[0] *= PassScale();
+   }
+ }
+ 
+@@ -153,7 +252,7 @@ void OnHudFadeClampedStep(cpu::ppc::PPCContext* ctx, void*) {
+   if (!Unlocked()) {
+     return;
+   }
+-  const float max_step = kHudFadeStepPerFrame * FrameScale();
++  const float max_step = kHudFadeStepPerFrame * PassScale();
+   const float target =
+       LoadF32(ctx, static_cast<uint32_t>(ctx->r[31]) + kHudFadeTarget);
+   const float delta = target - static_cast<float>(ctx->f[11]);
+@@ -235,6 +334,102 @@ void OnWindGustAdd(cpu::ppc::PPCContext* ctx, void*) {
+   }
+ }
+ 
++void OnDrawGameSeconds(cpu::ppc::PPCContext* ctx, void*) {
++  const float offset = DrawSubTickSeconds(ctx);
++  if (offset > 0.0f) {
++    ctx->f[1] = static_cast<float>(ctx->f[1]) + offset;
++    if (cvars::halo3_log_stats) {
++      stats().smoothed_shader_times.fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++}
++
++void OnTreeTimerStore(cpu::ppc::PPCContext* ctx, void*) {
++  const float offset = DrawSubTickSeconds(ctx);
++  if (offset <= 0.0f) {
++    return;
++  }
++  // Recompute the game's value with this frame's time; the cache keeps the
++  // tick's own.
++  const uint32_t time_globals = GameTimeGlobals(ctx);
++  const float ticks = static_cast<float>(
++      static_cast<int32_t>(LoadU32(ctx, time_globals + kGameTimeElapsedTicks)));
++  // Separate statements, rounded like the game's fmuls and fadds.
++  float seconds = ticks * LoadF32(ctx, time_globals + kGameTimeSecondsPerTick);
++  seconds += offset;
++  const float cycles = seconds * kTreeTimerRate;
++  ctx->f[0] = cycles - std::floor(cycles);
++}
++
++// The game's single precision arithmetic expects single precision values.
++void AddAgeFraction(cpu::ppc::PPCContext* ctx, double* age) {
++  const float alpha = AgeFraction(ctx);
++  if (alpha > 0.0f) {
++    *age = static_cast<float>(*age) + alpha;
++  }
++}
++void OnHudAgeF0(cpu::ppc::PPCContext* ctx, void*) {
++  AddAgeFraction(ctx, &ctx->f[0]);
++}
++void OnHudAgeF12(cpu::ppc::PPCContext* ctx, void*) {
++  AddAgeFraction(ctx, &ctx->f[12]);
++}
++void OnHudAgeF13(cpu::ppc::PPCContext* ctx, void*) {
++  AddAgeFraction(ctx, &ctx->f[13]);
++}
++
++void OnHudScrollStep(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  // step = 1 / f0: a zero frame time makes the step practically zero.
++  const float scale = PassScale();
++  ctx->f[0] = scale > 0.0f ? ctx->f[0] / scale : 1.0e30;
++}
++
++void OnHudFadeCompound(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  // (1 - x) per pass becomes (1 - x)^passes for this frame's share.
++  const double keep = ctx->f[0];
++  if (keep >= 0.0 && keep <= 1.0) {
++    ctx->f[0] = std::pow(keep, static_cast<double>(PassScale()));
++  }
++}
++
++void OnHudCinematicFadeIn(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked()) {
++    ctx->f[13] *= PassScale();
++  }
++}
++void OnHudCinematicFadeOut(cpu::ppc::PPCContext* ctx, void*) {
++  if (Unlocked()) {
++    ctx->f[12] *= PassScale();
++  }
++}
++
++void OnHudMedalAnimation(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Unlocked()) {
++    return;
++  }
++  const uint32_t time_globals = GameTimeGlobals(ctx);
++  const float alpha = TickFraction(ctx, time_globals);
++  if (alpha < 0.0f) {
++    return;
++  }
++  const int16_t tick_rate = xe::load_and_swap<int16_t>(
++      ctx->TranslateVirtual(time_globals + kGameTimeTickRate));
++  if (tick_rate <= 0) {
++    return;
++  }
++  // r10 = whole ticks since the medal started * 1000; the game divides by
++  // the tick rate to get milliseconds.
++  const double ticks_times_1000 =
++      static_cast<int32_t>(static_cast<uint32_t>(ctx->r[10])) + 1000.0 * alpha;
++  ctx->f[1] = static_cast<float>(ticks_times_1000 / tick_rate);
++}
++
+ }  // namespace
+ 
+ void InstallTiming(KernelState* kernel_state) {
+@@ -252,6 +447,28 @@ void InstallTiming(KernelState* kernel_state) {
+   hooks.Add(processor, kWindTime, OnWindTime);
+   hooks.Add(processor, kWindStepGate, OnWindStepGate);
+   hooks.Add(processor, kWindGustAdd, OnWindGustAdd);
++  for (uint32_t address : kHudAgeF0) {
++    hooks.Add(processor, address, OnHudAgeF0);
++  }
++  hooks.Add(processor, kHudAgeF12, OnHudAgeF12);
++  for (uint32_t address : kHudAgeF13) {
++    hooks.Add(processor, address, OnHudAgeF13);
++  }
++  for (uint32_t address : kHudScrollSteps) {
++    hooks.Add(processor, address, OnHudScrollStep);
++  }
++  hooks.Add(processor, kHudFadeCompound, OnHudFadeCompound);
++  if (cvars::halo3_smooth_shader_time) {
++    for (uint32_t address : kDrawGameSeconds) {
++      hooks.Add(processor, address, OnDrawGameSeconds);
++    }
++    for (uint32_t address : kTreeTimerStores) {
++      hooks.Add(processor, address, OnTreeTimerStore);
++    }
++  }
++  hooks.Add(processor, kHudMedalAnimation, OnHudMedalAnimation);
++  hooks.Add(processor, kHudCinematicFadeIn, OnHudCinematicFadeIn);
++  hooks.Add(processor, kHudCinematicFadeOut, OnHudCinematicFadeOut);
+ }
+ 
+ }  // namespace halo3

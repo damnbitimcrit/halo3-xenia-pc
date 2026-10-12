@@ -1,0 +1,617 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Keep memory export results over CPU writes to their
+ pages
+
+Unless readback_memexport is on, what shaders write with memory export
+exists only in the host GPU copy of guest memory. A CPU write anywhere
+in one of its 4 KB pages invalidates the page, and the next request
+uploads the whole page again from guest memory, which never got the
+results. Halo 3 simulates its particles, contrails, light volumes and
+beams on the GPU this way, in storages that share their first and last
+pages with CPU data it writes every frame (the in-use bitmaps of its
+datum arrays): the stretched plasma trails and drop-pod smoke.
+readback_memexport fixes it by waiting for the GPU at every export.
+
+With memexport_keep_gpu_data (default off, read at each use, so per-game
+configuration works), the shared memory remembers the byte ranges
+written by memory export inside windows that title code registers as
+GPU-only (memexport_keep.h), and uploads skip those bytes, leaving them
+as the GPU wrote them; the other bytes of the page still come from guest
+memory, and so do whole export targets outside the windows. A free,
+decommit, protection change or watched file read of the pages drops the
+kept bytes (Halo 3 protects its game state that way before every load,
+so loaded saves and films take their own data, as before).
+
+Halo 3 registers its four effect storages (headers set up by
+sub_8245F1A8: stride, count, address) from the main loop hook once they
+exist. Not every export target is GPU-only: the CPU fills the ripple
+staging buffers the GPU exported to the frame before (sub_8244AE08).
+
+Counters for titles that log statistics: memory export ranges, GPU-
+written pages a CPU write invalidated, and bytes kept on upload. Each
+distinct export range is logged once (up to 64).
+---
+ .../gpu/d3d12/d3d12_command_processor.cc      |   3 +-
+ src/xenia/gpu/d3d12/d3d12_shared_memory.cc    |  15 +-
+ src/xenia/gpu/gpu_thread_stats.h              |   9 ++
+ src/xenia/gpu/memexport_keep.h                |  40 +++++
+ src/xenia/gpu/shared_memory.cc                | 144 +++++++++++++++++-
+ src/xenia/gpu/shared_memory.h                 |  78 +++++++++-
+ .../gpu/vulkan/vulkan_command_processor.cc    |   2 +-
+ src/xenia/gpu/vulkan/vulkan_shared_memory.cc  |  17 ++-
+ src/xenia/kernel/title/halo3/halo3.cc         |  72 +++++++++
+ 9 files changed, 367 insertions(+), 13 deletions(-)
+ create mode 100644 src/xenia/gpu/memexport_keep.h
+
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.cc b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+index 9be5df1..f7c6fc0 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.cc
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+@@ -3284,7 +3284,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+     // Invalidate textures in memexported memory and watch for changes.
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+       shared_memory_->RangeWrittenByGpu(
+-          memexport_range.base_address_dwords << 2, memexport_range.size_bytes);
++          memexport_range.base_address_dwords << 2, memexport_range.size_bytes,
++          true);
+     }
+     if (GetGPUSetting(GPUSetting::ReadbackMemexport)) {
+       // Read the exported data on the CPU.
+diff --git a/src/xenia/gpu/d3d12/d3d12_shared_memory.cc b/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
+index 21900b0..28c253f 100644
+--- a/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
++++ b/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
+@@ -385,9 +385,18 @@ bool D3D12SharedMemory::UploadRanges(
+             memory().TranslatePhysical(upload_range_start << page_size_log2()),
+             upload_buffer_size);
+       }
+-      command_list.D3DCopyBufferRegion(
+-          buffer_, upload_range_start << page_size_log2(), upload_buffer,
+-          UINT64(upload_buffer_offset), UINT64(upload_buffer_size));
++      // memexport_keep_gpu_data: not over memory export results.
++      const uint32_t upload_chunk_start = upload_range_start
++                                          << page_size_log2();
++      ForEachUploadedPart(
++          upload_chunk_start, uint32_t(upload_buffer_size),
++          [&](uint32_t part_start, uint32_t part_length) {
++            command_list.D3DCopyBufferRegion(
++                buffer_, part_start, upload_buffer,
++                UINT64(upload_buffer_offset +
++                       (part_start - upload_chunk_start)),
++                part_length);
++          });
+       uint32_t upload_buffer_pages =
+           uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+diff --git a/src/xenia/gpu/gpu_thread_stats.h b/src/xenia/gpu/gpu_thread_stats.h
+index f2e3e92..59123f3 100644
+--- a/src/xenia/gpu/gpu_thread_stats.h
++++ b/src/xenia/gpu/gpu_thread_stats.h
+@@ -80,6 +80,15 @@ struct GpuThreadStats {
+   // The CPU wrote the range after the resolve, or there was no free slot.
+   std::atomic<uint32_t> small_readbacks_skipped{0};
+   std::atomic<uint32_t> small_readback_latency_frames{0};  // sum, delivered
++  // Shader memory export (memexport), counted by the shared memory: ranges
++  // exported (command processor thread); pages last written by the GPU (by a
++  // resolve or memory export) that a CPU write invalidated (guest threads, in
++  // the access violation handler) - unless readback_memexport is on, guest
++  // memory doesn't have their GPU data; and the bytes of memory export results
++  // that memexport_keep_gpu_data kept when such pages were uploaded again.
++  std::atomic<uint32_t> memexport_ranges{0};
++  std::atomic<uint32_t> gpu_written_pages_invalidated{0};
++  std::atomic<uint64_t> memexport_kept_bytes{0};
+ };
+ 
+ // While this thread is painting the guest output for a guest swap (in
+diff --git a/src/xenia/gpu/memexport_keep.h b/src/xenia/gpu/memexport_keep.h
+new file mode 100644
+index 0000000..67ae3b4
+--- /dev/null
++++ b/src/xenia/gpu/memexport_keep.h
+@@ -0,0 +1,40 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_GPU_MEMEXPORT_KEEP_H_
++#define XENIA_GPU_MEMEXPORT_KEEP_H_
++
++#include <atomic>
++#include <cstdint>
++
++namespace xe {
++namespace gpu {
++
++// memexport_keep_gpu_data keeps memory export results only inside these
++// physical byte ranges [start, end): buffers that title code knows only the
++// GPU writes during play (Halo 3: its particle, contrail, light volume and
++// beam storages). Other export targets may be written by the CPU as well.
++// Header-only, so title code can register them without linking the GPU code.
++// The writer clears the count, stores the entries, then stores the count.
++struct MemExportKeepWindows {
++  static constexpr uint32_t kMaxWindows = 8;
++  std::atomic<uint32_t> start[kMaxWindows] = {};
++  std::atomic<uint32_t> end[kMaxWindows] = {};
++  std::atomic<uint32_t> count{0};
++};
++
++inline MemExportKeepWindows& memexport_keep_windows() {
++  static MemExportKeepWindows windows;
++  return windows;
++}
++
++}  // namespace gpu
++}  // namespace xe
++
++#endif  // XENIA_GPU_MEMEXPORT_KEEP_H_
+diff --git a/src/xenia/gpu/shared_memory.cc b/src/xenia/gpu/shared_memory.cc
+index dab388a..9671193 100644
+--- a/src/xenia/gpu/shared_memory.cc
++++ b/src/xenia/gpu/shared_memory.cc
+@@ -11,8 +11,24 @@
+ 
+ #include "xenia/base/assert.h"
+ #include "xenia/base/bit_range.h"
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/math.h"
+ #include "xenia/base/profiling.h"
++#include "xenia/gpu/gpu_thread_stats.h"
++#include "xenia/gpu/memexport_keep.h"
++
++DEFINE_bool(
++    memexport_keep_gpu_data, false,
++    "Keep what shaders wrote with memory export (memexport) in the GPU copy of "
++    "guest memory when a CPU write elsewhere in the same 4 KB page makes Xenia "
++    "upload the page again from guest memory, which doesn't have those results "
++    "(unless readback_memexport is on). Only inside buffers the game's title "
++    "code registers as written by the GPU alone (Halo 3: particles, "
++    "contrails, light volumes and beams, whose trails stretch otherwise); "
++    "nothing for other games. A free or protection change of the memory still "
++    "replaces them.",
++    "GPU");
+ 
+ namespace xe {
+ namespace gpu {
+@@ -47,6 +63,7 @@ bool SharedMemory::InitializeCommon() {
+   memset(system_page_flags_valid_, 0, 8 * num_system_page_flags_entries);
+   memset(system_page_flags_valid_and_gpu_written_, 0,
+          8 * num_system_page_flags_entries);
++  stats_ = &gpu_thread_stats();
+   memory_invalidation_callback_handle_ =
+       memory_.RegisterPhysicalMemoryInvalidationCallback(
+           MemoryInvalidationCallbackThunk, this);
+@@ -281,7 +298,8 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last,
+   }
+ }
+ 
+-void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
++void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length,
++                                     bool memexport) {
+   if (length == 0 || start >= kBufferSize) {
+     return;
+   }
+@@ -297,6 +315,112 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   // Mark the range as valid (so pages are not reuploaded until modified by the
+   // CPU) and watch it so the CPU can reuse it and this will be caught.
+   MakeRangeValid(start, length, true);
++
++  if (memexport) {
++    stats_->memexport_ranges.fetch_add(1, std::memory_order_relaxed);
++    LogMemExportRange(start, length);
++    if (cvars::memexport_keep_gpu_data) {
++      // Only inside the registered windows: the CPU may write other export
++      // targets too (Halo 3's ripple buffers swap roles between the CPU and
++      // the GPU every frame), and some ranges are larger than their buffer.
++      const MemExportKeepWindows& windows = memexport_keep_windows();
++      const uint32_t window_count =
++          std::min(windows.count.load(std::memory_order_acquire),
++                   MemExportKeepWindows::kMaxWindows);
++      if (window_count) {
++        const uint32_t end = start + length;
++        auto global_lock = global_critical_region_.Acquire();
++        for (uint32_t i = 0; i < window_count; ++i) {
++          const uint32_t keep_start = std::max(
++              start, windows.start[i].load(std::memory_order_relaxed));
++          const uint32_t keep_end =
++              std::min(end, windows.end[i].load(std::memory_order_relaxed));
++          if (keep_start < keep_end) {
++            KeepMemExportRange(keep_start, keep_end);
++            memexport_ranges_kept_ = true;
++          }
++        }
++      }
++    } else if (memexport_ranges_kept_) {
++      auto global_lock = global_critical_region_.Acquire();
++      memexport_kept_ranges_.clear();
++      memexport_ranges_kept_ = false;
++    }
++  }
++}
++
++void SharedMemory::KeepMemExportRange(uint32_t start, uint32_t end) {
++  // The first range ending at or after start, which may overlap or touch it.
++  auto it = std::lower_bound(
++      memexport_kept_ranges_.begin(), memexport_kept_ranges_.end(), start,
++      [](const std::pair<uint32_t, uint32_t>& range, uint32_t value) {
++        return range.second < value;
++      });
++  // Usually the same storage exported to again.
++  if (it != memexport_kept_ranges_.end() && it->first <= start &&
++      it->second >= end) {
++    return;
++  }
++  uint32_t merged_start = start, merged_end = end;
++  auto merge_end = it;
++  while (merge_end != memexport_kept_ranges_.end() && merge_end->first <= end) {
++    merged_start = std::min(merged_start, merge_end->first);
++    merged_end = std::max(merged_end, merge_end->second);
++    ++merge_end;
++  }
++  it = memexport_kept_ranges_.erase(it, merge_end);
++  memexport_kept_ranges_.insert(it, std::make_pair(merged_start, merged_end));
++}
++
++void SharedMemory::DropMemExportKeptRanges(uint32_t start, uint32_t end) {
++  for (size_t i = 0; i < memexport_kept_ranges_.size();) {
++    std::pair<uint32_t, uint32_t>& range = memexport_kept_ranges_[i];
++    if (range.second <= start || range.first >= end) {
++      ++i;
++      continue;
++    }
++    if (range.first < start && range.second > end) {
++      // Split around the dropped bytes. The ranges are apart, so no other one
++      // overlaps them.
++      const std::pair<uint32_t, uint32_t> tail(end, range.second);
++      range.second = start;
++      memexport_kept_ranges_.insert(memexport_kept_ranges_.begin() + (i + 1),
++                                    tail);
++      return;
++    }
++    if (range.first < start) {
++      range.second = start;
++      ++i;
++    } else if (range.second > end) {
++      range.first = end;
++      ++i;
++    } else {
++      memexport_kept_ranges_.erase(memexport_kept_ranges_.begin() + i);
++    }
++  }
++}
++
++void SharedMemory::CountMemExportBytesKept(uint32_t bytes) const {
++  stats_->memexport_kept_bytes.fetch_add(bytes, std::memory_order_relaxed);
++}
++
++void SharedMemory::LogMemExportRange(uint32_t start, uint32_t length) {
++  if (memexport_ranges_logged_count_ >= kMemExportRangesLoggedMax) {
++    return;
++  }
++  for (uint32_t i = 0; i < memexport_ranges_logged_count_; ++i) {
++    if (memexport_ranges_logged_[i].first == start &&
++        memexport_ranges_logged_[i].second == length) {
++      return;
++    }
++  }
++  memexport_ranges_logged_[memexport_ranges_logged_count_++] =
++      std::make_pair(start, length);
++  XELOGI("SharedMemory: memory export to {:08X}-{:08X} ({} bytes){}", start,
++         start + length - 1, length,
++         memexport_ranges_logged_count_ == kMemExportRangesLoggedMax
++             ? "; new ranges after this one aren't logged"
++             : "");
+ }
+ 
+ bool SharedMemory::AllocateSparseHostGpuMemoryRange(
+@@ -631,9 +755,27 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
+       invalidate_bits &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+     }
+     system_page_flags_valid_[i] &= ~invalidate_bits;
++    if (!exact_range) {
++      // Counted only, in the access violation handler: no allocation here.
++      const uint64_t gpu_written_lost =
++          system_page_flags_valid_and_gpu_written_[i] & invalidate_bits;
++      if (gpu_written_lost) {
++        stats_->gpu_written_pages_invalidated.fetch_add(
++            xe::bit_count(gpu_written_lost), std::memory_order_relaxed);
++      }
++    }
+     system_page_flags_valid_and_gpu_written_[i] &= ~invalidate_bits;
+   }
+ 
++  // memexport_keep_gpu_data: a free, decommit, protection change or watched
++  // file read replaces the memory (in whole pages, as the callbacks get them),
++  // so its guest data wins over what was exported there. Halo 3 protects its
++  // whole game state this way before loading one.
++  if (exact_range && !memexport_kept_ranges_.empty()) {
++    DropMemExportKeptRanges(physical_address_start,
++                            physical_address_start + length);
++  }
++
+   FireWatches(page_first, page_last, false);
+ 
+   return std::make_pair(page_first << page_size_log2_,
+diff --git a/src/xenia/gpu/shared_memory.h b/src/xenia/gpu/shared_memory.h
+index fe86cfd..19b66ad 100644
+--- a/src/xenia/gpu/shared_memory.h
++++ b/src/xenia/gpu/shared_memory.h
+@@ -10,11 +10,18 @@
+ #ifndef XENIA_GPU_SHARED_MEMORY_H_
+ #define XENIA_GPU_SHARED_MEMORY_H_
+ 
++#include <algorithm>
++#include <cstdint>
++#include <utility>
++#include <vector>
++
+ #include "xenia/memory.h"
+ 
+ namespace xe {
+ namespace gpu {
+ 
++struct GpuThreadStats;
++
+ // Manages memory for unconverted textures, resolve targets, vertex and index
+ // buffers that can be accessed from shaders with Xenon physical addresses, with
+ // system page size granularity.
+@@ -105,8 +112,10 @@ class SharedMemory {
+   // protecting it. Before writing anything from the GPU side, RequestRange must
+   // be called, to make sure, if the GPU writes don't overwrite *everything* in
+   // the pages they touch, the CPU data is properly loaded to the unmodified
+-  // regions in those pages.
+-  void RangeWrittenByGpu(uint32_t start, uint32_t length);
++  // regions in those pages. memexport: written by shader memory export (not a
++  // resolve), kept over later uploads with memexport_keep_gpu_data.
++  void RangeWrittenByGpu(uint32_t start, uint32_t length,
++                         bool memexport = false);
+ 
+  protected:
+   SharedMemory(Memory& memory);
+@@ -154,6 +163,47 @@ class SharedMemory {
+       const std::pair<uint32_t, uint32_t>* upload_page_ranges,
+       uint32_t num_upload_ranges) = 0;
+ 
++  // For UploadRanges, after MakeRangeValid: calls copy(start, length) for
++  // each part of the bytes [start, start + length) that isn't a memory export
++  // result kept with memexport_keep_gpu_data, so the upload doesn't put the
++  // guest memory's stale bytes over what the GPU wrote. Returns the bytes
++  // kept. In the global critical region, so a drop of kept bytes either comes
++  // before (and is seen here) or invalidates the page again.
++  template <typename CopyFunction>
++  uint32_t ForEachUploadedPart(uint32_t start, uint32_t length,
++                               CopyFunction&& copy) {
++    const uint32_t end = start + length;
++    uint32_t position = start;
++    uint32_t kept = 0;
++    auto global_lock = global_critical_region_.Acquire();
++    // The first kept range ending after start.
++    auto kept_it = std::upper_bound(
++        memexport_kept_ranges_.cbegin(), memexport_kept_ranges_.cend(), start,
++        [](uint32_t value, const std::pair<uint32_t, uint32_t>& range) {
++          return value < range.second;
++        });
++    for (; kept_it != memexport_kept_ranges_.cend(); ++kept_it) {
++      const std::pair<uint32_t, uint32_t>& kept_range = *kept_it;
++      if (kept_range.first >= end) {
++        break;
++      }
++      if (kept_range.first > position) {
++        copy(position, kept_range.first - position);
++        position = kept_range.first;
++      }
++      const uint32_t kept_end = std::min(kept_range.second, end);
++      kept += kept_end - position;
++      position = kept_end;
++    }
++    if (position < end) {
++      copy(position, end - position);
++    }
++    if (kept) {
++      CountMemExportBytesKept(kept);
++    }
++    return kept;
++  }
++
+   const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
+     return trace_download_ranges_;
+   }
+@@ -188,6 +238,18 @@ class SharedMemory {
+   void* memory_data_provider_handle_ = nullptr;
+   static constexpr unsigned int MAX_UPLOAD_RANGES = 65536;
+ 
++  // Cached in InitializeCommon: gpu_thread_stats() initializes a function-local
++  // static on its first call, which isn't safe in the access violation handler.
++  GpuThreadStats* stats_ = nullptr;
++  void CountMemExportBytesKept(uint32_t bytes) const;
++  // Logs each distinct memory export range once, up to
++  // kMemExportRangesLoggedMax (command processor thread).
++  void LogMemExportRange(uint32_t start, uint32_t length);
++  static constexpr uint32_t kMemExportRangesLoggedMax = 64;
++  std::pair<uint32_t, uint32_t>
++      memexport_ranges_logged_[kMemExportRangesLoggedMax] = {};
++  uint32_t memexport_ranges_logged_count_ = 0;
++
+   // Ranges that need to be uploaded, generated by GetRangesToUpload (a
+   // persistently allocated vector).
+   // std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
+@@ -219,6 +281,18 @@ class SharedMemory {
+   uint64_t *system_page_flags_valid_ = nullptr,
+            *system_page_flags_valid_and_gpu_written_ = nullptr;
+   unsigned num_system_page_flags_ = 0;
++
++  // memexport_keep_gpu_data: byte ranges [first, second) written by shader
++  // memory export inside the windows a title registered (memexport_keep.h),
++  // sorted and apart, which uploads (after a CPU write to their pages) leave
++  // as the GPU wrote them. A free, decommit, protection change or (watched)
++  // file read of their pages drops them.
++  std::vector<std::pair<uint32_t, uint32_t>> memexport_kept_ranges_;
++  // Command processor thread: whether memexport_kept_ranges_ may be non-empty
++  // (to clear it when memexport_keep_gpu_data is turned off).
++  bool memexport_ranges_kept_ = false;
++  void KeepMemExportRange(uint32_t start, uint32_t end);
++  void DropMemExportKeptRanges(uint32_t start, uint32_t end);
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+       void* context_ptr, uint32_t physical_address_start, uint32_t length,
+       bool exact_range);
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.cc b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+index aa0874e..ac309c3 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.cc
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+@@ -3072,7 +3072,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type,
+   // Invalidate textures in memexported memory and watch for changes.
+   for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+     shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+-                                      memexport_range.size_bytes);
++                                      memexport_range.size_bytes, true);
+   }
+ 
+   // CPU readback for memexport data (if enabled).
+diff --git a/src/xenia/gpu/vulkan/vulkan_shared_memory.cc b/src/xenia/gpu/vulkan/vulkan_shared_memory.cc
+index fe8dc64..21de3f5 100644
+--- a/src/xenia/gpu/vulkan/vulkan_shared_memory.cc
++++ b/src/xenia/gpu/vulkan/vulkan_shared_memory.cc
+@@ -468,11 +468,18 @@ bool VulkanSharedMemory::UploadRanges(
+         upload_regions_.clear();
+       }
+       upload_buffer_previous = upload_buffer;
+-      VkBufferCopy& upload_region = upload_regions_.emplace_back();
+-      upload_region.srcOffset = upload_buffer_offset;
+-      upload_region.dstOffset =
+-          VkDeviceSize(upload_range_start << page_size_log2());
+-      upload_region.size = upload_buffer_size;
++      // memexport_keep_gpu_data: not over memory export results.
++      const uint32_t upload_chunk_start = upload_range_start
++                                          << page_size_log2();
++      ForEachUploadedPart(
++          upload_chunk_start, uint32_t(upload_buffer_size),
++          [&](uint32_t part_start, uint32_t part_length) {
++            VkBufferCopy& upload_region = upload_regions_.emplace_back();
++            upload_region.srcOffset =
++                upload_buffer_offset + (part_start - upload_chunk_start);
++            upload_region.dstOffset = VkDeviceSize(part_start);
++            upload_region.size = part_length;
++          });
+       uint32_t upload_buffer_pages =
+           uint32_t(upload_buffer_size >> page_size_log2());
+       upload_range_start += upload_buffer_pages;
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 6d1f63f..3e91bee 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <iterator>
+ 
+ #include "xenia/apu/audio_stats.h"
+ #include "xenia/base/byte_order.h"
+@@ -18,6 +19,7 @@
+ #include "xenia/base/logging.h"
+ #include "xenia/cpu/guest_hooks.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
++#include "xenia/gpu/memexport_keep.h"
+ #include "xenia/kernel/kernel_state.h"
+ 
+ DEFINE_bool(halo3_unlock_framerate, false,
+@@ -65,6 +67,21 @@ constexpr uint32_t kXmaContextCopySize = 0x60;
+ constexpr uint32_t kSrcFrame = 0x14;
+ constexpr uint32_t kSrcChannelStride = 0x400;
+ 
++// memexport_keep_gpu_data (Xenia's shared memory) keeps memory export results
++// only inside registered windows. Halo 3 simulates its particles, contrails,
++// light volumes and beams on the GPU in four vertex buffers
++// ("x_gamestate_storage") that only memory export writes during play; their
++// headers, set up once by the effect systems' constructors (sub_8245F2E0,
++// sub_82461070, sub_82463840, sub_82464600) through sub_8245F1A8: vertex
++// stride (u8), vertex count (u16), address. The game's other export targets
++// aren't GPU-only: the CPU fills the ripple staging buffers the GPU exported
++// to the frame before (sub_8244AE08).
++constexpr uint32_t kEffectStorageHeaders[] = {0x827BE794, 0x827BE978,
++                                              0x827BF2F4, 0x827BF508};
++constexpr uint32_t kEffectStorageStride = 0x01;
++constexpr uint32_t kEffectStorageCount = 0x02;
++constexpr uint32_t kEffectStorageAddress = 0x28;
++
+ constexpr uint32_t kExposureReadback = 0x8216B53C;
+ constexpr uint32_t kExposureTarget = 0x8216B5AC;
+ constexpr uint32_t kExposureCurrent = 0xC;
+@@ -394,6 +411,15 @@ void LogStats() {
+       delivered ? double(latency) / delivered : 0.0,
+       g.small_readbacks_skipped.exchange(0));
+   LogGpuProfile(seconds, swaps);
++  // Shader memory export: Halo 3 simulates particles, contrails, light volumes
++  // and beams on the GPU. Its CPU writes next to their memory every frame; with
++  // memexport_keep_gpu_data, the uploads that follow leave the GPU's results
++  // in the registered effect storage (otherwise their trails stretch).
++  XELOGI(
++      "Halo 3 memexport: {} ranges exported; {} GPU-written pages invalidated "
++      "by CPU writes; {:.0f} KB of export results kept on upload",
++      g.memexport_ranges.exchange(0), g.gpu_written_pages_invalidated.exchange(0),
++      double(g.memexport_kept_bytes.exchange(0)) / 1024.0);
+   // The presenter's present thread (host_present_thread), busy in percent of
+   // the interval, and the guest output images the presents have published:
+   // those replaced before any paint took them weren't displayed.
+@@ -496,8 +522,54 @@ void OnExposureTarget(cpu::ppc::PPCContext* ctx, void*) {
+   s.exposure_max = static_cast<float>(ctx->f[28]);
+ }
+ 
++// Registers the effect storages' physical ranges for memexport_keep_gpu_data
++// once they exist (main thread).
++void RegisterEffectStorage(cpu::ppc::PPCContext* ctx) {
++  static bool registered = false;
++  if (registered) {
++    return;
++  }
++  constexpr size_t kStorageCount = std::size(kEffectStorageHeaders);
++  uint32_t starts[kStorageCount], ends[kStorageCount];
++  for (size_t i = 0; i < kStorageCount; ++i) {
++    const uint32_t header = kEffectStorageHeaders[i];
++    const uint32_t address = xe::load_and_swap<uint32_t>(
++        ctx->TranslateVirtual(header + kEffectStorageAddress));
++    const uint32_t size =
++        uint32_t(*ctx->TranslateVirtual<uint8_t*>(header +
++                                                  kEffectStorageStride)) *
++        xe::load_and_swap<uint16_t>(
++            ctx->TranslateVirtual(header + kEffectStorageCount));
++    if (!address || !size) {
++      return;
++    }
++    const uint32_t physical =
++        ctx->kernel_state->memory()->GetPhysicalAddress(address);
++    if (physical == UINT32_MAX) {
++      return;
++    }
++    starts[i] = physical;
++    ends[i] = physical + size;
++  }
++  gpu::MemExportKeepWindows& windows = gpu::memexport_keep_windows();
++  windows.count.store(0, std::memory_order_release);
++  for (size_t i = 0; i < kStorageCount; ++i) {
++    windows.start[i].store(starts[i], std::memory_order_relaxed);
++    windows.end[i].store(ends[i], std::memory_order_relaxed);
++  }
++  windows.count.store(uint32_t(kStorageCount), std::memory_order_release);
++  registered = true;
++  XELOGI(
++      "Halo 3: GPU effect storage (kept with memexport_keep_gpu_data): "
++      "particles {:08X}-{:08X}, contrails {:08X}-{:08X}, light volumes "
++      "{:08X}-{:08X}, beams {:08X}-{:08X}",
++      starts[0], ends[0] - 1, starts[1], ends[1] - 1, starts[2], ends[2] - 1,
++      starts[3], ends[3] - 1);
++}
++
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
+   main_thread_id.store(ctx->thread_id, std::memory_order_relaxed);
++  RegisterEffectStorage(ctx);
+   if (cvars::halo3_log_stats) {
+     stats().frames++;
+     LogStats();

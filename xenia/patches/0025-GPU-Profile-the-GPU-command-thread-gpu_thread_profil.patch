@@ -1,0 +1,950 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Profile the GPU command thread (gpu_thread_profile)
+
+Xenia's GPU command thread limits Halo 3's frame rate in busy scenes at
+about 1.7 ms + 2.3 us per draw per frame, and nothing said where that time
+goes. With gpu_thread_profile (off by default, checked at every swap so a
+title's configuration can turn it on), the thread laps its time into
+exclusive buckets that together cover it: idle, the packet stream, shader
+loads, sync (WAIT_REG_MEM, host GPU waits, interrupts), each stage of a
+draw (setup, primitives, render targets, pipeline, textures, system
+constants, bindings, shared memory), resolves, submissions and the swap.
+
+- A lap reads the time stamp counter into plain per-thread variables
+  (GpuThreadProfiler, reached through a thread-local pointer that is null
+  on other threads and while off); scoped zones return to the bucket they
+  interrupted, so nested work (uploads inside texture loads, submissions
+  inside the swap) counts where it happens. The thread adds its numbers to
+  shared atomics once per swap. A lap's cost is measured when profiling
+  starts, for the reader to take out.
+- Counts: packets and primary buffers, shader loads, interrupts, draws
+  entered, recorded and waiting for a pipeline, pipeline lookups (current,
+  found, new), root signature changes, resolves, submissions with the time
+  spent replaying the deferred command list (and its command count) and
+  closing and executing it, shared memory uploads and bytes, texture loads
+  and bytes, render target transfers.
+- Halo 3's stats print it as a "Halo 3 GPU profile" line in ms per frame,
+  the draw stages in us per draw, against the time stamp counter's
+  frequency measured over each interval.
+---
+ src/xenia/gpu/command_processor.cc            |  32 ++++
+ src/xenia/gpu/command_processor.h             |   6 +
+ .../gpu/d3d12/d3d12_command_processor.cc      |  42 ++++-
+ .../gpu/d3d12/d3d12_render_target_cache.cc    |   8 +
+ src/xenia/gpu/d3d12/d3d12_shared_memory.cc    |   5 +
+ src/xenia/gpu/d3d12/d3d12_texture_cache.cc    |   5 +
+ src/xenia/gpu/d3d12/deferred_command_list.cc  |  10 +-
+ src/xenia/gpu/d3d12/deferred_command_list.h   |   7 +-
+ src/xenia/gpu/d3d12/pipeline_cache.cc         |   4 +
+ src/xenia/gpu/gpu_thread_stats.h              | 176 ++++++++++++++++++
+ .../gpu/pm4_command_processor_implement.h     |  26 +++
+ src/xenia/kernel/title/halo3/halo3.cc         | 113 +++++++++++
+ 12 files changed, 426 insertions(+), 8 deletions(-)
+
+diff --git a/src/xenia/gpu/command_processor.cc b/src/xenia/gpu/command_processor.cc
+index 418c355..4b8373c 100644
+--- a/src/xenia/gpu/command_processor.cc
++++ b/src/xenia/gpu/command_processor.cc
+@@ -104,6 +104,13 @@ DEFINE_string(
+ 
+ UPDATE_from_string(readback_resolve, 2025, 12, 4, 21, "fast");
+ 
++DEFINE_bool(gpu_thread_profile, false,
++            "Time the GPU command thread's work by kind (stream, draws by "
++            "stage, resolves, submissions, swaps) and count the work behind "
++            "it, for titles that log performance statistics. Costs about 5% "
++            "of the thread's time. Checked at every swap.",
++            "GPU");
++
+ DEFINE_uint32(readback_resolve_small_bytes, 16384,
+               "Largest resolve destination, in bytes, that readback_resolve = "
+               "\"small\" reads back. A resolve within one 32x32 tile takes "
+@@ -381,6 +388,7 @@ void CommandProcessor::WorkerThreadMain() {
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
+       const uint64_t idle_start = Clock::QueryHostTickCount();
++      GpuProfileLap(GpuProfileBucket::kIdle);
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -403,6 +411,7 @@ void CommandProcessor::WorkerThreadMain() {
+                (write_ptr_index == 0xBAADF00D ||
+                 read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++      GpuProfileLap(GpuProfileBucket::kStream);
+       gpu_thread_stats().idle_ticks.fetch_add(
+           Clock::QueryHostTickCount() - idle_start, std::memory_order_relaxed);
+       if (!worker_running_ || !pending_fns_.empty()) {
+@@ -430,9 +439,32 @@ void CommandProcessor::WorkerThreadMain() {
+     // but no games seem to actually use it.
+   }
+ 
++  if (thread_profiler_) {
++    gpu_thread_profiler = nullptr;
++    thread_profiler_.reset();
++    gpu_thread_profile().enabled.store(false, std::memory_order_relaxed);
++  }
+   ShutdownContext();
+ }
+ 
++void CommandProcessor::UpdateThreadProfiler() {
++  if (cvars::gpu_thread_profile == bool(thread_profiler_)) {
++    return;
++  }
++  GpuThreadProfile& profile = gpu_thread_profile();
++  if (thread_profiler_) {
++    thread_profiler_->Publish();
++    gpu_thread_profiler = nullptr;
++    thread_profiler_.reset();
++    profile.enabled.store(false, std::memory_order_relaxed);
++    return;
++  }
++  thread_profiler_ = std::make_unique<GpuThreadProfiler>();
++  thread_profiler_->Calibrate();
++  gpu_thread_profiler = thread_profiler_.get();
++  profile.enabled.store(true, std::memory_order_relaxed);
++}
++
+ void CommandProcessor::Pause() {
+   if (paused_) {
+     return;
+diff --git a/src/xenia/gpu/command_processor.h b/src/xenia/gpu/command_processor.h
+index 79af753..2161db1 100644
+--- a/src/xenia/gpu/command_processor.h
++++ b/src/xenia/gpu/command_processor.h
+@@ -22,6 +22,7 @@
+ 
+ #include "xenia/base/math.h"
+ #include "xenia/base/ring_buffer.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/register_file.h"
+ #include "xenia/gpu/trace_writer.h"
+ #include "xenia/gpu/xenos.h"
+@@ -223,6 +224,9 @@ class CommandProcessor {
+   }
+ 
+   void WorkerThreadMain();
++  // At a swap (no profiled zone open): starts or stops profiling this thread
++  // as gpu_thread_profile says, which the game's configuration may change.
++  void UpdateThreadProfiler();
+   virtual bool SetupContext() = 0;
+   virtual void ShutdownContext() = 0;
+   // rarely needed, most register writes have no special logic here
+@@ -610,6 +614,8 @@ class CommandProcessor {
+   uint32_t read_ptr_writeback_ptr_ = 0;
+ 
+   std::unique_ptr<xe::threading::Event> write_ptr_index_event_;
++  // While gpu_thread_profile is on, this thread's profiler.
++  std::unique_ptr<GpuThreadProfiler> thread_profiler_;
+   std::atomic<uint32_t> write_ptr_index_;
+ 
+   uint64_t bin_select_ = 0xFFFFFFFFull;
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.cc b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+index 8469550..ab90562 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.cc
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+@@ -2610,6 +2610,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
+ }
+ 
+ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
++  GpuProfileZone profile_zone(GpuProfileBucket::kSubmission);
+   // Pump any completed resolves now since the guest is likely about to poll.
+   PumpQueryResolves();
+   PumpPendingRetire();
+@@ -2656,6 +2657,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+     return IssueCopy();
+   }
+ 
++  // gpu_thread_profile: the draw's time by stage. Every early return goes
++  // back to the bucket the draw interrupted.
++  GpuProfileZone profile_zone(GpuProfileBucket::kDrawSetup);
++  GpuProfileAdd(GpuProfileCount::kDrawsEntered);
++
+   if (regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0) {
+     // Doesn't actually draw.
+     // TODO(Triang3l): Do something so memexport still works in this case maybe?
+@@ -2720,9 +2726,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+ 
+   // Process primitives.
+   PrimitiveProcessor::ProcessingResult primitive_processing_result;
++  GpuProfileLap(GpuProfileBucket::kPrimitives);
+   if (!primitive_processor_->Process(primitive_processing_result)) {
+     return false;
+   }
++  GpuProfileLap(GpuProfileBucket::kDrawSetup);
+   if (!primitive_processing_result.host_draw_vertex_count) {
+     // Nothing to draw.
+     return true;
+@@ -2784,6 +2792,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+   }
+ 
+   // Put the window offset into the EDRAM bases when possible.
++  GpuProfileLap(GpuProfileBucket::kRenderTargets);
+   int32_t window_offset_tiles = render_target_cache_->GetWindowOffsetTiles(
+       regs, normalized_depth_control, normalized_color_mask, frame_current_);
+ 
+@@ -2797,6 +2806,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+   // Create the pipeline (for this, need the actually used render target formats
+   // from the render target cache), translating the shaders - doing this now to
+   // obtain the used textures.
++  GpuProfileLap(GpuProfileBucket::kPipeline);
+   D3D12Shader::D3D12Translation* vertex_shader_translation =
+       static_cast<D3D12Shader::D3D12Translation*>(
+           vertex_shader->GetOrCreateTranslation(
+@@ -2857,6 +2867,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+           vertex_shader->ucode_data_hash(), vertex_shader_modification.value,
+           pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+           pixel_shader_modification.value);
++      GpuProfileAdd(GpuProfileCount::kDrawsNotReady);
+       OnVIZSurveyDraw(false);
+       return true;
+     }
+@@ -2865,12 +2876,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+   }
+ 
+   // Update the textures - this may bind pipelines.
++  GpuProfileLap(GpuProfileBucket::kTextures);
+   uint32_t used_texture_mask =
+       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+       (pixel_shader != nullptr
+            ? pixel_shader->GetUsedTextureMaskAfterTranslation()
+            : 0);
+   texture_cache_->RequestTextures(used_texture_mask);
++  GpuProfileLap(GpuProfileBucket::kDrawSetup);
+ 
+   // Bind the pipeline after configuring it and doing everything that may bind
+   // other pipelines.
+@@ -2945,6 +2958,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+ 
+   // Update system constants before uploading them.
+   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
++  GpuProfileLap(GpuProfileBucket::kSystemConstants);
+   UpdateSystemConstantValues(
+       memexport_used, primitive_polygonal,
+       primitive_processing_result.line_loop_closing_index,
+@@ -2954,11 +2968,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+       window_offset_tiles);
+ 
+   // Update constant buffers, descriptors and root parameters.
++  GpuProfileLap(GpuProfileBucket::kBindings);
+   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature,
+                       memexport_used)) {
+     return false;
+   }
+   // Must not call anything that can change the descriptor heap from now on!
++  GpuProfileLap(GpuProfileBucket::kSharedMemory);
+ 
+   // Ensure vertex buffers are resident.
+   // TODO(Triang3l): Cache residency for ranges in a way similar to how texture
+@@ -3055,6 +3071,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+       return false;
+     }
+   }
++  GpuProfileLap(GpuProfileBucket::kDrawSetup);
+   // Primitive topology.
+   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
+   if (primitive_processing_result.IsTessellated()) {
+@@ -3152,6 +3169,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+     }
+     deferred_command_list_.D3DDrawInstanced(
+         primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++    GpuProfileAdd(GpuProfileCount::kDrawsRecorded);
+     if (predicate_buffer) {
+       deferred_command_list_.D3DSetPredication(nullptr, 0,
+                                                D3D12_PREDICATION_OP_EQUAL_ZERO);
+@@ -3225,6 +3243,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
+     }
+     deferred_command_list_.D3DDrawIndexedInstanced(
+         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++    GpuProfileAdd(GpuProfileCount::kDrawsRecorded);
+     if (predicate_buffer) {
+       deferred_command_list_.D3DSetPredication(nullptr, 0,
+                                                D3D12_PREDICATION_OP_EQUAL_ZERO);
+@@ -3323,6 +3342,8 @@ bool D3D12CommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  GpuProfileZone profile_zone(GpuProfileBucket::kResolves);
++  GpuProfileAdd(GpuProfileCount::kResolves);
+   if (!BeginSubmission(true)) {
+     return false;
+   }
+@@ -3815,6 +3836,7 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
+ 
+   {
+     ScopedGpuThreadTicks gpu_wait_ticks(gpu_thread_stats().gpu_wait_ticks);
++    GpuProfileZone profile_zone(GpuProfileBucket::kSync);
+     completion_timeline_->AwaitSubmissionAndUpdateCompleted(await_submission);
+   }
+ 
+@@ -3888,6 +3910,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+   if (submission_open_ && !is_opening_frame) {
+     return true;
+   }
++  GpuProfileZone profile_zone(GpuProfileBucket::kSubmission);
+ 
+   // Check if the device is still available.
+   ID3D12Device* device = GetD3D12Provider().GetDevice();
+@@ -4046,6 +4069,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+ 
+ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++  GpuProfileZone profile_zone(GpuProfileBucket::kSubmission);
+ 
+   // Make sure there is a command allocator to write commands to.
+   if (submission_open_ && !command_allocator_writable_first_) {
+@@ -4102,13 +4126,26 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     // happens between Xenia submissions.
+     ID3D12CommandAllocator* command_allocator =
+         command_allocator_writable_first_->command_allocator;
++    // gpu_thread_profile: replaying the deferred commands into the command
++    // list, which is where the Direct3D 12 runtime and driver cost of the
++    // frame's draws shows, and closing and executing it.
++    const uint64_t replay_start = gpu_thread_profiler ? GpuProfileTicks() : 0;
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
+-    deferred_command_list_.Execute(command_list_, command_list_1_,
+-                                   command_list_2_);
++    const uint32_t replayed_commands = deferred_command_list_.Execute(
++        command_list_, command_list_1_, command_list_2_);
++    const uint64_t execute_start = gpu_thread_profiler ? GpuProfileTicks() : 0;
+     command_list_->Close();
+     ID3D12CommandList* execute_command_lists[] = {command_list_};
+     direct_queue->ExecuteCommandLists(1, execute_command_lists);
++    if (gpu_thread_profiler) {
++      GpuProfileAdd(GpuProfileCount::kSubmissions);
++      GpuProfileAdd(GpuProfileCount::kReplayTicks,
++                    execute_start - replay_start);
++      GpuProfileAdd(GpuProfileCount::kReplayCommands, replayed_commands);
++      GpuProfileAdd(GpuProfileCount::kExecuteTicks,
++                    GpuProfileTicks() - execute_start);
++    }
+     command_allocator_writable_first_->last_usage_submission =
+         GetCurrentSubmission();
+     if (command_allocator_submitted_last_) {
+@@ -5069,6 +5106,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
+ 
+   // Set the new root signature.
+   if (current_graphics_root_signature_ != root_signature) {
++    GpuProfileAdd(GpuProfileCount::kRootSignatures);
+     current_graphics_root_signature_ = root_signature;
+     if (!bindless_resources_used_) {
+       GetRootBindfulExtraParameterIndices(
+diff --git a/src/xenia/gpu/d3d12/d3d12_render_target_cache.cc b/src/xenia/gpu/d3d12/d3d12_render_target_cache.cc
+index ac03287..ec6857d 100644
+--- a/src/xenia/gpu/d3d12/d3d12_render_target_cache.cc
++++ b/src/xenia/gpu/d3d12/d3d12_render_target_cache.cc
+@@ -27,6 +27,7 @@
+ #include "xenia/gpu/dxbc.h"
+ #include "xenia/gpu/dxbc_shader_translator.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/trace_writer.h"
+ #include "xenia/gpu/xenos.h"
+ #include "xenia/ui/d3d12/d3d12_provider.h"
+@@ -1234,6 +1235,13 @@ bool D3D12RenderTargetCache::Update(
+     case Path::kHostRenderTargets: {
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
++      if (gpu_thread_profiler) {
++        const std::vector<Transfer>* transfers = last_update_transfers();
++        for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
++          GpuProfileAdd(GpuProfileCount::kRenderTargetTransfers,
++                        transfers[i].size());
++        }
++      }
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets,
+                                        last_update_transfers());
+diff --git a/src/xenia/gpu/d3d12/d3d12_shared_memory.cc b/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
+index 4a10c3e..018b8fc 100644
+--- a/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
++++ b/src/xenia/gpu/d3d12/d3d12_shared_memory.cc
+@@ -16,6 +16,7 @@
+ #include "xenia/base/logging.h"
+ #include "xenia/base/math.h"
+ #include "xenia/gpu/d3d12/d3d12_command_processor.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/ui/d3d12/d3d12_util.h"
+ 
+ DECLARE_bool(gpu_allow_invalid_upload_range);
+@@ -317,6 +318,8 @@ bool D3D12SharedMemory::UploadRanges(
+   if (!num_upload_page_ranges) {
+     return true;
+   }
++  GpuProfileZone profile_zone(GpuProfileBucket::kSharedMemory);
++  GpuProfileAdd(GpuProfileCount::kUploadRanges, num_upload_page_ranges);
+   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+   command_processor_.SubmitBarriers();
+   auto& command_list = command_processor_.GetDeferredCommandList();
+@@ -324,6 +327,8 @@ bool D3D12SharedMemory::UploadRanges(
+     auto& upload_range = upload_page_ranges[i];
+     uint32_t upload_range_start = upload_range.first;
+     uint32_t upload_range_length = upload_range.second;
++    GpuProfileAdd(GpuProfileCount::kUploadBytes, uint64_t(upload_range_length)
++                                                     << page_size_log2());
+     trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
+                                   upload_range_length << page_size_log2());
+ 
+diff --git a/src/xenia/gpu/d3d12/d3d12_texture_cache.cc b/src/xenia/gpu/d3d12/d3d12_texture_cache.cc
+index 1cc5ac1..fc9c037 100644
+--- a/src/xenia/gpu/d3d12/d3d12_texture_cache.cc
++++ b/src/xenia/gpu/d3d12/d3d12_texture_cache.cc
+@@ -21,6 +21,7 @@
+ #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+ #include "xenia/gpu/d3d12/d3d12_shared_memory.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/texture_info.h"
+ #include "xenia/gpu/texture_util.h"
+ #include "xenia/gpu/xenos.h"
+@@ -1432,6 +1433,10 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                                               bool load_mips) {
+   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+   TextureKey texture_key = d3d12_texture.key();
++  GpuProfileAdd(GpuProfileCount::kTextureLoads);
++  GpuProfileAdd(GpuProfileCount::kTextureLoadBytes,
++                uint64_t(load_base ? texture.GetGuestBaseSize() : 0) +
++                    (load_mips ? texture.GetGuestMipsSize() : 0));
+ 
+   DeferredCommandList& command_list =
+       command_processor_.GetDeferredCommandList();
+diff --git a/src/xenia/gpu/d3d12/deferred_command_list.cc b/src/xenia/gpu/d3d12/deferred_command_list.cc
+index 5025827..b761f25 100644
+--- a/src/xenia/gpu/d3d12/deferred_command_list.cc
++++ b/src/xenia/gpu/d3d12/deferred_command_list.cc
+@@ -27,16 +27,19 @@ DeferredCommandList::DeferredCommandList(
+ 
+ void DeferredCommandList::Reset() { command_stream_.clear(); }
+ 
+-void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+-                                  ID3D12GraphicsCommandList1* command_list_1,
+-                                  ID3D12GraphicsCommandList2* command_list_2) {
++uint32_t DeferredCommandList::Execute(
++    ID3D12GraphicsCommandList* command_list,
++    ID3D12GraphicsCommandList1* command_list_1,
++    ID3D12GraphicsCommandList2* command_list_2) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   const uintmax_t* stream = (const uintmax_t*)command_stream_.data();
+   size_t stream_remaining = command_stream_.size() / sizeof(uintmax_t);
+   ID3D12PipelineState* current_pipeline_state = nullptr;
++  uint32_t command_count = 0;
+   while (stream_remaining != 0) {
++    ++command_count;
+     const CommandHeader& header =
+         *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+@@ -335,6 +338,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+     stream += header.arguments_size_elements;
+     stream_remaining -= header.arguments_size_elements;
+   }
++  return command_count;
+ }
+ 
+ void* DeferredCommandList::WriteCommand(Command command,
+diff --git a/src/xenia/gpu/d3d12/deferred_command_list.h b/src/xenia/gpu/d3d12/deferred_command_list.h
+index cca7b50..38d72cd 100644
+--- a/src/xenia/gpu/d3d12/deferred_command_list.h
++++ b/src/xenia/gpu/d3d12/deferred_command_list.h
+@@ -39,9 +39,10 @@ class DeferredCommandList {
+                       size_t initial_size_bytes = MAX_SIZEOF_COMMANDLIST);
+ 
+   void Reset();
+-  void Execute(ID3D12GraphicsCommandList* command_list,
+-               ID3D12GraphicsCommandList1* command_list_1,
+-               ID3D12GraphicsCommandList2* command_list_2);
++  // Returns the number of commands executed.
++  uint32_t Execute(ID3D12GraphicsCommandList* command_list,
++                   ID3D12GraphicsCommandList1* command_list_1,
++                   ID3D12GraphicsCommandList2* command_list_2);
+ 
+   D3D12_RECT* ClearDepthStencilViewAllocatedRects(
+       D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
+diff --git a/src/xenia/gpu/d3d12/pipeline_cache.cc b/src/xenia/gpu/d3d12/pipeline_cache.cc
+index 1758d8d..69b3275 100644
+--- a/src/xenia/gpu/d3d12/pipeline_cache.cc
++++ b/src/xenia/gpu/d3d12/pipeline_cache.cc
+@@ -32,6 +32,7 @@
+ #include "xenia/gpu/dxbc.h"
+ #include "xenia/gpu/dxbc_shader_translator.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/pipeline_util.h"
+ #include "xenia/gpu/registers.h"
+ #include "xenia/gpu/xenos.h"
+@@ -873,6 +874,7 @@ bool PipelineCache::ConfigurePipeline(
+ 
+   if (current_pipeline_ != nullptr &&
+       current_pipeline_->description.description == description) {
++    GpuProfileAdd(GpuProfileCount::kPipelinesSame);
+     *pipeline_handle_out = current_pipeline_;
+     *root_signature_out = current_pipeline_->description.root_signature;
+     return true;
+@@ -884,6 +886,7 @@ bool PipelineCache::ConfigurePipeline(
+   for (auto it = found_range.first; it != found_range.second; ++it) {
+     Pipeline* found_pipeline = it->second;
+     if (found_pipeline->description.description == description) {
++      GpuProfileAdd(GpuProfileCount::kPipelinesFound);
+       current_pipeline_ = found_pipeline;
+       *pipeline_handle_out = found_pipeline;
+       *root_signature_out = found_pipeline->description.root_signature;
+@@ -891,6 +894,7 @@ bool PipelineCache::ConfigurePipeline(
+     }
+   }
+ 
++  GpuProfileAdd(GpuProfileCount::kPipelinesNew);
+   Pipeline* new_pipeline = new Pipeline;
+   std::memcpy(&new_pipeline->description, &runtime_description,
+               sizeof(runtime_description));
+diff --git a/src/xenia/gpu/gpu_thread_stats.h b/src/xenia/gpu/gpu_thread_stats.h
+index 774f854..921c906 100644
+--- a/src/xenia/gpu/gpu_thread_stats.h
++++ b/src/xenia/gpu/gpu_thread_stats.h
+@@ -11,9 +11,11 @@
+ #define XENIA_GPU_GPU_THREAD_STATS_H_
+ 
+ #include <atomic>
++#include <cstddef>
+ #include <cstdint>
+ 
+ #include "xenia/base/clock.h"
++#include "xenia/base/platform.h"
+ 
+ namespace xe {
+ namespace gpu {
+@@ -99,6 +101,180 @@ class ScopedGpuThreadTicks {
+   uint64_t start_;
+ };
+ 
++// Profile of the GPU command thread (gpu_thread_profile): where its time
++// goes, in exclusive buckets that together cover all of it, and counts of
++// the work behind them. The command thread keeps them in plain variables
++// (GpuThreadProfiler, reached through gpu_thread_profiler, which is null on
++// every other thread and while profiling is off) and adds them to the shared
++// atomics below once per swap.
++enum class GpuProfileBucket : uint32_t {
++  kIdle,             // waiting for commands
++  kStream,           // packets, register and constant writes, small packets
++  kShaderLoads,      // IM_LOAD(_IMMEDIATE): hashing and looking up shaders
++  kSync,             // WAIT_REG_MEM waits, host GPU waits, guest interrupts
++  kDrawSetup,        // the rest of a draw, recording it included
++  kPrimitives,       // primitive processing (index conversion and caching)
++  kRenderTargets,    // render target cache updates (and transfers)
++  kPipeline,         // shader translations and pipeline lookup / creation
++  kTextures,         // texture cache: bindings, lookups, loads
++  kSystemConstants,  // system constant updates
++  kBindings,         // root signature, constant buffers, descriptors
++  kSharedMemory,     // vertex and memexport ranges, uploads from any caller
++  kResolves,         // EDRAM resolves
++  kSubmission,       // beginning and ending submissions (replay, execute)
++  kPresent,          // the swap, minus what it submits
++  kCount,
++};
++
++enum class GpuProfileCount : uint32_t {
++  kPrimaryBuffers,
++  kPackets,
++  kShaderLoads,
++  kInterrupts,
++  kDrawsEntered,    // draws (not resolves) IssueDraw was called for
++  kDrawsRecorded,   // and recorded
++  kDrawsNotReady,   // skipped while a pipeline was being created
++  kPipelinesSame,   // pipeline lookups: the current one again,
++  kPipelinesFound,  // found in the cache,
++  kPipelinesNew,    // created
++  kRootSignatures,  // root signature changes
++  kSubmissions,     // submissions ended
++  kReplayTicks,     // of them, replaying the deferred command list
++  kReplayCommands,  // deferred commands replayed
++  kExecuteTicks,    // closing, executing and signalling
++  kUploadRanges,    // shared memory upload ranges
++  kUploadBytes,
++  kTextureLoads,
++  kTextureLoadBytes,
++  kRenderTargetTransfers,
++  kResolves,
++  kCount,
++};
++
++constexpr size_t kGpuProfileBucketCount = size_t(GpuProfileBucket::kCount);
++constexpr size_t kGpuProfileCountCount = size_t(GpuProfileCount::kCount);
++
++// The profiler's clock: the time stamp counter where available (a read costs
++// about 10 ns, against 20-30 ns and a 100 ns resolution for the performance
++// counter), so the reader works out its frequency against the host clock.
++inline uint64_t GpuProfileTicks() {
++#if XE_ARCH_AMD64
++  return __rdtsc();
++#else
++  return Clock::QueryHostTickCount();
++#endif
++}
++
++struct GpuThreadProfile {
++  // Set while the command thread profiles.
++  std::atomic<bool> enabled{false};
++  // What switching buckets costs, measured when profiling starts, to take
++  // out of each entered bucket's time.
++  std::atomic<uint64_t> lap_cost_ticks{0};
++  std::atomic<uint64_t> ticks[kGpuProfileBucketCount] = {};
++  std::atomic<uint64_t> entries[kGpuProfileBucketCount] = {};
++  std::atomic<uint64_t> counts[kGpuProfileCountCount] = {};
++};
++
++inline GpuThreadProfile& gpu_thread_profile() {
++  static GpuThreadProfile profile;
++  return profile;
++}
++
++class GpuThreadProfiler {
++ public:
++  GpuThreadProfiler() : last_(GpuProfileTicks()) {}
++
++  GpuProfileBucket current() const { return current_; }
++  // Ends the current bucket's time and starts the next's.
++  void Lap(GpuProfileBucket next) {
++    const uint64_t now = GpuProfileTicks();
++    ticks_[size_t(current_)] += now - last_;
++    last_ = now;
++    current_ = next;
++    ++entries_[size_t(next)];
++  }
++  void Count(GpuProfileCount count, uint64_t amount = 1) {
++    counts_[size_t(count)] += amount;
++  }
++
++  // Measures a lap and publishes the cost.
++  void Calibrate() {
++    GpuThreadProfiler scratch;
++    constexpr uint32_t kLaps = 4096;
++    const uint64_t start = GpuProfileTicks();
++    for (uint32_t i = 0; i < kLaps; ++i) {
++      scratch.Lap(GpuProfileBucket(i & 1));
++    }
++    gpu_thread_profile().lap_cost_ticks.store(
++        (GpuProfileTicks() - start) / kLaps, std::memory_order_relaxed);
++  }
++
++  // Adds everything so far to the shared profile.
++  void Publish() {
++    const uint64_t now = GpuProfileTicks();
++    ticks_[size_t(current_)] += now - last_;
++    last_ = now;
++    GpuThreadProfile& profile = gpu_thread_profile();
++    for (size_t i = 0; i < kGpuProfileBucketCount; ++i) {
++      profile.ticks[i].fetch_add(ticks_[i], std::memory_order_relaxed);
++      profile.entries[i].fetch_add(entries_[i], std::memory_order_relaxed);
++      ticks_[i] = 0;
++      entries_[i] = 0;
++    }
++    for (size_t i = 0; i < kGpuProfileCountCount; ++i) {
++      profile.counts[i].fetch_add(counts_[i], std::memory_order_relaxed);
++      counts_[i] = 0;
++    }
++  }
++
++ private:
++  uint64_t last_;
++  GpuProfileBucket current_ = GpuProfileBucket::kStream;
++  uint64_t ticks_[kGpuProfileBucketCount] = {};
++  uint64_t entries_[kGpuProfileBucketCount] = {};
++  uint64_t counts_[kGpuProfileCountCount] = {};
++};
++
++// The command thread's profiler while it profiles, null otherwise and on
++// other threads (which may run some of the same code).
++inline thread_local GpuThreadProfiler* gpu_thread_profiler = nullptr;
++
++inline void GpuProfileLap(GpuProfileBucket bucket) {
++  if (GpuThreadProfiler* profiler = gpu_thread_profiler) {
++    profiler->Lap(bucket);
++  }
++}
++
++inline void GpuProfileAdd(GpuProfileCount count, uint64_t amount = 1) {
++  if (GpuThreadProfiler* profiler = gpu_thread_profiler) {
++    profiler->Count(count, amount);
++  }
++}
++
++// Times its scope into a bucket, then returns to the one it interrupted.
++class GpuProfileZone {
++ public:
++  explicit GpuProfileZone(GpuProfileBucket bucket)
++      : profiler_(gpu_thread_profiler) {
++    if (profiler_) {
++      interrupted_ = profiler_->current();
++      profiler_->Lap(bucket);
++    }
++  }
++  ~GpuProfileZone() {
++    if (profiler_) {
++      profiler_->Lap(interrupted_);
++    }
++  }
++  GpuProfileZone(const GpuProfileZone&) = delete;
++  GpuProfileZone& operator=(const GpuProfileZone&) = delete;
++
++ private:
++  GpuThreadProfiler* profiler_;
++  GpuProfileBucket interrupted_ = GpuProfileBucket::kStream;
++};
++
+ }  // namespace gpu
+ }  // namespace xe
+ 
+diff --git a/src/xenia/gpu/pm4_command_processor_implement.h b/src/xenia/gpu/pm4_command_processor_implement.h
+index 260cea0..f429207 100644
+--- a/src/xenia/gpu/pm4_command_processor_implement.h
++++ b/src/xenia/gpu/pm4_command_processor_implement.h
+@@ -22,7 +22,9 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
+     // chiplets l3
+     reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(
+         COMMAND_PROCESSOR::GetCurrentRingReadCount());
++    uint32_t packets = 0;
+     do {
++      ++packets;
+       if (COMMAND_PROCESSOR::ExecutePacket()) {
+         continue;
+       } else {
+@@ -32,6 +34,7 @@ void COMMAND_PROCESSOR::ExecuteIndirectBuffer(uint32_t ptr,
+         break;
+       }
+     } while (reader_.read_count());
++    GpuProfileAdd(GpuProfileCount::kPackets, packets);
+ 
+     trace_writer_.WriteIndirectBufferEnd();
+     reader_ = old_reader;
+@@ -640,6 +643,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
+ 
+   // generate interrupt from the command stream
+   uint32_t cpu_mask = reader_.ReadAndSwap<uint32_t>();
++  GpuProfileZone profile_zone(GpuProfileBucket::kSync);
++  GpuProfileAdd(GpuProfileCount::kInterrupts);
+   for (int n = 0; n < 6; n++) {
+     if (cpu_mask & (1 << n)) {
+       graphics_system_->DispatchInterruptCallback(1, n);
+@@ -669,10 +674,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
+ 
+   {
+     ScopedGpuThreadTicks swap_ticks(gpu_thread_stats().swap_ticks);
++    GpuProfileZone profile_zone(GpuProfileBucket::kPresent);
+     COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
+                                  frontbuffer_height);
+   }
+   gpu_thread_stats().swaps.fetch_add(1, std::memory_order_relaxed);
++  if (thread_profiler_) {
++    thread_profiler_->Publish();
++  }
++  UpdateThreadProfiler();
+ 
+   ++counter_;
+   return true;
+@@ -728,6 +738,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+   bool matched = false;
+   // Host ticks when the first poll didn't match.
+   uint64_t wait_start = 0;
++  // The profile bucket to return to after waiting.
++  GpuProfileBucket interrupted_bucket = GpuProfileBucket::kStream;
+ 
+   do {
+     uint32_t value = value_ref;
+@@ -749,6 +761,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+         wait_start = Clock::QueryHostTickCount();
+         gpu_thread_stats().wait_reg_mem_waits.fetch_add(
+             1, std::memory_order_relaxed);
++        if (gpu_thread_profiler) {
++          interrupted_bucket = gpu_thread_profiler->current();
++          gpu_thread_profiler->Lap(GpuProfileBucket::kSync);
++        }
+       }
+       // Wait.
+       if (wait >= 0x100) {
+@@ -763,6 +779,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+ 
+         if (!worker_running_) {
+           // Short-circuited exit.
++          GpuProfileLap(interrupted_bucket);
+           return false;
+         }
+       } else {
+@@ -773,6 +790,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+   if (wait_start) {
+     gpu_thread_stats().wait_reg_mem_ticks.fetch_add(
+         Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
++    GpuProfileLap(interrupted_bucket);
+   }
+   return true;
+ }
+@@ -1296,6 +1314,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD(uint32_t packet,
+   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
+   assert_true(start == 0);
+   trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
++  GpuProfileZone profile_zone(GpuProfileBucket::kShaderLoads);
++  GpuProfileAdd(GpuProfileCount::kShaderLoads);
+   auto shader = COMMAND_PROCESSOR::LoadShader(
+       shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
+       size_dwords);
+@@ -1327,6 +1347,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_IM_LOAD_IMMEDIATE(
+   assert_true(start == 0);
+   assert_true(reader_.read_count() >= size_dwords * 4);
+   assert_true(count - 2 >= size_dwords);
++  GpuProfileZone profile_zone(GpuProfileBucket::kShaderLoads);
++  GpuProfileAdd(GpuProfileCount::kShaderLoads);
+   auto shader = COMMAND_PROCESSOR::LoadShader(
+       shader_type, uint32_t(reader_.read_ptr()),
+       reinterpret_cast<uint32_t*>(reader_.read_ptr()), size_dwords);
+@@ -1433,7 +1455,9 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
+   // chiplets l3
+   reader_.BeginPrefetchedRead<swcache::PrefetchTag::Level2>(
+       GetCurrentRingReadCount());
++  uint32_t packets = 0;
+   do {
++    ++packets;
+     if (!COMMAND_PROCESSOR::ExecutePacket()) {
+       // This probably should be fatal - but we're going to continue anyways.
+       XELOGE("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+@@ -1441,6 +1465,8 @@ uint32_t COMMAND_PROCESSOR::ExecutePrimaryBuffer(uint32_t read_index,
+       break;
+     }
+   } while (reader_.read_count());
++  GpuProfileAdd(GpuProfileCount::kPackets, packets);
++  GpuProfileAdd(GpuProfileCount::kPrimaryBuffers);
+ 
+   COMMAND_PROCESSOR::OnPrimaryBufferEnd();
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 9d443b7..4528aac 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -74,6 +74,118 @@ std::atomic<uint32_t> main_thread_id{0};
+ // Guest thread ID of the render thread; 0 until it presents.
+ std::atomic<uint32_t> render_thread_id{0};
+ 
++// gpu_thread_profile: the GPU command thread's time by kind, per frame and
++// per draw, and the work behind it. swaps = the frames in the interval.
++void LogGpuProfile(double seconds, uint32_t swaps) {
++  using gpu::GpuProfileBucket;
++  using gpu::GpuProfileCount;
++  gpu::GpuThreadProfile& p = gpu::gpu_thread_profile();
++  // The profiler's clock (the time stamp counter) against the host clock.
++  static uint64_t last_profile_ticks = 0;
++  const uint64_t profile_ticks = gpu::GpuProfileTicks();
++  const double tick_frequency =
++      double(profile_ticks - last_profile_ticks) / seconds;
++  const bool clock_known = last_profile_ticks != 0;
++  last_profile_ticks = profile_ticks;
++  // Each entry into a bucket carries about one lap of the profiler's own
++  // time: take it out.
++  const uint64_t lap_cost = p.lap_cost_ticks.load(std::memory_order_relaxed);
++  double ticks[gpu::kGpuProfileBucketCount];
++  uint64_t entries = 0;
++  for (size_t i = 0; i < gpu::kGpuProfileBucketCount; ++i) {
++    const uint64_t bucket_entries = p.entries[i].exchange(0);
++    const uint64_t cost = bucket_entries * lap_cost;
++    const uint64_t bucket_ticks = p.ticks[i].exchange(0);
++    ticks[i] = double(bucket_ticks > cost ? bucket_ticks - cost : 0);
++    entries += bucket_entries;
++  }
++  double counts[gpu::kGpuProfileCountCount];
++  for (size_t i = 0; i < gpu::kGpuProfileCountCount; ++i) {
++    counts[i] = double(p.counts[i].exchange(0));
++  }
++  if (!p.enabled.load(std::memory_order_relaxed) || !clock_known || !swaps ||
++      tick_frequency <= 0.0) {
++    return;
++  }
++  const double frames = double(swaps);
++  const auto count = [&](GpuProfileCount c) {
++    return counts[size_t(c)] / frames;
++  };
++  // Milliseconds per frame.
++  const auto ms = [&](double bucket_ticks) {
++    return bucket_ticks * 1000.0 / tick_frequency / frames;
++  };
++  const auto bucket = [&](GpuProfileBucket b) { return ticks[size_t(b)]; };
++  const GpuProfileBucket draw_buckets[] = {
++      GpuProfileBucket::kDrawSetup,     GpuProfileBucket::kPrimitives,
++      GpuProfileBucket::kRenderTargets, GpuProfileBucket::kPipeline,
++      GpuProfileBucket::kTextures,      GpuProfileBucket::kSystemConstants,
++      GpuProfileBucket::kBindings,      GpuProfileBucket::kSharedMemory};
++  double draw_ticks = 0.0;
++  for (GpuProfileBucket b : draw_buckets) {
++    draw_ticks += bucket(b);
++  }
++  double busy_ticks = 0.0;
++  for (size_t i = 0; i < gpu::kGpuProfileBucketCount; ++i) {
++    if (i != size_t(GpuProfileBucket::kIdle)) {
++      busy_ticks += ticks[i];
++    }
++  }
++  // Microseconds per draw entered.
++  const double draws = counts[size_t(GpuProfileCount::kDrawsEntered)];
++  const auto us_per_draw = [&](GpuProfileBucket b) {
++    return draws ? bucket(b) * 1000000.0 / tick_frequency / draws : 0.0;
++  };
++  const double submissions = counts[size_t(GpuProfileCount::kSubmissions)];
++  XELOGI(
++      "Halo 3 GPU profile: {:.0f} draws/frame ({:.0f} recorded, {:.1f} "
++      "waiting for a pipeline), {:.1f} resolves; ms/frame: busy {:.2f} = "
++      "stream {:.2f} ({:.0f} packets in {:.1f} buffers), shader loads {:.2f} "
++      "({:.0f}), sync {:.2f} ({:.1f} interrupts), draws {:.2f}, resolves "
++      "{:.2f}, submissions {:.2f} ({:.1f}; replaying {:.2f} for {:.0f} "
++      "commands, executing {:.2f}), present {:.2f}; idle {:.2f}; us/draw: "
++      "setup {:.2f}, primitives {:.2f}, render targets {:.2f}, pipeline "
++      "{:.2f}, textures {:.2f}, system constants {:.2f}, bindings {:.2f}, "
++      "shared memory {:.2f}; per frame: pipelines {:.0f} same, {:.1f} found, "
++      "{:.2f} new, {:.1f} root signatures, {:.1f} uploads {:.0f} KB, {:.1f} "
++      "texture loads {:.0f} KB, {:.1f} render target transfers; profiler "
++      "{:.1f} ns a lap, {:.1f}% of the time (taken out)",
++      count(GpuProfileCount::kDrawsEntered),
++      count(GpuProfileCount::kDrawsRecorded),
++      count(GpuProfileCount::kDrawsNotReady), count(GpuProfileCount::kResolves),
++      ms(busy_ticks), ms(bucket(GpuProfileBucket::kStream)),
++      count(GpuProfileCount::kPackets), count(GpuProfileCount::kPrimaryBuffers),
++      ms(bucket(GpuProfileBucket::kShaderLoads)),
++      count(GpuProfileCount::kShaderLoads), ms(bucket(GpuProfileBucket::kSync)),
++      count(GpuProfileCount::kInterrupts), ms(draw_ticks),
++      ms(bucket(GpuProfileBucket::kResolves)),
++      ms(bucket(GpuProfileBucket::kSubmission)), submissions / frames,
++      ms(counts[size_t(GpuProfileCount::kReplayTicks)]),
++      count(GpuProfileCount::kReplayCommands),
++      ms(counts[size_t(GpuProfileCount::kExecuteTicks)]),
++      ms(bucket(GpuProfileBucket::kPresent)),
++      ms(bucket(GpuProfileBucket::kIdle)),
++      us_per_draw(GpuProfileBucket::kDrawSetup),
++      us_per_draw(GpuProfileBucket::kPrimitives),
++      us_per_draw(GpuProfileBucket::kRenderTargets),
++      us_per_draw(GpuProfileBucket::kPipeline),
++      us_per_draw(GpuProfileBucket::kTextures),
++      us_per_draw(GpuProfileBucket::kSystemConstants),
++      us_per_draw(GpuProfileBucket::kBindings),
++      us_per_draw(GpuProfileBucket::kSharedMemory),
++      count(GpuProfileCount::kPipelinesSame),
++      count(GpuProfileCount::kPipelinesFound),
++      count(GpuProfileCount::kPipelinesNew),
++      count(GpuProfileCount::kRootSignatures),
++      count(GpuProfileCount::kUploadRanges),
++      count(GpuProfileCount::kUploadBytes) / 1024.0,
++      count(GpuProfileCount::kTextureLoads),
++      count(GpuProfileCount::kTextureLoadBytes) / 1024.0,
++      count(GpuProfileCount::kRenderTargetTransfers),
++      double(lap_cost) * 1000000000.0 / tick_frequency,
++      double(entries * lap_cost) * 100.0 / (tick_frequency * seconds));
++}
++
+ void LogStats() {
+   static uint64_t last = 0;
+   const uint64_t now = Clock::QueryHostTickCount();
+@@ -261,6 +373,7 @@ void LogStats() {
+       g.small_readbacks_queued.exchange(0), delivered,
+       delivered ? double(latency) / delivered : 0.0,
+       g.small_readbacks_skipped.exchange(0));
++  LogGpuProfile(seconds, swaps);
+   // The presenter's present thread (host_present_thread), busy in percent of
+   // the interval, and the guest output images the presents have published:
+   // those replaced before any paint took them weren't displayed.

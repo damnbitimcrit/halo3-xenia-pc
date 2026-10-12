@@ -1,0 +1,165 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Kernel] Install title-specific guest hooks while the title
+ loads
+
+KernelState::FinishLoadingUserModule now lets per-title code register guest
+hooks after patch files are applied and before any title code runs.
+---
+ src/xenia/kernel/kernel_state.cc      | 13 +++++
+ src/xenia/kernel/title/title_hooks.cc | 68 +++++++++++++++++++++++++++
+ src/xenia/kernel/title/title_hooks.h  | 36 ++++++++++++++
+ 3 files changed, 117 insertions(+)
+ create mode 100644 src/xenia/kernel/title/title_hooks.cc
+ create mode 100644 src/xenia/kernel/title/title_hooks.h
+
+diff --git a/src/xenia/kernel/kernel_state.cc b/src/xenia/kernel/kernel_state.cc
+index e502008..8d07df6 100644
+--- a/src/xenia/kernel/kernel_state.cc
++++ b/src/xenia/kernel/kernel_state.cc
+@@ -13,8 +13,10 @@
+ 
+ #include "xenia/base/byte_stream.h"
+ #include "xenia/base/logging.h"
++#include "xenia/cpu/guest_hooks.h"
+ #include "xenia/emulator.h"
+ #include "xenia/hid/input_system.h"
++#include "xenia/kernel/title/title_hooks.h"
+ #include "xenia/kernel/user_module.h"
+ #include "xenia/kernel/util/shim_utils.h"
+ #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
+@@ -658,6 +660,17 @@ X_RESULT KernelState::FinishLoadingUserModule(
+   emulator_->patcher()->ApplyPatchesForTitle(memory_, module->title_id(),
+                                              module->hash());
+   emulator_->on_patch_apply();
++  // Only the title's executable, not the DLLs it loads later (those carry the
++  // title flag too and would replace the title's hooks).
++  if (module->is_executable() && !module->is_dll_module()) {
++    // Title-specific guest hooks must be registered before any of the title's
++    // code is translated.
++    auto& guest_hooks = cpu::GuestHooks::Get();
++    guest_hooks.Unfreeze();
++    guest_hooks.SetActive(false);
++    title::InstallTitleHooks(this, module.get());
++    guest_hooks.Freeze();
++  }
+   if (module->xex_module()) {
+     module->xex_module()->Precompile();
+   }
+diff --git a/src/xenia/kernel/title/title_hooks.cc b/src/xenia/kernel/title/title_hooks.cc
+new file mode 100644
+index 0000000..d091fb3
+--- /dev/null
++++ b/src/xenia/kernel/title/title_hooks.cc
+@@ -0,0 +1,68 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/kernel/title/title_hooks.h"
++
++#include "xenia/base/byte_order.h"
++#include "xenia/base/logging.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++#include "xenia/kernel/user_module.h"
++#include "xenia/memory.h"
++
++namespace xe {
++namespace kernel {
++namespace title {
++
++void InstallTitleHooks(KernelState* kernel_state, UserModule* module) {
++  if (!module->is_executable() || module->is_dll_module()) {
++    return;
++  }
++  const uint64_t hash = module->hash().value_or(0);
++  switch (module->title_id()) {
++    case halo3::kTitleId:
++      if (hash == halo3::kModuleHash) {
++        halo3::Install(kernel_state, module);
++        cpu::GuestHooks::Get().SetActive(true);
++      } else {
++        XELOGW("Halo 3: unsupported default.xex (hash {:016X}); hooks disabled",
++               hash);
++      }
++      break;
++    default:
++      break;
++  }
++}
++
++bool PatchGuestWord(Memory* memory, uint32_t address, uint32_t expected,
++                    uint32_t value) {
++  BaseHeap* heap = memory->LookupHeap(address);
++  if (!heap) {
++    XELOGE("PatchGuestWord: no heap for {:08X}", address);
++    return false;
++  }
++  auto ptr = memory->TranslateVirtual<xe::be<uint32_t>*>(address);
++  const uint32_t current = *ptr;
++  if (current != expected) {
++    XELOGE("PatchGuestWord: {:08X} holds {:08X}, expected {:08X}; skipped",
++           address, current, expected);
++    return false;
++  }
++  uint32_t old_protect = 0;
++  heap->QueryProtect(address, &old_protect);
++  heap->Protect(address, 4, kMemoryProtectRead | kMemoryProtectWrite);
++  *ptr = value;
++  heap->Protect(address, 4, old_protect);
++  XELOGI("PatchGuestWord: {:08X} {:08X} -> {:08X}", address, expected, value);
++  return true;
++}
++
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
+diff --git a/src/xenia/kernel/title/title_hooks.h b/src/xenia/kernel/title/title_hooks.h
+new file mode 100644
+index 0000000..2ab5bf7
+--- /dev/null
++++ b/src/xenia/kernel/title/title_hooks.h
+@@ -0,0 +1,36 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_KERNEL_TITLE_TITLE_HOOKS_H_
++#define XENIA_KERNEL_TITLE_TITLE_HOOKS_H_
++
++#include <cstdint>
++
++namespace xe {
++class Memory;
++namespace kernel {
++class KernelState;
++class UserModule;
++namespace title {
++
++// Installs title-specific guest hooks and code patches for the title
++// executable. Called while the module is loading, after patch files are
++// applied and before any of its code is translated or run.
++void InstallTitleHooks(KernelState* kernel_state, UserModule* module);
++
++// Replaces the big-endian word at a guest code address if it still holds the
++// expected original value, so a patch can never land on a different build.
++bool PatchGuestWord(Memory* memory, uint32_t address, uint32_t expected,
++                    uint32_t value);
++
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
++
++#endif  // XENIA_KERNEL_TITLE_TITLE_HOOKS_H_

@@ -1,0 +1,179 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Log what can click while the audio output stays full
+
+A hook in the game's XAudio where an XMA voice's 256-sample frame is
+short of decoded samples and gets padded with zeros (826CE290 in
+sub_826CDF58, reached by fall-through only from the check that it is
+short) tells apart a voice cut mid-sound (no end of stream submitted, a
+click unless its last sample was near 0, with the size of that step and
+whether its context still had input queued), the end of a sound, and an
+empty frame (normal on a voice's first pass).
+
+A "Halo 3 audio sources" line every 5 s shows these with the XMA decoder's
+stream resets and split frames and the XAudio2 engine's glitches.
+---
+ src/xenia/kernel/title/halo3/halo3.cc | 92 +++++++++++++++++++++++++++
+ src/xenia/kernel/title/halo3/halo3.h  | 17 +++++
+ 2 files changed, 109 insertions(+)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 527a254..9d443b7 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -9,6 +9,9 @@
+ 
+ #include "xenia/kernel/title/halo3/halo3.h"
+ 
++#include <algorithm>
++#include <cmath>
++
+ #include "xenia/apu/audio_stats.h"
+ #include "xenia/base/byte_order.h"
+ #include "xenia/base/clock.h"
+@@ -48,6 +51,20 @@ constexpr uint64_t kStatsIntervalSeconds = 5;
+ // from the GPU (`lhz r3` at 8216B538; only reached by fall-through, with auto
+ // exposure on), and the point all three paths reach with the clamped target
+ // in f13, the area's range in f29 / f28 and the exposure at r30 + 0xC.
++// The game's XAudio, per XMA voice and pass (sub_826CDF58): after taking
++// what the context's output ring had, `cmplwi cr6, r29, 0` before zeroing the
++// rest of the 256-sample frame, reached by fall-through only from the check
++// that it is short. r10 = samples missing, r11 = samples filled, r29 =
++// channels, r30 = the sample rate converter state (+0x14: float frame,
++// channels 0x400 bytes apart), r31 = the voice, r27 = the context index.
++constexpr uint32_t kVoiceFrameShort = 0x826CE290;
++constexpr uint32_t kVoiceFlags = 0xAC;  // u8
++constexpr uint8_t kVoiceFlagEndOfStream = 0x08;
++constexpr uint32_t kVoiceXmaContexts = 0xB8;  // -> +8: local copies
++constexpr uint32_t kXmaContextCopySize = 0x60;
++constexpr uint32_t kSrcFrame = 0x14;
++constexpr uint32_t kSrcChannelStride = 0x400;
++
+ constexpr uint32_t kExposureReadback = 0x8216B53C;
+ constexpr uint32_t kExposureTarget = 0x8216B5AC;
+ constexpr uint32_t kExposureCurrent = 0xC;
+@@ -190,6 +207,24 @@ void LogStats() {
+       a.slow_pumps.exchange(0), a.slowest_pump_us.exchange(0) / 1000.0,
+       a.underruns.exchange(0), a.hard_underruns.exchange(0),
+       a.resumes.exchange(0), min_queued == UINT32_MAX ? 0 : min_queued);
++  // What can click without the output running dry: the game's voices cut
++  // short, the XMA decoder's stream resets and split frames, and the XAudio2
++  // engine's own glitches.
++  XELOGI(
++      "Halo 3 audio sources: voices cut short mid-sound {} times ({} "
++      "audible, largest step {:.4f}; {} with XMA input queued), {} at a "
++      "sound's end, {} empty frames ({} with XMA input queued); XMA: {} "
++      "clears, {} new streams by work buffer ({} cut a frame short), {} "
++      "split frames dropped, {} waits for the next buffer mid-frame; XAudio2 "
++      "engine glitches {}",
++      s.voice_cuts.exchange(0), s.voice_cuts_audible.exchange(0),
++      s.voice_cut_largest.exchange(0) / 10000.0,
++      s.voice_cuts_with_input.exchange(0), s.voice_ends.exchange(0),
++      s.voice_empty_frames.exchange(0),
++      s.voice_empty_frames_with_input.exchange(0), a.xma_clears.exchange(0),
++      a.xma_work_buffer_resets.exchange(0), a.xma_reset_drops.exchange(0),
++      a.xma_split_header_drops.exchange(0), a.xma_split_body_waits.exchange(0),
++      a.engine_glitches.exchange(0));
+   // The GPU command processor thread, in percent of the interval. Executing
+   // includes the swaps, which include the presents, and the waits for the
+   // host GPU and for guest memory (WAIT_REG_MEM). The presents paint the
+@@ -247,6 +282,62 @@ void LogStats() {
+       g.guest_output_replaced.exchange(0) / seconds);
+ }
+ 
++void OnVoiceFrameShort(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_log_stats) {
++    return;
++  }
++  Stats& s = stats();
++  const uint32_t voice = static_cast<uint32_t>(ctx->r[31]);
++  // The voice's local copy of the context: input buffer 0 / 1 valid in bits
++  // 20 / 21 of its first word.
++  const uint32_t contexts = xe::load_and_swap<uint32_t>(
++      ctx->TranslateVirtual(xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(
++                                voice + kVoiceXmaContexts)) +
++                            8));
++  const uint32_t context_word =
++      xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(
++          contexts + static_cast<uint32_t>(ctx->r[27]) * kXmaContextCopySize));
++  const bool input_queued = ((context_word >> 20) & 3) != 0;
++  const uint32_t filled = static_cast<uint32_t>(ctx->r[11]);
++  if (!filled) {
++    s.voice_empty_frames.fetch_add(1, std::memory_order_relaxed);
++    if (input_queued) {
++      s.voice_empty_frames_with_input.fetch_add(1, std::memory_order_relaxed);
++    }
++    return;
++  }
++  if (*ctx->TranslateVirtual<uint8_t*>(voice + kVoiceFlags) &
++      kVoiceFlagEndOfStream) {
++    s.voice_ends.fetch_add(1, std::memory_order_relaxed);
++    return;
++  }
++  s.voice_cuts.fetch_add(1, std::memory_order_relaxed);
++  if (input_queued) {
++    s.voice_cuts_with_input.fetch_add(1, std::memory_order_relaxed);
++  }
++  // The step to the zeros: the last sample written, in any channel.
++  const uint32_t frame = xe::load_and_swap<uint32_t>(
++      ctx->TranslateVirtual(static_cast<uint32_t>(ctx->r[30]) + kSrcFrame));
++  const uint32_t channels = static_cast<uint32_t>(ctx->r[29]);
++  float step = 0.0f;
++  for (uint32_t channel = 0; channel < channels; ++channel) {
++    step = std::max(
++        step, std::abs(xe::load_and_swap<float>(
++                  ctx->TranslateVirtual(frame + channel * kSrcChannelStride +
++                                        (filled - 1) * sizeof(float)))));
++  }
++  if (step > 0.02f) {
++    s.voice_cuts_audible.fetch_add(1, std::memory_order_relaxed);
++  }
++  const uint32_t step_units =
++      static_cast<uint32_t>(std::min(step, 100.0f) * 10000.0f);
++  uint32_t largest = s.voice_cut_largest.load(std::memory_order_relaxed);
++  while (step_units > largest &&
++         !s.voice_cut_largest.compare_exchange_weak(
++             largest, step_units, std::memory_order_relaxed)) {
++  }
++}
++
+ void OnExposureReadback(cpu::ppc::PPCContext* ctx, void*) {
+   if (!cvars::halo3_log_stats) {
+     return;
+@@ -313,6 +404,7 @@ void Install(KernelState* kernel_state, UserModule* module) {
+   auto processor = kernel_state->processor();
+   hooks.Add(processor, kMainLoopBodyEntry, OnMainLoopBodyEntry);
+   hooks.Add(processor, kExposureReadback, OnExposureReadback);
++  hooks.Add(processor, kVoiceFrameShort, OnVoiceFrameShort);
+   hooks.Add(processor, kExposureTarget, OnExposureTarget);
+ }
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index ea212f7..b3ddd91 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -125,6 +125,23 @@ struct Stats {
+   // for a later vblank (each of those makes the GPU wait for that vblank).
+   std::atomic<uint32_t> flips_immediate{0};
+   std::atomic<uint32_t> flips_deferred{0};
++  // The game's XAudio (its XMA voices): frames of a voice that ran short of
++  // decoded samples and were filled up with zeros. Mid-sound (no end of
++  // stream submitted) is a cut, a click if the last sample wasn't near 0:
++  // cuts, those stepping from more than 0.02 of full scale, the largest step
++  // (in 1/10000 of full scale), and cuts while the voice's XMA context had
++  // input queued (the decoder fell short, not the game's streaming). At a
++  // sound's end the frame is only padded, and an empty frame is normal for a
++  // voice's first pass after it starts; empty frames while input is queued
++  // beyond that (about 190 a second for each voice) mean a voice the decoder
++  // doesn't feed, a sound that doesn't play.
++  std::atomic<uint32_t> voice_cuts{0};
++  std::atomic<uint32_t> voice_cuts_audible{0};
++  std::atomic<uint32_t> voice_cut_largest{0};
++  std::atomic<uint32_t> voice_cuts_with_input{0};
++  std::atomic<uint32_t> voice_ends{0};
++  std::atomic<uint32_t> voice_empty_frames{0};
++  std::atomic<uint32_t> voice_empty_frames_with_input{0};
+ };
+ Stats& stats();
+ 

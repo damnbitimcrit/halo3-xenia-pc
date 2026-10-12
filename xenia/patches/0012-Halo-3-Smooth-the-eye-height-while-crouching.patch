@@ -1,0 +1,129 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Smooth the eye height while crouching
+
+The first-person eye height follows the biped's crouch amount
+(unit + 0x370), which the biped update moves once per tick
+(sub_82390550), so the camera stepped down and up at 30 Hz. It is now
+blended with the biped's position and restored with it.
+---
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 30 +++++++++++++++-----
+ 1 file changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 99f3618..2055b00 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -94,11 +94,15 @@ constexpr uint32_t kDataArrayInUseBits = 0x48;
+ // Object header, 0x10 bytes per object.
+ constexpr uint32_t kObjectHeaderSize = 0x10;
+ constexpr uint32_t kObjectHeaderSalt = 0x0;
++constexpr uint32_t kObjectHeaderType = 0x3;  // u8, 0 = biped
+ constexpr uint32_t kObjectHeaderAddress = 0xC;
+ // Object data.
+ constexpr uint32_t kObjectPosition = 0x54;
+ constexpr uint32_t kObjectForward = 0x60;
+ constexpr uint32_t kObjectUp = 0x6C;
++// Bipeds: crouch amount (0-1, moved per tick by sub_82390550), which sets
++// the first-person eye height.
++constexpr uint32_t kBipedCrouch = 0x370;
+ constexpr uint32_t kObjectNodeMatricesSize = 0x13A;    // bytes
+ constexpr uint32_t kObjectNodeMatricesOffset = 0x13C;  // from the object
+ constexpr uint32_t kMatrixSize = 0x34;                 // real_matrix4x3
+@@ -151,6 +155,7 @@ struct ObjectTransform {
+   Vector3 position;
+   Vector3 forward;
+   Vector3 up;
++  float crouch = 0.0f;  // bipeds only
+ };
+ 
+ struct ObjectSnapshot {
+@@ -159,6 +164,7 @@ struct ObjectSnapshot {
+   uint16_t nodes_size = 0;
+   uint16_t nodes_offset = 0;
+   uint32_t node_count = 0;
++  bool biped = false;
+   bool has_previous = false;
+   bool moved = false;
+   bool applied = false;
+@@ -213,6 +219,9 @@ uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
+ void StoreU32(cpu::ppc::PPCContext* ctx, uint32_t address, uint32_t value) {
+   xe::store_and_swap<uint32_t>(ctx->TranslateVirtual(address), value);
+ }
++uint8_t LoadU8(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return *ctx->TranslateVirtual<uint8_t*>(address);
++}
+ uint16_t LoadU16(cpu::ppc::PPCContext* ctx, uint32_t address) {
+   return xe::load_and_swap<uint16_t>(ctx->TranslateVirtual(address));
+ }
+@@ -293,16 +302,21 @@ float BlendFactor(cpu::ppc::PPCContext* ctx) {
+ 
+ // Objects.
+ 
+-ObjectTransform LoadTransform(cpu::ppc::PPCContext* ctx, uint32_t object) {
++ObjectTransform LoadTransform(cpu::ppc::PPCContext* ctx, uint32_t object,
++                              bool biped) {
+   return {LoadVector3(ctx, object + kObjectPosition),
+           LoadVector3(ctx, object + kObjectForward),
+-          LoadVector3(ctx, object + kObjectUp)};
++          LoadVector3(ctx, object + kObjectUp),
++          biped ? LoadF32(ctx, object + kBipedCrouch) : 0.0f};
+ }
+ void StoreTransform(cpu::ppc::PPCContext* ctx, uint32_t object,
+-                    const ObjectTransform& t) {
++                    const ObjectTransform& t, bool biped) {
+   StoreVector3(ctx, object + kObjectPosition, t.position);
+   StoreVector3(ctx, object + kObjectForward, t.forward);
+   StoreVector3(ctx, object + kObjectUp, t.up);
++  if (biped) {
++    StoreF32(ctx, object + kBipedCrouch, t.crouch);
++  }
+ }
+ 
+ bool IsUnitVector(const Vector3& v) {
+@@ -314,6 +328,7 @@ ObjectTransform BlendTransform(const ObjectTransform& a,
+                                const ObjectTransform& b, float t) {
+   ObjectTransform r;
+   r.position = Lerp(a.position, b.position, t);
++  r.crouch = a.crouch + (b.crouch - a.crouch) * t;
+   const bool turned = !SameBits(a.forward, b.forward) || !SameBits(a.up, b.up);
+   if (turned && IsUnitVector(a.forward) && IsUnitVector(a.up) &&
+       IsUnitVector(b.forward) && IsUnitVector(b.up)) {
+@@ -406,7 +421,8 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+       o.node_count = node_count;
+     }
+     LoadNodes(ctx, address + nodes_offset, node_count, o.current_nodes);
+-    o.current = LoadTransform(ctx, address);
++    o.biped = LoadU8(ctx, header + kObjectHeaderType) == 0;
++    o.current = LoadTransform(ctx, address, o.biped);
+ 
+     // Position is relative to the parent for attached objects (held weapons,
+     // passengers); the root node is in world space, so check both.
+@@ -448,7 +464,7 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+     for (uint32_t n = 0; n < o.node_count; ++n) {
+       StoreMatrix(ctx, nodes + n * kMatrixSize, o.written_nodes[n]);
+     }
+-    StoreTransform(ctx, o.address, o.written);
++    StoreTransform(ctx, o.address, o.written, o.biped);
+     o.applied = true;
+     stats().blended_objects++;
+   }
+@@ -471,7 +487,7 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+       continue;
+     }
+     const uint32_t nodes = o.address + o.nodes_offset;
+-    if (!SameBits(LoadTransform(ctx, o.address), o.written) ||
++    if (!SameBits(LoadTransform(ctx, o.address, o.biped), o.written) ||
+         !SameBits(LoadNodes(ctx, nodes, o.node_count, guest_nodes),
+                   o.written_nodes)) {
+       // Changed since we blended it: keep that, and don't blend from the old
+@@ -483,7 +499,7 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+     for (uint32_t n = 0; n < o.node_count; ++n) {
+       StoreMatrix(ctx, nodes + n * kMatrixSize, o.current_nodes[n]);
+     }
+-    StoreTransform(ctx, o.address, o.current);
++    StoreTransform(ctx, o.address, o.current, o.biped);
+   }
+ }
+ 

@@ -1,0 +1,227 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [APU] Exact audio pump interval; bound the output queue
+
+The output queue, and with it the audio delay, grew by about one frame
+every 80 seconds (about 0.75 frames a minute, +176 ms after 40 minutes,
+up to the 64-frame cap of 341 ms). The pump interval is 5333 us, but a
+256-sample frame at 48 kHz is 5333.33 us: the game was asked for frames
+62.5 ppm faster than they play.
+
+- apu_exact_pump_interval (default on): every third interval is 5334 us,
+  16000 us per three frames, exact.
+- apu_target_queued_frames (default 9): the level catch-up refills the
+  queue to, instead of apu_prebuffer_frames (3). The fast cadence used
+  to build a cushion by accident (up to 33 frames), and that cushion
+  carried map loads, where the game's audio callbacks take 17-44 ms (up
+  to 8.3 frames); loads that started with 3-9 frames queued ran dry
+  about twice. With the exact interval nothing else fills the queue, so
+  catch-up keeps 9 frames (48 ms) instead.
+- apu_max_queued_frames (default 8): while the driver reports more than
+  apu_target_queued_frames plus this many frames queued, a regular request
+  is skipped and its output slot given back, so device clock drift can't
+  grow the delay either. Only with a driver that reports its queue (XAudio2
+  with apu_prebuffer_frames); 0 disables it.
+- XAudio2's QueuedFrames no longer takes the driver's lock (the held count
+  is atomic), so XAudio2's thread failing its try-lock again means a frame
+  is being submitted.
+- The skips are counted in the Halo 3 audio line.
+---
+ src/xenia/apu/apu_flags.cc                    | 21 +++++++++++++
+ src/xenia/apu/apu_flags.h                     |  3 ++
+ src/xenia/apu/audio_stats.h                   |  2 ++
+ src/xenia/apu/audio_system.cc                 | 31 ++++++++++++++++---
+ src/xenia/apu/audio_system.h                  |  2 ++
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.cc |  4 +--
+ src/xenia/apu/xaudio2/xaudio2_audio_driver.h  |  5 ++-
+ src/xenia/kernel/title/halo3/halo3.cc         | 15 ++++-----
+ 8 files changed, 68 insertions(+), 15 deletions(-)
+
+diff --git a/src/xenia/apu/apu_flags.cc b/src/xenia/apu/apu_flags.cc
+index 6e02965..c54a5bf 100644
+--- a/src/xenia/apu/apu_flags.cc
++++ b/src/xenia/apu/apu_flags.cc
+@@ -34,3 +34,24 @@ DEFINE_bool(apu_raise_thread_priority, true,
+             "highest thread priority, so audio keeps up while shaders "
+             "compile or the game loads.",
+             "APU");
++DEFINE_bool(apu_exact_pump_interval, true,
++            "Request audio frames from the game every 5333.33 microseconds, "
++            "the true length of a 256-sample frame at 48 kHz, instead of "
++            "every 5333. The shorter interval makes the output queue, and "
++            "with it the audio delay, grow by about a frame every 80 "
++            "seconds.",
++            "APU");
++DEFINE_int32(apu_target_queued_frames, 9,
++             "Audio frames (5.3 ms each) the catch-up keeps queued for output, "
++             "at least apu_prebuffer_frames. The game's audio takes up to "
++             "about 44 ms per frame while a map loads; a queue this deep "
++             "carries the sound through that without a gap. Lower means less "
++             "audio delay but gaps at loads. XAudio2 with apu_prebuffer_frames "
++             "only.",
++             "APU");
++DEFINE_int32(apu_max_queued_frames, 8,
++             "Skip a request to the game while more than "
++             "apu_target_queued_frames plus this many audio frames are queued "
++             "for output, so the audio delay stays bounded however long the "
++             "session. 0 disables it. XAudio2 with apu_prebuffer_frames only.",
++             "APU");
+diff --git a/src/xenia/apu/apu_flags.h b/src/xenia/apu/apu_flags.h
+index 61166ca..81b8a1b 100644
+--- a/src/xenia/apu/apu_flags.h
++++ b/src/xenia/apu/apu_flags.h
+@@ -16,5 +16,8 @@ DECLARE_int32(apu_prebuffer_frames);
+ DECLARE_double(apu_fade_ms);
+ DECLARE_int32(apu_max_catchup_frames);
+ DECLARE_bool(apu_raise_thread_priority);
++DECLARE_bool(apu_exact_pump_interval);
++DECLARE_int32(apu_target_queued_frames);
++DECLARE_int32(apu_max_queued_frames);
+ 
+ #endif  // XENIA_APU_APU_FLAGS_H_
+diff --git a/src/xenia/apu/audio_stats.h b/src/xenia/apu/audio_stats.h
+index 1ad0917..e4419fb 100644
+--- a/src/xenia/apu/audio_stats.h
++++ b/src/xenia/apu/audio_stats.h
+@@ -28,6 +28,8 @@ struct AudioStats {
+   std::atomic<uint32_t> late_pumps{0};
+   std::atomic<uint32_t> slow_pumps{0};
+   std::atomic<uint32_t> slowest_pump_us{0};
++  // Regular callbacks skipped because the output queue was too deep.
++  std::atomic<uint32_t> skipped_pumps{0};
+   // Output (XAudio2 with apu_prebuffer_frames): times it ran dry with a fade
+   // out, passes that started short while a frame was being submitted (no
+   // fade out; the frame may still have been in time), and resumes after
+diff --git a/src/xenia/apu/audio_system.cc b/src/xenia/apu/audio_system.cc
+index d97c78f..522dcd0 100644
+--- a/src/xenia/apu/audio_system.cc
++++ b/src/xenia/apu/audio_system.cc
+@@ -131,9 +131,17 @@ void AudioSystem::WorkerThreadMain() {
+         client_callback_arg = clients_[client_index].wrapped_callback_arg;
+ 
+         const double scalar = xe::Clock::guest_time_scalar();
++        // A frame is 256 samples at 48 kHz, 5333.33 us: every third interval
++        // is 1 us longer.
++        uint32_t interval_us = kAudioPumpInterval;
++        if (cvars::apu_exact_pump_interval &&
++            ++clients_[client_index].pump_phase >= 3) {
++          clients_[client_index].pump_phase = 0;
++          ++interval_us;
++        }
+         const uint64_t min_us =
+-            scalar > 0.0 ? static_cast<uint64_t>(kAudioPumpInterval / scalar)
+-                         : kAudioPumpInterval;
++            scalar > 0.0 ? static_cast<uint64_t>(interval_us / scalar)
++                         : interval_us;
+         clients_[client_index].next_pump_us =
+             (earliest_pump_us > now ? earliest_pump_us : now) + min_us;
+       }
+@@ -206,6 +214,22 @@ void AudioSystem::WorkerThreadMain() {
+           }
+         }
+       };
++      auto& client = clients_[client_index];
++      // The level the catch-up keeps the output queue at.
++      const uint32_t target = uint32_t(std::max(
++          {cvars::apu_prebuffer_frames, cvars::apu_target_queued_frames, 0}));
++      // The pump clock and the output device's clock drift apart. While the
++      // output queue is deeper than needed, skip a regular request, which
++      // gives back the frame's output slot.
++      if (cvars::apu_max_queued_frames > 0) {
++        const uint32_t queued = client.driver->QueuedFrames();
++        if (queued != UINT32_MAX &&
++            queued > target + uint32_t(cvars::apu_max_queued_frames)) {
++          client_semaphores_[client_index]->Release(1, nullptr);
++          stats.skipped_pumps.fetch_add(1, std::memory_order_relaxed);
++          continue;
++        }
++      }
+       const uint64_t pump_start_us = static_cast<uint64_t>(
+           std::chrono::duration_cast<std::chrono::microseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+@@ -220,12 +244,9 @@ void AudioSystem::WorkerThreadMain() {
+       // output queue for good, until it runs dry. While the queue is below
+       // the prebuffer target, request a few extra frames right away; this
+       // only refills it, it doesn't move the cadence.
+-      auto& client = clients_[client_index];
+       const uint32_t max_catchup =
+           uint32_t(std::max(cvars::apu_max_catchup_frames, 0));
+       client.catchup_tokens = std::min(client.catchup_tokens + 1, max_catchup);
+-      const uint32_t target =
+-          uint32_t(std::max(cvars::apu_prebuffer_frames, 0));
+       while (client.catchup_tokens && client.driver &&
+              client.driver->QueuedFrames() < target &&
+              xe::threading::Wait(client_semaphores_[client_index].get(), false,
+diff --git a/src/xenia/apu/audio_system.h b/src/xenia/apu/audio_system.h
+index 5cd68ae..1a7abe7 100644
+--- a/src/xenia/apu/audio_system.h
++++ b/src/xenia/apu/audio_system.h
+@@ -92,6 +92,8 @@ class AudioSystem {
+     std::mutex lock;
+     // Extra pumps allowed to refill the output queue after a late one.
+     uint32_t catchup_tokens = 0;
++    // Position in the 5333 / 5333 / 5334 us pump interval cycle.
++    uint32_t pump_phase = 0;
+   } clients_[kMaximumClientCount];
+ 
+   int FindFreeClient();
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+index 8b8d360..9465a8c 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.cc
+@@ -215,8 +215,8 @@ uint32_t XAudio2AudioDriver::QueuedFrames() {
+   if (!smoothing_) {
+     return UINT32_MAX;
+   }
+-  std::lock_guard<std::mutex> lock(smoothing_mutex_);
+-  return queued_frames_.load(std::memory_order_acquire) + held_count_;
++  return queued_frames_.load(std::memory_order_acquire) +
++         held_count_.load(std::memory_order_relaxed);
+ }
+ 
+ bool XAudio2AudioDriver::SubmitBuffer(const float* samples,
+diff --git a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+index 4e5f2b8..ad57069 100644
+--- a/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
++++ b/src/xenia/apu/xaudio2/xaudio2_audio_driver.h
+@@ -137,8 +137,11 @@ class XAudio2AudioDriver : public AudioDriver {
+   // hasn't started); frames are held until prebuffer_frames_ are there.
+   bool playing_ = false;
+   // Frames converted into frames_ but not submitted yet, from held_first_.
++  // held_count_ is written only under the lock but read without it by
++  // QueuedFrames, so that XAudio2's thread failing its try-lock still means
++  // a frame is being submitted.
+   uint32_t held_first_ = 0;
+-  uint32_t held_count_ = 0;
++  std::atomic<uint32_t> held_count_{0};
+   // The frames_ index of the last frame submitted, for the fade out.
+   uint32_t last_frame_ = UINT32_MAX;
+   // Frames submitted and not finished playing (fade outs not counted).
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 8f5dd43..ddeac0c 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -169,14 +169,15 @@ void LogStats() {
+   apu::AudioStats& a = apu::audio_stats();
+   const uint32_t min_queued = a.min_queued_frames.exchange(UINT32_MAX);
+   XELOGI(
+-      "Halo 3 audio: {} frames requested and {} more to catch up, {} late, {} "
+-      "slow (slowest {:.1f} ms); output ran dry {} times with a fade ({} "
+-      "without), resumed {} times; fewest frames queued {}",
++      "Halo 3 audio: {} frames requested, {} more to catch up and {} skipped "
++      "as the queue was deep, {} late, {} slow (slowest {:.1f} ms); output "
++      "ran dry {} times with a fade ({} without), resumed {} times; fewest "
++      "frames queued {}",
+       a.pumps.exchange(0), a.catchup_pumps.exchange(0),
+-      a.late_pumps.exchange(0), a.slow_pumps.exchange(0),
+-      a.slowest_pump_us.exchange(0) / 1000.0, a.underruns.exchange(0),
+-      a.hard_underruns.exchange(0), a.resumes.exchange(0),
+-      min_queued == UINT32_MAX ? 0 : min_queued);
++      a.skipped_pumps.exchange(0), a.late_pumps.exchange(0),
++      a.slow_pumps.exchange(0), a.slowest_pump_us.exchange(0) / 1000.0,
++      a.underruns.exchange(0), a.hard_underruns.exchange(0),
++      a.resumes.exchange(0), min_queued == UINT32_MAX ? 0 : min_queued);
+   // The GPU command processor thread, in percent of the interval. Executing
+   // includes the swaps, which include the presents, and the waits for the
+   // host GPU and for guest memory (WAIT_REG_MEM).

@@ -1,0 +1,246 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Split the swap's present time; rate-limit invalid
+ texture fetch warnings
+
+- gpu_thread_stats: the "presents" time (presenter->RefreshGuestOutput on
+  the GPU command thread) split into refreshing the guest output image,
+  which includes the frame's last submission (EndSubmission in the
+  refresher), and painting it to the host window on that thread, with the
+  wait for a free paint command allocator and the host Present call.
+  Paint-side times count only while the guest output thread paints
+  (painting_guest_output), not UI thread paints. Logged in Halo 3's GPU
+  thread line. Presents took 12-38% of that thread's time.
+- The "Texture fetch constant ... is completely invalid!" warning, which
+  Halo 3 triggers once per frame (up to about 100 lines a second, most
+  of the log), is logged at most four times a second, with a count of
+  the rest.
+---
+ src/xenia/gpu/gpu_thread_stats.h      | 14 ++++++++++-
+ src/xenia/gpu/texture_cache.cc        | 36 ++++++++++++++++++++++-----
+ src/xenia/kernel/title/halo3/halo3.cc | 16 ++++++++----
+ src/xenia/ui/d3d12/d3d12_presenter.cc | 20 +++++++++++++--
+ src/xenia/ui/presenter.cc             | 21 +++++++++++++---
+ 5 files changed, 89 insertions(+), 18 deletions(-)
+
+diff --git a/src/xenia/gpu/gpu_thread_stats.h b/src/xenia/gpu/gpu_thread_stats.h
+index 34961fc..5f6454b 100644
+--- a/src/xenia/gpu/gpu_thread_stats.h
++++ b/src/xenia/gpu/gpu_thread_stats.h
+@@ -27,9 +27,17 @@ struct GpuThreadStats {
+   std::atomic<uint64_t> idle_ticks{0};          // waiting for new commands
+   std::atomic<uint64_t> execute_ticks{0};       // executing command buffers
+   std::atomic<uint64_t> swap_ticks{0};          // inside IssueSwap
+-  std::atomic<uint64_t> present_ticks{0};       // the host Present call
++  std::atomic<uint64_t> present_ticks{0};       // presenter->RefreshGuestOutput
+   std::atomic<uint64_t> gpu_wait_ticks{0};      // waiting for host GPU work
+   std::atomic<uint64_t> wait_reg_mem_ticks{0};  // guest WAIT_REG_MEM polls
++  // Inside the presents: refreshing the guest output image (which also ends
++  // the frame's submission) and painting it to the host window on this
++  // thread, and of the painting, waiting for a free paint command allocator
++  // and the host Present call.
++  std::atomic<uint64_t> refresh_ticks{0};
++  std::atomic<uint64_t> paint_ticks{0};
++  std::atomic<uint64_t> paint_wait_ticks{0};
++  std::atomic<uint64_t> host_present_ticks{0};
+   std::atomic<uint32_t> swaps{0};
+   std::atomic<uint32_t> draws{0};
+   std::atomic<uint32_t> copies{0};  // resolves (Direct3D 12)
+@@ -42,6 +50,10 @@ struct GpuThreadStats {
+   std::atomic<uint32_t> small_readback_latency_frames{0};  // sum, delivered
+ };
+ 
++// Whether this thread is painting the guest output as part of a guest swap
++// (Presenter::RefreshGuestOutput) rather than for the UI.
++inline thread_local bool painting_guest_output = false;
++
+ inline GpuThreadStats& gpu_thread_stats() {
+   static GpuThreadStats stats;
+   return stats;
+diff --git a/src/xenia/gpu/texture_cache.cc b/src/xenia/gpu/texture_cache.cc
+index a76be1e..e44f0f1 100644
+--- a/src/xenia/gpu/texture_cache.cc
++++ b/src/xenia/gpu/texture_cache.cc
+@@ -988,13 +988,37 @@ void TextureCache::BindingInfoFromFetchConstant(
+           fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
+           fetch.dword_4, fetch.dword_5);
+       return;
+-    default:
+-      XELOGW(
+-          "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+-          "is completely invalid!",
+-          fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
+-          fetch.dword_4, fetch.dword_5);
++    default: {
++      // Some games (Halo 3) bind such a constant on every frame, which filled
++      // the log with up to a hundred lines a second. Log a few per second.
++      // Only the GPU command thread gets here.
++      static uint64_t log_second = 0;
++      static uint32_t logged = 0;
++      static uint32_t suppressed = 0;
++      const uint64_t second = Clock::QueryHostUptimeMillis() / 1000;
++      if (second != log_second) {
++        if (suppressed) {
++          XELOGW(
++              "{} more completely invalid texture fetch constants weren't "
++              "logged (at most 4 a second)",
++              suppressed);
++        }
++        log_second = second;
++        logged = 0;
++        suppressed = 0;
++      }
++      if (logged < 4) {
++        ++logged;
++        XELOGW(
++            "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} "
++            "{:08X}) is completely invalid!",
++            fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3,
++            fetch.dword_4, fetch.dword_5);
++      } else {
++        ++suppressed;
++      }
+       return;
++    }
+   }
+ 
+   uint32_t width_minus_1, height_minus_1, depth_or_array_size_minus_1;
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index ddeac0c..b14444a 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -68,7 +68,8 @@ void LogStats() {
+     gpu::GpuThreadStats& g = gpu::gpu_thread_stats();
+     for (std::atomic<uint64_t>* ticks :
+          {&g.idle_ticks, &g.execute_ticks, &g.swap_ticks, &g.present_ticks,
+-          &g.gpu_wait_ticks, &g.wait_reg_mem_ticks}) {
++          &g.gpu_wait_ticks, &g.wait_reg_mem_ticks, &g.refresh_ticks,
++          &g.paint_ticks, &g.paint_wait_ticks, &g.host_present_ticks}) {
+       ticks->store(0, std::memory_order_relaxed);
+     }
+     apu::audio_stats().min_queued_frames.store(UINT32_MAX,
+@@ -191,16 +192,21 @@ void LogStats() {
+   XELOGI(
+       "Halo 3 GPU thread: idle {:.0f}%, executing {:.0f}% (swaps {:.0f}%, "
+       "presents {:.0f}%, host GPU waits {:.0f}%, {} guest memory waits "
+-      "{:.0f}%); {:.1f} swaps/s, {:.0f} draws and {:.0f} resolves per swap; "
+-      "small readbacks: {} queued, {} delivered ({:.1f} frames late), {} "
+-      "skipped",
++      "{:.0f}%); presents: refresh with the frame's submission {:.0f}%, "
++      "paint {:.0f}% (allocator waits {:.0f}%, host Present {:.0f}%); {:.1f} "
++      "swaps/s, {:.0f} draws and {:.0f} resolves per swap; small readbacks: "
++      "{} queued, {} delivered ({:.1f} frames late), {} skipped",
+       double(g.idle_ticks.exchange(0)) * percent,
+       double(g.execute_ticks.exchange(0)) * percent,
+       double(g.swap_ticks.exchange(0)) * percent,
+       double(g.present_ticks.exchange(0)) * percent,
+       double(g.gpu_wait_ticks.exchange(0)) * percent,
+       g.wait_reg_mem_waits.exchange(0),
+-      double(g.wait_reg_mem_ticks.exchange(0)) * percent, swaps / seconds,
++      double(g.wait_reg_mem_ticks.exchange(0)) * percent,
++      double(g.refresh_ticks.exchange(0)) * percent,
++      double(g.paint_ticks.exchange(0)) * percent,
++      double(g.paint_wait_ticks.exchange(0)) * percent,
++      double(g.host_present_ticks.exchange(0)) * percent, swaps / seconds,
+       swaps ? double(draws) / swaps : 0.0, swaps ? double(copies) / swaps : 0.0,
+       g.small_readbacks_queued.exchange(0), delivered,
+       delivered ? double(latency) / delivered : 0.0,
+diff --git a/src/xenia/ui/d3d12/d3d12_presenter.cc b/src/xenia/ui/d3d12/d3d12_presenter.cc
+index 554e901..74d4cc0 100644
+--- a/src/xenia/ui/d3d12/d3d12_presenter.cc
++++ b/src/xenia/ui/d3d12/d3d12_presenter.cc
+@@ -15,9 +15,11 @@
+ #include <utility>
+ 
+ #include "xenia/base/assert.h"
++#include "xenia/base/clock.h"
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/math.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/ui/d3d12/d3d12_provider.h"
+ #include "xenia/ui/d3d12/d3d12_util.h"
+ #include "xenia/ui/surface_win.h"
+@@ -468,8 +470,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
+       paint_context_.paint_completion_timeline->GetUpcomingSubmission();
+   const uint64_t command_allocator_count =
+       UINT64(paint_context_.command_allocators.size());
+-  paint_context_.paint_completion_timeline
+-      ->AwaitMaxSubmissionsPendingAndUpdateCompleted(command_allocator_count);
++  {
++    const uint64_t wait_start =
++        gpu::painting_guest_output ? Clock::QueryHostTickCount() : 0;
++    paint_context_.paint_completion_timeline
++        ->AwaitMaxSubmissionsPendingAndUpdateCompleted(command_allocator_count);
++    if (wait_start) {
++      gpu::gpu_thread_stats().paint_wait_ticks.fetch_add(
++          Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
++    }
++  }
+   ID3D12CommandAllocator* command_allocator =
+       paint_context_
+           .command_allocators[current_paint_submission %
+@@ -1083,10 +1093,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
++  const uint64_t present_start =
++      gpu::painting_guest_output ? Clock::QueryHostTickCount() : 0;
+   HRESULT present_result = paint_context_.swap_chain->Present(
+       0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                      ? DXGI_PRESENT_ALLOW_TEARING
+                                      : 0));
++  if (present_start) {
++    gpu::gpu_thread_stats().host_present_ticks.fetch_add(
++        Clock::QueryHostTickCount() - present_start, std::memory_order_relaxed);
++  }
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+diff --git a/src/xenia/ui/presenter.cc b/src/xenia/ui/presenter.cc
+index d53a081..e704be0 100644
+--- a/src/xenia/ui/presenter.cc
++++ b/src/xenia/ui/presenter.cc
+@@ -13,6 +13,7 @@
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/platform.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/ui/window.h"
+ 
+ #if XE_PLATFORM_WIN32
+@@ -362,9 +363,15 @@ bool Presenter::RefreshGuestOutput(
+   writable_properties.is_8bpc = false;
+   bool is_active = writable_properties.IsActive();
+   if (is_active) {
+-    if (!RefreshGuestOutputImpl(guest_output_mailbox_writable_,
+-                                frontbuffer_width, frontbuffer_height,
+-                                refresher, writable_properties.is_8bpc)) {
++    bool refreshed;
++    {
++      gpu::ScopedGpuThreadTicks refresh_ticks(
++          gpu::gpu_thread_stats().refresh_ticks);
++      refreshed = RefreshGuestOutputImpl(
++          guest_output_mailbox_writable_, frontbuffer_width, frontbuffer_height,
++          refresher, writable_properties.is_8bpc);
++    }
++    if (!refreshed) {
+       // If failed to refresh, don't send the currently writable image to the
+       // mailbox as it may be in an undefined state. Don't disable the guest
+       // output either though because the failure may be something transient.
+@@ -435,7 +442,13 @@ bool Presenter::RefreshGuestOutput(
+         // Both painting and window paint requesting are accessible.
+         if (surface_paint_connection_state_ ==
+             SurfacePaintConnectionState::kConnectedPaintable) {
+-          paint_result = PaintAndPresent(false);
++          {
++            gpu::ScopedGpuThreadTicks paint_ticks(
++                gpu::gpu_thread_stats().paint_ticks);
++            gpu::painting_guest_output = true;
++            paint_result = PaintAndPresent(false);
++            gpu::painting_guest_output = false;
++          }
+           if (surface_paint_connection_state_ ==
+               SurfacePaintConnectionState::kConnectedOutdated) {
+             RequestPaintOrConnectionRecoveryViaWindow(true);

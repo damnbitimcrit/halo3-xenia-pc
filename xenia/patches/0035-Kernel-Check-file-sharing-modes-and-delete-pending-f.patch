@@ -1,0 +1,1079 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Kernel] Check file sharing modes and delete pending files as
+ the console
+
+Xenia ignored the sharing modes of open files, and its NtOpenFile took
+the share access (the fifth argument) as the open options, dropping the
+real options. Halo 3 deletes leftover Theater recordings (*.temp in
+cache1:\autosave) with DeleteFile at every game start that records, after
+it has opened the new recording with no sharing at all: on the console
+that delete's open fails with a sharing violation and the recording
+survives. In Xenia the delete was marked on the file's shared entry, the
+host refused it (the file was open), the mark survived the rename to
+.film, and the next close of any handle to it deleted the finished film.
+
+On the console, cache0: and cache1: are served by a file system driver
+inside the game's own executable (Halo 3: create sub_82588848,
+set-information sub_82589558, cleanup sub_82588560); Xenia serves them
+from host folders instead. This follows that driver's rules:
+
+- NtOpenFile takes (handle, access, attributes, I/O status, share
+  access, options), as the game calls it.
+- With file_share_access (default on, read at each call), NtCreateFile
+  checks an open of an existing file on a writable device (not read-only
+  devices, device roots or the raw partitions of the NullDevice, whose
+  volume opens the utility drive code makes as before), in the console's
+  order: a directory opened to be created, replaced or overwritten fails
+  with OBJECT_NAME_COLLISION and a file opened as a directory with
+  NOT_A_DIRECTORY (creating an existing file and opening a directory as
+  a file fail in the open as before); then an open of a file pending
+  deletion fails with DELETE_PENDING, and one that conflicts with the
+  file's other opens (IoCheckShareAccess: read, write and delete access
+  against the sharing they allow, both ways), or replaces a file that is
+  open, with SHARING_VIOLATION. Nothing can be created in a directory
+  pending deletion (DELETE_PENDING). The open is counted before the host
+  open, also while a replace deletes and recreates the file, so a
+  concurrent open sees it. The state is kept per file (by path, under
+  the global critical region) and follows renames.
+- FILE_DELETE_ON_CLOSE needs DELETE access (else INVALID_PARAMETER) and
+  marks the file at create, as the console's driver does.
+- Setting the delete disposition needs DELETE access on a writable
+  device (else ACCESS_DENIED), isn't allowed on a device root
+  (INVALID_PARAMETER) and fails with DIRECTORY_NOT_EMPTY for a directory
+  that isn't empty. Deleting entries while a directory is enumerated (a
+  recursive delete) no longer skips the entry after each one deleted.
+- Renaming needs DELETE access, a writable device and a file that isn't
+  a device root (else ACCESS_DENIED or INVALID_PARAMETER), and stays on
+  the file's device (else NOT_SAME_DEVICE); a target that exists is
+  replaced only if the caller allows it (the BOOLEAN's byte alone:
+  MoveFile leaves the padding unset) and it isn't a directory (else
+  OBJECT_NAME_COLLISION) or open (else ACCESS_DENIED); the file's own
+  name is OBJECT_NAME_COLLISION (or ACCESS_DENIED when replacing), a
+  target in a directory pending deletion DELETE_PENDING. The checks and
+  the host rename, which replaces the target in one step, run under one
+  lock, and a file moved to another directory moves there in the tree.
+  A host rename that fails is reported (ACCESS_DENIED) and changes
+  nothing; before, the entry took the new name anyway.
+- A file marked for deletion is deleted when its last handle closes, not
+  at the first close.
+- A host file being deleted closes its own host handle first, and if the
+  host still refuses, the mark is cleared instead of firing at a later
+  close; on devices that can't delete (packages, discs) a delete leaves
+  the file as it was. Host file handles on Windows share deletion, so a
+  guest rename or delete of a file open through other guest handles
+  doesn't fail on the host (guest sharing is checked by Xenia).
+
+The first 64 refused opens are logged with the file's open handles.
+---
+ src/xenia/base/filesystem_win.cc              |   5 +-
+ src/xenia/kernel/info/file.h                  |   4 +-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc      | 165 ++++++++++++++-
+ src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc |  94 ++++++++-
+ src/xenia/kernel/xfile.cc                     | 189 +++++++++++++++++-
+ src/xenia/kernel/xfile.h                      |  58 ++++++
+ src/xenia/vfs/device.h                        |   3 +
+ src/xenia/vfs/devices/disc_image_file.cc      |   8 +-
+ src/xenia/vfs/devices/disc_zarchive_file.cc   |   8 +-
+ src/xenia/vfs/devices/host_path_entry.cc      |   5 +-
+ src/xenia/vfs/devices/host_path_entry.h       |   2 +-
+ src/xenia/vfs/devices/host_path_file.cc       |   8 +-
+ src/xenia/vfs/devices/null_device.h           |   1 +
+ src/xenia/vfs/devices/null_file.cc            |   8 +-
+ .../vfs/devices/xcontent_container_file.cc    |   8 +-
+ src/xenia/vfs/entry.cc                        |  35 +++-
+ src/xenia/vfs/entry.h                         |  13 +-
+ src/xenia/xbox.h                              |   4 +
+ 18 files changed, 592 insertions(+), 26 deletions(-)
+
+diff --git a/src/xenia/base/filesystem_win.cc b/src/xenia/base/filesystem_win.cc
+index 7a50d8b..46268a1 100644
+--- a/src/xenia/base/filesystem_win.cc
++++ b/src/xenia/base/filesystem_win.cc
+@@ -190,7 +190,10 @@ std::unique_ptr<FileHandle> FileHandle::OpenExisting(
+   if (desired_access & FileAccess::kFileAppendData) {
+     open_access |= FILE_APPEND_DATA;
+   }
+-  DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE;
++  // Guest sharing is Xenia's to check (file_share_access); on the host, a
++  // guest rename or delete of a file open through other guest handles must
++  // not fail.
++  DWORD share_mode = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+   // We assume we've already created the file in the caller.
+   DWORD creation_disposition = OPEN_EXISTING;
+   HANDLE handle = CreateFileW(
+diff --git a/src/xenia/kernel/info/file.h b/src/xenia/kernel/info/file.h
+index 21205c2..92b5da2 100644
+--- a/src/xenia/kernel/info/file.h
++++ b/src/xenia/kernel/info/file.h
+@@ -78,7 +78,9 @@ static_assert_size(X_FILE_INTERNAL_INFORMATION, 8);
+ 
+ // https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information
+ struct X_FILE_RENAME_INFORMATION {
+-  be<uint32_t> replace_existing;
++  // A BOOLEAN: callers such as XAPI's MoveFile leave the padding unset.
++  uint8_t replace_existing;
++  uint8_t pad[3];
+   be<uint32_t> root_dir_handle;
+   X_ANSI_STRING ansi_string;
+ };
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc
+index 2e6ecf5..d1a73f9 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_io.cc
+@@ -7,7 +7,10 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/mutex.h"
++#include "xenia/base/utf8.h"
+ #include "xenia/kernel/info/file.h"
+ #include "xenia/kernel/kernel_state.h"
+ #include "xenia/kernel/util/shim_utils.h"
+@@ -18,8 +21,18 @@
+ #include "xenia/kernel/xsymboliclink.h"
+ #include "xenia/kernel/xthread.h"
+ #include "xenia/vfs/device.h"
++#include "xenia/vfs/virtual_file_system.h"
+ #include "xenia/xbox.h"
+ 
++DEFINE_bool(file_share_access, true,
++            "Check the sharing modes of the guest's open files as the console "
++            "does: an open that conflicts with another open of the same file "
++            "fails (STATUS_SHARING_VIOLATION), a file pending deletion can't "
++            "be opened, and it's deleted when its last handle closes. Halo 3 "
++            "deletes leftover Theater recordings this way while the new one "
++            "is open, which deleted new recordings without it.",
++            "Kernel");
++
+ namespace xe {
+ namespace kernel {
+ namespace xboxkrnl {
+@@ -32,6 +45,7 @@ struct CreateOptions {
+   static constexpr uint32_t FILE_SYNCHRONOUS_IO_ALERT = 0x00000010;
+   static constexpr uint32_t FILE_SYNCHRONOUS_IO_NONALERT = 0x00000020;
+   static constexpr uint32_t FILE_NON_DIRECTORY_FILE = 0x00000040;
++  static constexpr uint32_t FILE_DELETE_ON_CLOSE = 0x00001000;
+   // Optimization - file access will be random, not sequential.
+   static constexpr uint32_t FILE_RANDOM_ACCESS = 0x00000800;
+ };
+@@ -77,15 +91,119 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
+     root_entry = root_file->entry();
+   }
+ 
++  // As the console's file systems (Halo 3 carries the one for cache0: and
++  // cache1: in its executable, create sub_82588848): an open of an existing
++  // file is checked, after what the open itself would fail for, against the
++  // file's other opens (IoCheckShareAccess), and counted before the host open
++  // so a concurrent open sees it. Read-only devices, device roots and raw
++  // partitions aren't tracked, and open as before.
++  const bool check_share = cvars::file_share_access;
++  const XFile::ShareRequest share_request =
++      XFile::MakeShareRequest(desired_access, share_access);
++  const auto disposition = vfs::FileDisposition(uint32_t(creation_disposition));
++  const bool directory_file =
++      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0;
++  const bool non_directory_file =
++      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0;
++  const bool delete_on_close =
++      (create_options & CreateOptions::FILE_DELETE_ON_CLOSE) != 0;
++  const auto refuse = [&](X_STATUS status,
++                          vfs::FileAction action =
++                              vfs::FileAction::kExists) -> X_STATUS {
++    if (io_status_block) {
++      io_status_block->status = status;
++      io_status_block->information = uint32_t(action);
++    }
++    *handle_out = X_INVALID_HANDLE_VALUE;
++    return status;
++  };
++  // Deleting on close needs the right to delete.
++  if (check_share && delete_on_close && !XFile::GrantsDelete(desired_access)) {
++    return refuse(X_STATUS_INVALID_PARAMETER);
++  }
++  std::shared_ptr<XFile::ShareState> share_state;
++  if (check_share) {
++    auto global_lock = global_critical_region::AcquireDirect();
++    vfs::Entry* existing =
++        root_entry ? root_entry->ResolvePath(target_path)
++                   : kernel_state()->file_system()->ResolvePath(target_path);
++    if (!existing) {
++      // Nothing can be created in a directory pending deletion
++      // (82588B60-82588B70).
++      const std::string base_path = xe::utf8::find_base_guest_path(target_path);
++      vfs::Entry* parent =
++          base_path.empty()
++              ? root_entry
++              : (root_entry
++                     ? root_entry->ResolvePath(base_path)
++                     : kernel_state()->file_system()->ResolvePath(base_path));
++      if (XFile::TracksShareAccess(parent) && parent->delete_on_close()) {
++        return refuse(X_STATUS_DELETE_PENDING,
++                      vfs::FileAction::kDoesNotExist);
++      }
++    }
++    // Creating an existing file: the open reports the collision. A directory
++    // opened as a file: the open reports that too.
++    if (existing && disposition != vfs::FileDisposition::kCreate &&
++        XFile::TracksShareAccess(existing)) {
++      const bool is_directory =
++          (existing->attributes() & vfs::kFileAttributeDirectory) != 0;
++      if (is_directory && disposition != vfs::FileDisposition::kOpen &&
++          disposition != vfs::FileDisposition::kOpenIf) {
++        return refuse(X_STATUS_OBJECT_NAME_COLLISION);
++      }
++      if (!is_directory && directory_file) {
++        return refuse(X_STATUS_NOT_A_DIRECTORY);
++      }
++      if (!(is_directory && non_directory_file)) {
++        // Xenia replaces a file by deleting and recreating it, so it can't
++        // while anything has it open.
++        const bool replaces =
++            disposition == vfs::FileDisposition::kSuperscede ||
++            disposition == vfs::FileDisposition::kOverwrite ||
++            disposition == vfs::FileDisposition::kOverwriteIf;
++        std::shared_ptr<XFile::ShareState> existing_state =
++            XFile::FindShareState(existing);
++        X_STATUS refused = X_STATUS_SUCCESS;
++        if (existing->delete_on_close()) {
++          refused = X_STATUS_DELETE_PENDING;
++        } else if (existing_state &&
++                   ((replaces && existing_state->file_objects) ||
++                    XFile::ShareAccessConflicts(*existing_state,
++                                                share_request))) {
++          refused = X_STATUS_SHARING_VIOLATION;
++        }
++        if (refused != X_STATUS_SUCCESS) {
++          static uint32_t refusals_logged = 0;
++          if (refusals_logged < 64) {
++            ++refusals_logged;
++            XELOGI(
++                "NtCreateFile: {} refused: {} (access {:08X}, share {:X}; "
++                "{} open, {} reading, {} writing, {} deleting)",
++                existing->absolute_path(),
++                refused == X_STATUS_DELETE_PENDING ? "pending deletion"
++                                                   : "sharing violation",
++                uint32_t(desired_access), uint32_t(share_access),
++                existing_state ? existing_state->open_count : 0,
++                existing_state ? existing_state->readers : 0,
++                existing_state ? existing_state->writers : 0,
++                existing_state ? existing_state->deleters : 0);
++          }
++          return refuse(refused);
++        }
++        // Also while a replace deletes and recreates the file: the path (the
++        // key) stays the same.
++        share_state = XFile::AddShareAccess(existing, share_request);
++      }
++    }
++  }
++
+   // Attempt open (or create).
+   vfs::File* vfs_file;
+   vfs::FileAction file_action;
+   X_STATUS result = kernel_state()->file_system()->OpenFile(
+-      root_entry, target_path,
+-      vfs::FileDisposition((uint32_t)creation_disposition), desired_access,
+-      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+-      (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file,
+-      &file_action);
++      root_entry, target_path, disposition, desired_access, directory_file,
++      non_directory_file, &vfs_file, &file_action);
+   object_ref<XFile> file = nullptr;
+ 
+   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+@@ -95,11 +213,41 @@ dword_result_t NtCreateFile_entry(lpdword_t handle_out, dword_t desired_access,
+         (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_ALERT) ||
+         (create_options & CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT);
+     file = object_ref<XFile>(new XFile(kernel_state(), vfs_file, synchronous));
++    file->set_desired_access(desired_access);
+ 
+     // Handle ref is incremented, so return that.
+     handle = file->handle();
+   }
+ 
++  if (check_share) {
++    auto global_lock = global_critical_region::AcquireDirect();
++    if (XSUCCEEDED(result)) {
++      vfs::Entry* opened = vfs_file->entry();
++      // A new file: counted now (nothing else has it open).
++      std::shared_ptr<XFile::ShareState> opened_state =
++          XFile::FindShareState(opened);
++      if (!share_state || opened_state != share_state) {
++        if (share_state) {
++          XFile::RemoveShareAccess(share_state, share_request);
++          share_state.reset();
++        }
++        if (XFile::TracksShareAccess(opened)) {
++          share_state = XFile::AddShareAccess(opened, share_request);
++        }
++      }
++      if (share_state) {
++        file->SetShareAccess(std::move(share_state), share_request);
++      }
++      // As the console's file system, at create (sub_82588848, 82588DBC).
++      if (delete_on_close && XFile::TracksShareAccess(opened) &&
++          !(opened->attributes() & vfs::kFileAttributeDirectory)) {
++        opened->SetForDeletion(true);
++      }
++    } else if (share_state) {
++      XFile::RemoveShareAccess(share_state, share_request);
++    }
++  }
++
+   if (io_status_block) {
+     io_status_block->status = result;
+     io_status_block->information = (uint32_t)file_action;
+@@ -114,10 +262,13 @@ DECLARE_XBOXKRNL_EXPORT1(NtCreateFile, kFileSystem, kImplemented);
+ dword_result_t NtOpenFile_entry(
+     lpdword_t handle_out, dword_t desired_access,
+     pointer_t<X_OBJECT_ATTRIBUTES> object_attributes,
+-    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t open_options) {
++    pointer_t<X_IO_STATUS_BLOCK> io_status_block, dword_t share_access,
++    dword_t open_options) {
++  // NtOpenFile(handle, access, attributes, iosb, share access, options): the
++  // share access was read as the options.
+   return NtCreateFile_entry(
+       handle_out, desired_access, object_attributes, io_status_block, nullptr,
+-      0, 0, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
++      0, share_access, static_cast<uint32_t>(xe::vfs::FileDisposition::kOpen),
+       open_options);
+ }
+ DECLARE_XBOXKRNL_EXPORT1(NtOpenFile, kFileSystem, kImplemented);
+diff --git a/src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc b/src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc
+index b10c312..028bca0 100644
+--- a/src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc
++++ b/src/xenia/kernel/xboxkrnl/xboxkrnl_io_info.cc
+@@ -7,7 +7,10 @@
+  ******************************************************************************
+  */
+ 
++#include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
++#include "xenia/base/mutex.h"
++#include "xenia/base/utf8.h"
+ #include "xenia/kernel/info/file.h"
+ #include "xenia/kernel/info/volume.h"
+ #include "xenia/kernel/kernel_state.h"
+@@ -17,6 +20,8 @@
+ #include "xenia/vfs/device.h"
+ #include "xenia/xbox.h"
+ 
++DECLARE_bool(file_share_access);
++
+ namespace xe {
+ namespace kernel {
+ namespace xboxkrnl {
+@@ -238,15 +243,100 @@ dword_result_t NtSetInformationFile_entry(
+         return X_STATUS_INVALID_PARAMETER;
+       }
+ 
+-      file->Rename(target_path);
+       out_length = sizeof(*info);
++      if (!cvars::file_share_access) {
++        result = file->Rename(target_path);
++        break;
++      }
++      // As the console: renaming needs the right to delete and stays on the
++      // device, and the target may be replaced only if allowed, isn't a
++      // directory and isn't open (the cache file system's rename,
++      // sub_82589170). The host rename replaces the target in one step, and
++      // nothing can open or create it in between.
++      if (!file->entry()->parent()) {
++        // A device root (82589684-8258968C).
++        result = X_STATUS_INVALID_PARAMETER;
++        break;
++      }
++      if (!XFile::GrantsDelete(file->desired_access()) ||
++          file->entry()->is_read_only()) {
++        result = X_STATUS_ACCESS_DENIED;
++        break;
++      }
++      auto global_lock = global_critical_region::AcquireDirect();
++      auto file_system = kernel_state()->file_system();
++      const std::string target_guest_path = xe::path_to_utf8(target_path);
++      vfs::Entry* target = file_system->ResolvePath(target_guest_path);
++      vfs::Entry* target_parent = file_system->ResolvePath(
++          xe::utf8::find_base_guest_path(target_guest_path));
++      if (!target && target_parent && target_parent->delete_on_close()) {
++        result = X_STATUS_DELETE_PENDING;
++        break;
++      }
++      if (target_parent &&
++          target_parent->device() != file->entry()->device()) {
++        result = X_STATUS_NOT_SAME_DEVICE;
++        break;
++      }
++      if (target == file->entry()) {
++        // Its own name (in any case): the name exists, and it is open.
++        result = info->replace_existing ? X_STATUS_ACCESS_DENIED
++                                        : X_STATUS_OBJECT_NAME_COLLISION;
++        break;
++      }
++      const bool replaces = target != nullptr;
++      if (replaces) {
++        if (!info->replace_existing || !target->parent() ||
++            (target->attributes() & vfs::kFileAttributeDirectory)) {
++          result = X_STATUS_OBJECT_NAME_COLLISION;
++          break;
++        }
++        std::shared_ptr<XFile::ShareState> target_state =
++            XFile::FindShareState(target);
++        if (target_state && target_state->file_objects) {
++          result = X_STATUS_ACCESS_DENIED;
++          break;
++        }
++      }
++      vfs::Entry* const old_parent = file->entry()->parent();
++      result = file->Rename(target_path);
++      if (XSUCCEEDED(result)) {
++        if (replaces) {
++          target->parent()->ForgetChild(target);
++        }
++        if (target_parent && target_parent != old_parent) {
++          old_parent->MoveChildTo(file->entry(), target_parent);
++        }
++      }
+       break;
+     }
+     case XFileDispositionInformation: {
+       auto info = info_ptr.as<X_FILE_DISPOSITION_INFORMATION*>();
+       bool delete_on_close = info->delete_file ? true : false;
+-      file->entry()->SetForDeletion(static_cast<bool>(info->delete_file));
+       out_length = 0;
++      // As the console: not on a device root, it needs the right to delete,
++      // and a directory must be empty (the cache file system's disposition,
++      // sub_82589400).
++      if (cvars::file_share_access && !file->entry()->parent()) {
++        result = X_STATUS_INVALID_PARAMETER;
++        break;
++      }
++      if (cvars::file_share_access &&
++          (!XFile::GrantsDelete(file->desired_access()) ||
++           file->entry()->is_read_only())) {
++        result = X_STATUS_ACCESS_DENIED;
++        break;
++      }
++      {
++        auto global_lock = global_critical_region::AcquireDirect();
++        if (cvars::file_share_access && delete_on_close &&
++            (file->entry()->attributes() & vfs::kFileAttributeDirectory) &&
++            !file->entry()->children().empty()) {
++          result = X_STATUS_DIRECTORY_NOT_EMPTY;
++          break;
++        }
++        file->entry()->SetForDeletion(delete_on_close);
++      }
+       XELOGW("NtSetInformationFile set deleting flag for {} on close to: {}",
+              file->name(), delete_on_close);
+       break;
+diff --git a/src/xenia/kernel/xfile.cc b/src/xenia/kernel/xfile.cc
+index 442750c..094c9c1 100644
+--- a/src/xenia/kernel/xfile.cc
++++ b/src/xenia/kernel/xfile.cc
+@@ -10,7 +10,12 @@
+ #include "xenia/kernel/xfile.h"
+ #include "xenia/vfs/virtual_file_system.h"
+ 
++#include <algorithm>
++#include <unordered_map>
++
+ #include "xenia/base/byte_stream.h"
++#include "xenia/base/mutex.h"
++#include "xenia/base/utf8.h"
+ #include "xenia/kernel/kernel_state.h"
+ 
+ namespace xe {
+@@ -32,7 +37,157 @@ XFile::XFile() : XObject(kObjectType), completion_port_lock_() {
+ XFile::~XFile() {
+   // TODO(benvanik): signal that the file is closing?
+   async_event_->Set();
+-  file_->Destroy();
++  // Closing handles takes it too (the object table), and so does deleting.
++  auto global_lock = global_critical_region::AcquireDirect();
++  bool others_open = false;
++  if (share_state_) {
++    RemoveShareAccess(share_state_, share_request_);
++    others_open = share_state_->file_objects != 0;
++    share_state_.reset();
++  }
++  vfs::Entry* entry = file_->entry();
++  if (others_open && entry && entry->delete_on_close()) {
++    // As on the console, a file pending deletion goes when its last handle
++    // closes.
++    entry->SetForDeletion(false);
++    file_->Destroy();
++    entry->SetForDeletion(true);
++  } else {
++    file_->Destroy();
++  }
++}
++
++namespace {
++
++// Kept by NtCreateFile for the guest's opens.
++std::unordered_map<std::string, std::shared_ptr<XFile::ShareState>>&
++share_states() {
++  static std::unordered_map<std::string, std::shared_ptr<XFile::ShareState>>
++      states;
++  return states;
++}
++
++std::string ShareKey(const vfs::Entry* entry) {
++  return xe::utf8::lower_ascii(entry->absolute_path());
++}
++
++}  // namespace
++
++XFile::ShareRequest XFile::MakeShareRequest(uint32_t desired_access,
++                                            uint32_t share_access) {
++  constexpr uint32_t kFileReadData = 0x00000001;
++  constexpr uint32_t kFileWriteData = 0x00000002;
++  constexpr uint32_t kFileAppendData = 0x00000004;
++  constexpr uint32_t kFileExecute = 0x00000020;
++  constexpr uint32_t kDelete = 0x00010000;
++  constexpr uint32_t kGenericAll = 0x10000000;
++  constexpr uint32_t kGenericExecute = 0x20000000;
++  constexpr uint32_t kGenericWrite = 0x40000000;
++  constexpr uint32_t kGenericRead = 0x80000000;
++  constexpr uint32_t kShareRead = 0x1;
++  constexpr uint32_t kShareWrite = 0x2;
++  constexpr uint32_t kShareDelete = 0x4;
++  uint32_t access = desired_access;
++  if (access & kGenericAll) {
++    access |= kFileReadData | kFileWriteData | kFileAppendData | kFileExecute |
++              kDelete;
++  }
++  if (access & kGenericRead) {
++    access |= kFileReadData;
++  }
++  if (access & kGenericWrite) {
++    access |= kFileWriteData | kFileAppendData;
++  }
++  if (access & kGenericExecute) {
++    access |= kFileExecute;
++  }
++  ShareRequest request;
++  request.read = (access & (kFileReadData | kFileExecute)) != 0;
++  request.write = (access & (kFileWriteData | kFileAppendData)) != 0;
++  request.del = (access & kDelete) != 0;
++  request.shared_read = (share_access & kShareRead) != 0;
++  request.shared_write = (share_access & kShareWrite) != 0;
++  request.shared_delete = (share_access & kShareDelete) != 0;
++  return request;
++}
++
++bool XFile::GrantsDelete(uint32_t desired_access) {
++  constexpr uint32_t kDelete = 0x00010000;
++  constexpr uint32_t kGenericAll = 0x10000000;
++  return (desired_access & (kDelete | kGenericAll)) != 0;
++}
++
++bool XFile::TracksShareAccess(const vfs::Entry* entry) {
++  return entry && entry->parent() && !entry->is_read_only() &&
++         entry->device()->is_file_system();
++}
++
++std::shared_ptr<XFile::ShareState> XFile::FindShareState(
++    const vfs::Entry* entry) {
++  auto it = share_states().find(ShareKey(entry));
++  return it != share_states().end() ? it->second : nullptr;
++}
++
++bool XFile::ShareAccessConflicts(const ShareState& state,
++                                 const ShareRequest& request) {
++  // IoCheckShareAccess: an open with no read, write or delete access is
++  // always allowed.
++  if (!request.counts()) {
++    return false;
++  }
++  return (request.read && state.shared_read < state.open_count) ||
++         (request.write && state.shared_write < state.open_count) ||
++         (request.del && state.shared_delete < state.open_count) ||
++         (state.readers && !request.shared_read) ||
++         (state.writers && !request.shared_write) ||
++         (state.deleters && !request.shared_delete);
++}
++
++std::shared_ptr<XFile::ShareState> XFile::AddShareAccess(
++    const vfs::Entry* entry, const ShareRequest& request) {
++  std::string key = ShareKey(entry);
++  std::shared_ptr<ShareState>& state = share_states()[key];
++  if (!state) {
++    state = std::make_shared<ShareState>();
++    state->key = std::move(key);
++  }
++  ++state->file_objects;
++  if (request.counts()) {
++    ++state->open_count;
++    state->readers += request.read;
++    state->writers += request.write;
++    state->deleters += request.del;
++    state->shared_read += request.shared_read;
++    state->shared_write += request.shared_write;
++    state->shared_delete += request.shared_delete;
++  }
++  return state;
++}
++
++void XFile::RemoveShareAccess(const std::shared_ptr<ShareState>& state,
++                              const ShareRequest& request) {
++  --state->file_objects;
++  if (request.counts()) {
++    --state->open_count;
++    state->readers -= request.read;
++    state->writers -= request.write;
++    state->deleters -= request.del;
++    state->shared_read -= request.shared_read;
++    state->shared_write -= request.shared_write;
++    state->shared_delete -= request.shared_delete;
++  }
++  if (!state->file_objects) {
++    auto it = share_states().find(state->key);
++    if (it != share_states().end() && it->second == state) {
++      share_states().erase(it);
++    }
++  }
++}
++
++void XFile::SetShareAccess(std::shared_ptr<ShareState> state,
++                           const ShareRequest& request) {
++  share_state_ = std::move(state);
++  share_request_ = request;
+ }
+ 
+ uint64_t XFile::position() const {
+@@ -68,6 +223,23 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info,
+   } else {
+     if (restart) {
+       find_index_ = 0;
++    } else if (find_index_) {
++      // Entries deleted while enumerating (a recursive delete) move the ones
++      // after them back: go on after the last one returned (if that was
++      // deleted, its place is now the next one's).
++      auto global_lock = global_critical_region::AcquireDirect();
++      const auto& children = file_->entry()->children();
++      if (find_index_ > children.size() ||
++          children[find_index_ - 1]->name() != find_last_name_) {
++        size_t index = 0;
++        while (index < children.size() &&
++               children[index]->name() != find_last_name_) {
++          ++index;
++        }
++        find_index_ = index < children.size()
++                          ? index + 1
++                          : std::min(find_index_ - 1, children.size());
++      }
+     }
+ 
+     entry = file_->entry()->IterateChildren(find_engine_, &find_index_);
+@@ -75,6 +247,7 @@ X_STATUS XFile::QueryDirectory(X_FILE_DIRECTORY_INFORMATION* out_info,
+       return X_STATUS_NO_MORE_FILES;
+     }
+   }
++  find_last_name_ = entry->name();
+ 
+   auto end = reinterpret_cast<uint8_t*>(out_info) + length;
+   const auto& entry_name = entry->name();
+@@ -297,7 +470,19 @@ X_STATUS XFile::SetLength(size_t length) {
+   return file_->SetLength(length);
+ }
+ X_STATUS XFile::Rename(const std::filesystem::path file_path) {
+-  entry()->Rename(file_path);
++  auto global_lock = global_critical_region::AcquireDirect();
++  if (!entry()->Rename(file_path)) {
++    return X_STATUS_ACCESS_DENIED;
++  }
++  // The file's open handles move with it.
++  if (share_state_) {
++    auto it = share_states().find(share_state_->key);
++    if (it != share_states().end() && it->second == share_state_) {
++      share_states().erase(it);
++    }
++    share_state_->key = ShareKey(entry());
++    share_states()[share_state_->key] = share_state_;
++  }
+   return X_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/xenia/kernel/xfile.h b/src/xenia/kernel/xfile.h
+index 5663155..770b571 100644
+--- a/src/xenia/kernel/xfile.h
++++ b/src/xenia/kernel/xfile.h
+@@ -10,6 +10,7 @@
+ #ifndef XENIA_KERNEL_XFILE_H_
+ #define XENIA_KERNEL_XFILE_H_
+ 
++#include <memory>
+ #include <mutex>
+ #include <string>
+ 
+@@ -132,9 +133,60 @@ class XFile : public XObject {
+  public:
+   static const XObject::Type kObjectType = XObject::Type::File;
+ 
++  // NT share access (IoCheckShareAccess) of the guest's open files, as the
++  // console's I/O manager keeps it per file: what one open uses and allows.
++  struct ShareRequest {
++    bool read = false;
++    bool write = false;
++    bool del = false;
++    bool shared_read = false;
++    bool shared_write = false;
++    bool shared_delete = false;
++    bool counts() const { return read || write || del; }
++  };
++  // Per file (keyed by its absolute path, lowercase), under the global
++  // critical region.
++  struct ShareState {
++    std::string key;
++    uint32_t open_count = 0;
++    uint32_t readers = 0;
++    uint32_t writers = 0;
++    uint32_t deleters = 0;
++    uint32_t shared_read = 0;
++    uint32_t shared_write = 0;
++    uint32_t shared_delete = 0;
++    // Guest file objects open on it, with any access.
++    uint32_t file_objects = 0;
++  };
++  static ShareRequest MakeShareRequest(uint32_t desired_access,
++                                       uint32_t share_access);
++  // Whether access includes DELETE (directly or through GENERIC_ALL).
++  static bool GrantsDelete(uint32_t desired_access);
++  // Opens of files on writable devices are checked; read-only devices
++  // (discs, the game's own files), raw partitions and device roots aren't.
++  static bool TracksShareAccess(const vfs::Entry* entry);
++  // The rest under the global critical region.
++  static std::shared_ptr<ShareState> FindShareState(const vfs::Entry* entry);
++  static bool ShareAccessConflicts(const ShareState& state,
++                                   const ShareRequest& request);
++  static std::shared_ptr<ShareState> AddShareAccess(
++      const vfs::Entry* entry, const ShareRequest& request);
++  static void RemoveShareAccess(const std::shared_ptr<ShareState>& state,
++                                const ShareRequest& request);
++  // Takes over an AddShareAccess, released when this is destroyed.
++  void SetShareAccess(std::shared_ptr<ShareState> state,
++                      const ShareRequest& request);
++
+   XFile(KernelState* kernel_state, vfs::File* file, bool synchronous);
+   ~XFile() override;
+ 
++  // The access the guest opened the file with (NtCreateFile); all access
++  // for files Xenia opens itself.
++  uint32_t desired_access() const { return desired_access_; }
++  void set_desired_access(uint32_t desired_access) {
++    desired_access_ = desired_access;
++  }
++
+   vfs::Device* device() const { return file_->entry()->device(); }
+   vfs::Entry* entry() const { return file_->entry(); }
+   vfs::File* file() const { return file_; }
+@@ -193,6 +245,10 @@ class XFile : public XObject {
+   vfs::File* file_ = nullptr;
+   std::unique_ptr<threading::Event> async_event_ = nullptr;
+ 
++  std::shared_ptr<ShareState> share_state_;
++  ShareRequest share_request_;
++  uint32_t desired_access_ = 0x10000000;  // GENERIC_ALL
++
+   mutable std::mutex file_lock_;
+   std::mutex completion_port_lock_;
+   std::vector<std::pair<uint32_t, object_ref<XIOCompletion>>> completion_ports_;
+@@ -203,6 +259,8 @@ class XFile : public XObject {
+ 
+   xe::filesystem::WildcardEngine find_engine_;
+   size_t find_index_ = 0;
++  // The last entry the enumeration returned.
++  std::string find_last_name_;
+ 
+   bool is_synchronous_ = false;
+ };
+diff --git a/src/xenia/vfs/device.h b/src/xenia/vfs/device.h
+index 7cf8b7c..0cdfc2c 100644
+--- a/src/xenia/vfs/device.h
++++ b/src/xenia/vfs/device.h
+@@ -29,6 +29,9 @@ class Device {
+ 
+   const std::string_view mount_path() const { return mount_path_; }
+   virtual bool is_read_only() const { return true; }
++  // False for a device standing in for raw partitions: its entries aren't
++  // files of a file system.
++  virtual bool is_file_system() const { return true; }
+ 
+   virtual void Dump(StringBuffer* string_buffer) = 0;
+   virtual Entry* ResolvePath(const std::string_view path) = 0;
+diff --git a/src/xenia/vfs/devices/disc_image_file.cc b/src/xenia/vfs/devices/disc_image_file.cc
+index d1db59d..fffad3a 100644
+--- a/src/xenia/vfs/devices/disc_image_file.cc
++++ b/src/xenia/vfs/devices/disc_image_file.cc
+@@ -19,7 +19,13 @@ DiscImageFile::DiscImageFile(uint32_t file_access, DiscImageEntry* entry)
+ 
+ DiscImageFile::~DiscImageFile() = default;
+ 
+-void DiscImageFile::Destroy() { delete this; }
++void DiscImageFile::Destroy() {
++  // Nothing here can be deleted: a delete leaves the file as it was.
++  if (File::entry_ && File::entry_->delete_on_close()) {
++    File::entry_->SetForDeletion(false);
++  }
++  delete this;
++}
+ 
+ X_STATUS DiscImageFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+                                  size_t* out_bytes_read) {
+diff --git a/src/xenia/vfs/devices/disc_zarchive_file.cc b/src/xenia/vfs/devices/disc_zarchive_file.cc
+index 9bdf5bc..d7c2f82 100644
+--- a/src/xenia/vfs/devices/disc_zarchive_file.cc
++++ b/src/xenia/vfs/devices/disc_zarchive_file.cc
+@@ -21,7 +21,13 @@ DiscZarchiveFile::DiscZarchiveFile(uint32_t file_access,
+ 
+ DiscZarchiveFile::~DiscZarchiveFile() = default;
+ 
+-void DiscZarchiveFile::Destroy() { delete this; }
++void DiscZarchiveFile::Destroy() {
++  // Nothing here can be deleted: a delete leaves the file as it was.
++  if (File::entry_ && File::entry_->delete_on_close()) {
++    File::entry_->SetForDeletion(false);
++  }
++  delete this;
++}
+ 
+ X_STATUS DiscZarchiveFile::ReadSync(std::span<uint8_t> buffer,
+                                     size_t byte_offset,
+diff --git a/src/xenia/vfs/devices/host_path_entry.cc b/src/xenia/vfs/devices/host_path_entry.cc
+index 41f74df..610f6bd 100644
+--- a/src/xenia/vfs/devices/host_path_entry.cc
++++ b/src/xenia/vfs/devices/host_path_entry.cc
+@@ -122,7 +122,7 @@ bool HostPathEntry::DeleteEntryInternal(Entry* entry) {
+   }
+ }
+ 
+-void HostPathEntry::RenameEntryInternal(
++bool HostPathEntry::RenameEntryInternal(
+     const std::vector<std::string_view>& path_parts) {
+   const std::string relative_path = xe::utf8::join_paths(path_parts);
+   const std::string new_host_path_ = xe::utf8::join_paths(
+@@ -134,9 +134,10 @@ void HostPathEntry::RenameEntryInternal(
+   if (ec) {
+     XELOGE("RenameEntryInternal: Failed to rename '{}' to '{}': {}",
+            xe::path_to_utf8(host_path_), new_host_path_, ec.message());
+-    return;
++    return false;
+   }
+   host_path_ = new_host_path_;
++  return true;
+ }
+ 
+ void HostPathEntry::update() {
+diff --git a/src/xenia/vfs/devices/host_path_entry.h b/src/xenia/vfs/devices/host_path_entry.h
+index eb0ae10..4c302a7 100644
+--- a/src/xenia/vfs/devices/host_path_entry.h
++++ b/src/xenia/vfs/devices/host_path_entry.h
+@@ -51,7 +51,7 @@ class HostPathEntry : public Entry {
+   std::unique_ptr<Entry> CreateEntryInternal(const std::string_view name,
+                                              uint32_t attributes) override;
+   bool DeleteEntryInternal(Entry* entry) override;
+-  void RenameEntryInternal(
++  bool RenameEntryInternal(
+       const std::vector<std::string_view>& path_parts) override;
+ 
+   std::filesystem::path host_path_;
+diff --git a/src/xenia/vfs/devices/host_path_file.cc b/src/xenia/vfs/devices/host_path_file.cc
+index 48ab1a6..a918485 100644
+--- a/src/xenia/vfs/devices/host_path_file.cc
++++ b/src/xenia/vfs/devices/host_path_file.cc
+@@ -23,7 +23,13 @@ HostPathFile::~HostPathFile() = default;
+ 
+ void HostPathFile::Destroy() {
+   if (entry_ && entry_->delete_on_close()) {
+-    entry()->Delete();
++    // This handle doesn't share deletion on the host: close it first. If the
++    // host still can't delete it, don't leave it pending for whichever handle
++    // to the file closes next.
++    file_handle_.reset();
++    if (!entry()->Delete()) {
++      entry_->SetForDeletion(false);
++    }
+   }
+   delete this;
+ }
+diff --git a/src/xenia/vfs/devices/null_device.h b/src/xenia/vfs/devices/null_device.h
+index 6ac8f2a..0a7f656 100644
+--- a/src/xenia/vfs/devices/null_device.h
++++ b/src/xenia/vfs/devices/null_device.h
+@@ -30,6 +30,7 @@ class NullDevice : public Device {
+   Entry* ResolvePath(const std::string_view path) override;
+ 
+   bool is_read_only() const override { return false; }
++  bool is_file_system() const override { return false; }
+ 
+   const std::string& name() const override { return name_; }
+   uint32_t attributes() const override { return 0; }
+diff --git a/src/xenia/vfs/devices/null_file.cc b/src/xenia/vfs/devices/null_file.cc
+index b54e5e1..e563231 100644
+--- a/src/xenia/vfs/devices/null_file.cc
++++ b/src/xenia/vfs/devices/null_file.cc
+@@ -19,7 +19,13 @@ NullFile::NullFile(uint32_t file_access, NullEntry* entry)
+ 
+ NullFile::~NullFile() = default;
+ 
+-void NullFile::Destroy() { delete this; }
++void NullFile::Destroy() {
++  // Nothing here can be deleted: a delete leaves the file as it was.
++  if (File::entry_ && File::entry_->delete_on_close()) {
++    File::entry_->SetForDeletion(false);
++  }
++  delete this;
++}
+ 
+ X_STATUS NullFile::ReadSync(std::span<uint8_t> buffer, size_t byte_offset,
+                             size_t* out_bytes_read) {
+diff --git a/src/xenia/vfs/devices/xcontent_container_file.cc b/src/xenia/vfs/devices/xcontent_container_file.cc
+index 15c4a7a..6f2897a 100644
+--- a/src/xenia/vfs/devices/xcontent_container_file.cc
++++ b/src/xenia/vfs/devices/xcontent_container_file.cc
+@@ -19,7 +19,13 @@ XContentContainerFile::XContentContainerFile(uint32_t file_access,
+ 
+ XContentContainerFile::~XContentContainerFile() = default;
+ 
+-void XContentContainerFile::Destroy() { delete this; }
++void XContentContainerFile::Destroy() {
++  // Nothing here can be deleted: a delete leaves the file as it was.
++  if (File::entry_ && File::entry_->delete_on_close()) {
++    File::entry_->SetForDeletion(false);
++  }
++  delete this;
++}
+ 
+ X_STATUS XContentContainerFile::ReadSync(std::span<uint8_t> buffer,
+                                          size_t byte_offset,
+diff --git a/src/xenia/vfs/entry.cc b/src/xenia/vfs/entry.cc
+index 90d6b5c..60a8a9b 100644
+--- a/src/xenia/vfs/entry.cc
++++ b/src/xenia/vfs/entry.cc
+@@ -132,11 +132,39 @@ bool Entry::Delete() {
+   return parent_->Delete(this);
+ }
+ 
++bool Entry::MoveChildTo(Entry* entry, Entry* new_parent) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (auto it = children_.begin(); it != children_.end(); ++it) {
++    if (it->get() == entry) {
++      std::unique_ptr<Entry> child = std::move(*it);
++      children_.erase(it);
++      Touch();
++      child->parent_ = new_parent;
++      new_parent->children_.push_back(std::move(child));
++      new_parent->Touch();
++      return true;
++    }
++  }
++  return false;
++}
++
++bool Entry::ForgetChild(Entry* entry) {
++  auto global_lock = global_critical_region_.Acquire();
++  for (auto it = children_.begin(); it != children_.end(); ++it) {
++    if (it->get() == entry) {
++      children_.erase(it);
++      Touch();
++      return true;
++    }
++  }
++  return false;
++}
++
+ void Entry::Touch() {
+   // TODO(benvanik): update timestamps.
+ }
+ 
+-void Entry::Rename(const std::filesystem::path file_path) {
++bool Entry::Rename(const std::filesystem::path file_path) {
+   // Store the string to ensure string_views from split_path remain valid
+   const std::string path_str = xe::path_to_utf8(file_path);
+   std::vector<std::string_view> path_parts = xe::utf8::split_path(path_str);
+@@ -144,7 +172,9 @@ void Entry::Rename(const std::filesystem::path file_path) {
+   // Remove the root (e.g., "cache:")
+   path_parts.erase(path_parts.begin());
+ 
+-  RenameEntryInternal(path_parts);
++  if (!RenameEntryInternal(path_parts)) {
++    return false;
++  }
+ 
+   const std::string guest_path = xe::utf8::join_guest_paths(path_parts);
+   absolute_path_ =
+@@ -152,6 +182,7 @@ void Entry::Rename(const std::filesystem::path file_path) {
+   path_ = guest_path;
+   // Use the guest path since POSIX doesn't treat \ as a separator.
+   name_ = path_parts.empty() ? std::string() : std::string(path_parts.back());
++  return true;
+ }
+ 
+ }  // namespace vfs
+diff --git a/src/xenia/vfs/entry.h b/src/xenia/vfs/entry.h
+index c0f4541..9a044ad 100644
+--- a/src/xenia/vfs/entry.h
++++ b/src/xenia/vfs/entry.h
+@@ -118,9 +118,14 @@ class Entry {
+   Entry* CreateEntry(const std::string_view name, uint32_t attributes);
+   bool Delete(Entry* entry);
+   bool Delete();
++  // Drops a child whose host file is gone already (replaced by a rename).
++  bool ForgetChild(Entry* entry);
++  // Moves a child renamed into another directory under that directory.
++  bool MoveChildTo(Entry* entry, Entry* new_parent);
+   void Touch();
+ 
+-  void Rename(const std::filesystem::path file_path);
++  // Returns false (and changes nothing) if the device couldn't rename it.
++  bool Rename(const std::filesystem::path file_path);
+   // If successful, out_file points to a new file. When finished, call
+   // file->Destroy()
+   virtual X_STATUS Open(uint32_t desired_access, File** out_file) = 0;
+@@ -141,8 +146,10 @@ class Entry {
+     return nullptr;
+   }
+   virtual bool DeleteEntryInternal(Entry* entry) = 0;
+-  virtual void RenameEntryInternal(
+-      const std::vector<std::string_view>& path_parts) {}
++  virtual bool RenameEntryInternal(
++      const std::vector<std::string_view>& path_parts) {
++    return true;
++  }
+ 
+   xe::global_critical_region global_critical_region_;
+   Device* device_;
+diff --git a/src/xenia/xbox.h b/src/xenia/xbox.h
+index 501f432..4b70ff8 100644
+--- a/src/xenia/xbox.h
++++ b/src/xenia/xbox.h
+@@ -59,10 +59,12 @@ typedef uint32_t X_STATUS;
+ #define X_STATUS_OBJECT_NAME_NOT_FOUND                  ((X_STATUS)0xC0000034L)
+ #define X_STATUS_OBJECT_NAME_COLLISION                  ((X_STATUS)0xC0000035L)
+ #define X_STATUS_OBJECT_PATH_NOT_FOUND                  ((X_STATUS)0xC000003AL)
++#define X_STATUS_SHARING_VIOLATION                      ((X_STATUS)0xC0000043L)
+ #define X_STATUS_INVALID_PAGE_PROTECTION                ((X_STATUS)0xC0000045L)
+ #define X_STATUS_MUTANT_NOT_OWNED                       ((X_STATUS)0xC0000046L)
+ #define X_STATUS_SEMAPHORE_LIMIT_EXCEEDED               ((X_STATUS)0xC0000047L)
+ #define X_STATUS_THREAD_IS_TERMINATING                  ((X_STATUS)0xC000004BL)
++#define X_STATUS_DELETE_PENDING                         ((X_STATUS)0xC0000056L)
+ #define X_STATUS_PROCEDURE_NOT_FOUND                    ((X_STATUS)0xC000007AL)
+ #define X_STATUS_INVALID_IMAGE_FORMAT                   ((X_STATUS)0xC000007BL)
+ #define X_STATUS_DISK_FULL                              ((X_STATUS)0xC000007FL)
+@@ -70,9 +72,11 @@ typedef uint32_t X_STATUS;
+ #define X_STATUS_MEMORY_NOT_ALLOCATED                   ((X_STATUS)0xC00000A0L)
+ #define X_STATUS_FILE_IS_A_DIRECTORY                    ((X_STATUS)0xC00000BAL)
+ #define X_STATUS_NOT_SUPPORTED                          ((X_STATUS)0xC00000BBL)
++#define X_STATUS_NOT_SAME_DEVICE                        ((X_STATUS)0xC00000D4L)
+ #define X_STATUS_INVALID_PARAMETER_1                    ((X_STATUS)0xC00000EFL)
+ #define X_STATUS_INVALID_PARAMETER_2                    ((X_STATUS)0xC00000F0L)
+ #define X_STATUS_INVALID_PARAMETER_3                    ((X_STATUS)0xC00000F1L)
++#define X_STATUS_DIRECTORY_NOT_EMPTY                    ((X_STATUS)0xC0000101L)
+ #define X_STATUS_NOT_A_DIRECTORY                        ((X_STATUS)0xC0000103L)
+ #define X_STATUS_PROCESS_IS_TERMINATING                 ((X_STATUS)0xC000010AL)
+ #define X_STATUS_DLL_NOT_FOUND                          ((X_STATUS)0xC0000135L)

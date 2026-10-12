@@ -1,0 +1,752 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [UI] Paint and present the guest output on a dedicated
+ present thread
+
+Xenia's GPU command thread limits the frame rate in Halo 3's busy scenes
+(97-99% busy from about 1,600 draws per frame on), and with the presenter
+painting immediately, it also painted the guest output and made the host
+present call itself: 5-9% of its time in heavy scenes, 30-40% at the frame
+cap where the present call blocks.
+
+With host_present_thread (on by default), the refreshing thread only
+publishes the image to the guest output mailbox and notifies a dedicated
+present thread, which checks the paint mode and paints under
+paint_mode_mutex_ like the inline path did, so the UI thread takes painting
+over exactly as before. Refreshes during a paint coalesce into one paint
+of the newest image, and an image is never presented twice. The thread is
+started last in the implementations' initialization and stopped first in
+their destructors. GPU loss during its paints goes to the same callback.
+
+The stats keep the GPU thread's time apart from the present thread's: the
+GPU thread line shows paints done on it (only with the option off), and a
+new "Halo 3 present thread" line shows the present thread's paint time,
+allocator waits and host Present, its wakes and their delay after the
+refresh, and the guest output images replaced before any paint took them.
+---
+ src/xenia/gpu/gpu_thread_stats.h        |  45 +++--
+ src/xenia/kernel/title/halo3/halo3.cc   |  54 ++++--
+ src/xenia/ui/d3d12/d3d12_presenter.cc   |  21 ++-
+ src/xenia/ui/presenter.cc               | 221 +++++++++++++++++++++---
+ src/xenia/ui/presenter.h                |  99 ++++++++---
+ src/xenia/ui/vulkan/vulkan_presenter.cc |   4 +
+ 6 files changed, 365 insertions(+), 79 deletions(-)
+
+diff --git a/src/xenia/gpu/gpu_thread_stats.h b/src/xenia/gpu/gpu_thread_stats.h
+index 5f6454b..774f854 100644
+--- a/src/xenia/gpu/gpu_thread_stats.h
++++ b/src/xenia/gpu/gpu_thread_stats.h
+@@ -18,10 +18,23 @@
+ namespace xe {
+ namespace gpu {
+ 
++// Painting of the guest output for the guest's swaps on one thread: the GPU
++// command processor thread itself, or the presenter's present thread
++// (host_present_thread).
++struct GuestOutputPaintStats {
++  // Host ticks: the whole paint, and of it, waiting for a free paint command
++  // allocator and the host Present call (Direct3D 12 only).
++  std::atomic<uint64_t> ticks{0};
++  std::atomic<uint64_t> wait_ticks{0};
++  std::atomic<uint64_t> host_present_ticks{0};
++  std::atomic<uint32_t> paints{0};
++};
++
+ // Counters for what the GPU command processor thread spends its time on, for
+ // titles that log performance statistics. Written by the command processor
+-// thread (and the presenter); readers exchange them with 0. Header-only, so
+-// any library can read them without linking the GPU code.
++// thread (and the presenter, including on its present thread); readers
++// exchange them with 0. Header-only, so any library can read them without
++// linking the GPU code.
+ struct GpuThreadStats {
+   // Host ticks (Clock::QueryHostTickCount).
+   std::atomic<uint64_t> idle_ticks{0};          // waiting for new commands
+@@ -31,13 +44,22 @@ struct GpuThreadStats {
+   std::atomic<uint64_t> gpu_wait_ticks{0};      // waiting for host GPU work
+   std::atomic<uint64_t> wait_reg_mem_ticks{0};  // guest WAIT_REG_MEM polls
+   // Inside the presents: refreshing the guest output image (which also ends
+-  // the frame's submission) and painting it to the host window on this
+-  // thread, and of the painting, waiting for a free paint command allocator
+-  // and the host Present call.
++  // the frame's submission), and painting it to the host window on this
++  // thread (with host_present_thread off; on otherwise, the presents only
++  // notify the present thread).
+   std::atomic<uint64_t> refresh_ticks{0};
+-  std::atomic<uint64_t> paint_ticks{0};
+-  std::atomic<uint64_t> paint_wait_ticks{0};
+-  std::atomic<uint64_t> host_present_ticks{0};
++  GuestOutputPaintStats gpu_thread_paint;
++  // Not this thread's time: painting on the presenter's present thread, and
++  // the times it has been woken by a refresh, with the host ticks from the
++  // refresh to the start of the paint (or the paint request to the UI thread),
++  // summed.
++  GuestOutputPaintStats present_thread_paint;
++  std::atomic<uint32_t> present_thread_wakes{0};
++  std::atomic<uint64_t> present_thread_delay_ticks{0};
++  // Guest output images published by the presents, and of them, those replaced
++  // in the mailbox by a newer one before any paint (on any thread) took them.
++  std::atomic<uint32_t> guest_output_refreshes{0};
++  std::atomic<uint32_t> guest_output_replaced{0};
+   std::atomic<uint32_t> swaps{0};
+   std::atomic<uint32_t> draws{0};
+   std::atomic<uint32_t> copies{0};  // resolves (Direct3D 12)
+@@ -50,9 +72,10 @@ struct GpuThreadStats {
+   std::atomic<uint32_t> small_readback_latency_frames{0};  // sum, delivered
+ };
+ 
+-// Whether this thread is painting the guest output as part of a guest swap
+-// (Presenter::RefreshGuestOutput) rather than for the UI.
+-inline thread_local bool painting_guest_output = false;
++// While this thread is painting the guest output for a guest swap (in
++// Presenter::RefreshGuestOutput or on the presenter's present thread), the
++// counters of this thread; null otherwise, such as for UI thread paints.
++inline thread_local GuestOutputPaintStats* guest_output_paint_stats = nullptr;
+ 
+ inline GpuThreadStats& gpu_thread_stats() {
+   static GpuThreadStats stats;
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index b14444a..527a254 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -62,16 +62,27 @@ void LogStats() {
+   const uint64_t now = Clock::QueryHostTickCount();
+   const uint64_t frequency = Clock::QueryHostTickFrequency();
+   if (!last) {
+-    // The counters that measure time ran since Xenia started; start the
+-    // first interval clean.
++    // The counters that measure time, and the present counts (rates, and the
++    // divisor of the present thread's average delay), ran since Xenia
++    // started; start the first interval clean.
+     last = now;
+     gpu::GpuThreadStats& g = gpu::gpu_thread_stats();
+     for (std::atomic<uint64_t>* ticks :
+          {&g.idle_ticks, &g.execute_ticks, &g.swap_ticks, &g.present_ticks,
+           &g.gpu_wait_ticks, &g.wait_reg_mem_ticks, &g.refresh_ticks,
+-          &g.paint_ticks, &g.paint_wait_ticks, &g.host_present_ticks}) {
++          &g.gpu_thread_paint.ticks, &g.gpu_thread_paint.wait_ticks,
++          &g.gpu_thread_paint.host_present_ticks, &g.present_thread_paint.ticks,
++          &g.present_thread_paint.wait_ticks,
++          &g.present_thread_paint.host_present_ticks,
++          &g.present_thread_delay_ticks}) {
+       ticks->store(0, std::memory_order_relaxed);
+     }
++    for (std::atomic<uint32_t>* count :
++         {&g.gpu_thread_paint.paints, &g.present_thread_paint.paints,
++          &g.present_thread_wakes, &g.guest_output_refreshes,
++          &g.guest_output_replaced}) {
++      count->store(0, std::memory_order_relaxed);
++    }
+     apu::audio_stats().min_queued_frames.store(UINT32_MAX,
+                                                std::memory_order_relaxed);
+     return;
+@@ -181,7 +192,8 @@ void LogStats() {
+       a.resumes.exchange(0), min_queued == UINT32_MAX ? 0 : min_queued);
+   // The GPU command processor thread, in percent of the interval. Executing
+   // includes the swaps, which include the presents, and the waits for the
+-  // host GPU and for guest memory (WAIT_REG_MEM).
++  // host GPU and for guest memory (WAIT_REG_MEM). The presents paint the
++  // guest output on this thread only with host_present_thread off.
+   gpu::GpuThreadStats& g = gpu::gpu_thread_stats();
+   const double percent = 100.0 / (seconds * double(frequency));
+   const uint32_t swaps = g.swaps.exchange(0);
+@@ -189,13 +201,15 @@ void LogStats() {
+   const uint32_t copies = g.copies.exchange(0);
+   const uint32_t delivered = g.small_readbacks_delivered.exchange(0);
+   const uint32_t latency = g.small_readback_latency_frames.exchange(0);
++  gpu::GuestOutputPaintStats& gpu_paint = g.gpu_thread_paint;
+   XELOGI(
+       "Halo 3 GPU thread: idle {:.0f}%, executing {:.0f}% (swaps {:.0f}%, "
+       "presents {:.0f}%, host GPU waits {:.0f}%, {} guest memory waits "
+       "{:.0f}%); presents: refresh with the frame's submission {:.0f}%, "
+-      "paint {:.0f}% (allocator waits {:.0f}%, host Present {:.0f}%); {:.1f} "
+-      "swaps/s, {:.0f} draws and {:.0f} resolves per swap; small readbacks: "
+-      "{} queued, {} delivered ({:.1f} frames late), {} skipped",
++      "paint on the GPU thread {:.0f}% (allocator waits {:.0f}%, host "
++      "Present {:.0f}%; {:.1f} paints/s); {:.1f} swaps/s, {:.0f} draws and "
++      "{:.0f} resolves per swap; small readbacks: {} queued, {} delivered "
++      "({:.1f} frames late), {} skipped",
+       double(g.idle_ticks.exchange(0)) * percent,
+       double(g.execute_ticks.exchange(0)) * percent,
+       double(g.swap_ticks.exchange(0)) * percent,
+@@ -204,13 +218,33 @@ void LogStats() {
+       g.wait_reg_mem_waits.exchange(0),
+       double(g.wait_reg_mem_ticks.exchange(0)) * percent,
+       double(g.refresh_ticks.exchange(0)) * percent,
+-      double(g.paint_ticks.exchange(0)) * percent,
+-      double(g.paint_wait_ticks.exchange(0)) * percent,
+-      double(g.host_present_ticks.exchange(0)) * percent, swaps / seconds,
++      double(gpu_paint.ticks.exchange(0)) * percent,
++      double(gpu_paint.wait_ticks.exchange(0)) * percent,
++      double(gpu_paint.host_present_ticks.exchange(0)) * percent,
++      gpu_paint.paints.exchange(0) / seconds, swaps / seconds,
+       swaps ? double(draws) / swaps : 0.0, swaps ? double(copies) / swaps : 0.0,
+       g.small_readbacks_queued.exchange(0), delivered,
+       delivered ? double(latency) / delivered : 0.0,
+       g.small_readbacks_skipped.exchange(0));
++  // The presenter's present thread (host_present_thread), busy in percent of
++  // the interval, and the guest output images the presents have published:
++  // those replaced before any paint took them weren't displayed.
++  gpu::GuestOutputPaintStats& present_paint = g.present_thread_paint;
++  const uint32_t wakes = g.present_thread_wakes.exchange(0);
++  const uint64_t wake_delay_ticks = g.present_thread_delay_ticks.exchange(0);
++  XELOGI(
++      "Halo 3 present thread: paint {:.0f}% (allocator waits {:.0f}%, host "
++      "Present {:.0f}%), {:.1f} paints/s; woken {:.1f} times/s, {:.3f} ms "
++      "after the refresh on average; guest output: {:.1f} refreshes/s, "
++      "{:.1f}/s replaced by a newer one before any paint",
++      double(present_paint.ticks.exchange(0)) * percent,
++      double(present_paint.wait_ticks.exchange(0)) * percent,
++      double(present_paint.host_present_ticks.exchange(0)) * percent,
++      present_paint.paints.exchange(0) / seconds, wakes / seconds,
++      wakes ? double(wake_delay_ticks) * 1000.0 / (double(frequency) * wakes)
++            : 0.0,
++      g.guest_output_refreshes.exchange(0) / seconds,
++      g.guest_output_replaced.exchange(0) / seconds);
+ }
+ 
+ void OnExposureReadback(cpu::ppc::PPCContext* ctx, void*) {
+diff --git a/src/xenia/ui/d3d12/d3d12_presenter.cc b/src/xenia/ui/d3d12/d3d12_presenter.cc
+index 74d4cc0..3d5a749 100644
+--- a/src/xenia/ui/d3d12/d3d12_presenter.cc
++++ b/src/xenia/ui/d3d12/d3d12_presenter.cc
+@@ -50,6 +50,10 @@ namespace shaders {
+ }  // namespace shaders
+ 
+ D3D12Presenter::~D3D12Presenter() {
++  // Stop painting on the present thread first, so its last paint is awaited
++  // below, and nothing it uses is destroyed while it may be painting.
++  ShutdownPresentThread();
++
+   // Await completion of the usage of everything before destroying anything,
+   // irrespective of the declaration order in the class.
+   // From most likely the latest to most likely the earliest to be signaled, so
+@@ -470,13 +474,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
+       paint_context_.paint_completion_timeline->GetUpcomingSubmission();
+   const uint64_t command_allocator_count =
+       UINT64(paint_context_.command_allocators.size());
++  // The statistics counters of the thread painting the guest output for a
++  // guest swap, null for UI thread paints.
++  gpu::GuestOutputPaintStats* const paint_stats = gpu::guest_output_paint_stats;
+   {
+-    const uint64_t wait_start =
+-        gpu::painting_guest_output ? Clock::QueryHostTickCount() : 0;
++    const uint64_t wait_start = paint_stats ? Clock::QueryHostTickCount() : 0;
+     paint_context_.paint_completion_timeline
+         ->AwaitMaxSubmissionsPendingAndUpdateCompleted(command_allocator_count);
+-    if (wait_start) {
+-      gpu::gpu_thread_stats().paint_wait_ticks.fetch_add(
++    if (paint_stats) {
++      paint_stats->wait_ticks.fetch_add(
+           Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
+     }
+   }
+@@ -1093,14 +1099,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
+-  const uint64_t present_start =
+-      gpu::painting_guest_output ? Clock::QueryHostTickCount() : 0;
++  const uint64_t present_start = paint_stats ? Clock::QueryHostTickCount() : 0;
+   HRESULT present_result = paint_context_.swap_chain->Present(
+       0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                      ? DXGI_PRESENT_ALLOW_TEARING
+                                      : 0));
+-  if (present_start) {
+-    gpu::gpu_thread_stats().host_present_ticks.fetch_add(
++  if (paint_stats) {
++    paint_stats->host_present_ticks.fetch_add(
+         Clock::QueryHostTickCount() - present_start, std::memory_order_relaxed);
+   }
+   // Even if presentation has failed, work might have been enqueued anyway
+diff --git a/src/xenia/ui/presenter.cc b/src/xenia/ui/presenter.cc
+index e704be0..15ff268 100644
+--- a/src/xenia/ui/presenter.cc
++++ b/src/xenia/ui/presenter.cc
+@@ -10,9 +10,11 @@
+ #include "xenia/ui/presenter.h"
+ 
+ #include "xenia/base/assert.h"
++#include "xenia/base/clock.h"
+ #include "xenia/base/cvar.h"
+ #include "xenia/base/logging.h"
+ #include "xenia/base/platform.h"
++#include "xenia/base/threading.h"
+ #include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/ui/window.h"
+ 
+@@ -37,6 +39,23 @@ DEFINE_bool(
+     "surface directly instead of requesting the UI thread to do so through the "
+     "host window system.",
+     "Display");
++// The host present call may block (the presentation queue being full, or the
++// host driver synchronizing to the display), and painting waits for a free
++// paint command allocator - with these on a dedicated thread, GPU emulation
++// only publishes the refreshed image and notifies that thread, which then
++// always paints the newest image (older ones are replaced in the mailbox
++// rather than queued). Read on every guest output refresh, so per-game
++// configuration may change it. Disabling it brings back presenting exactly
++// between emulation frames on the GPU emulation thread, for debugging with
++// external tools that capture frames by the host present calls.
++DEFINE_bool(
++    host_present_thread, true,
++    "When the guest output is presented to the host surface without the UI "
++    "thread (host_present_from_non_ui_thread), paint and present it on a "
++    "dedicated host thread instead of the GPU emulation thread, so GPU "
++    "emulation doesn't wait for painting and the host present call. If false, "
++    "the GPU emulation thread paints and presents itself.",
++    "Display");
+ 
+ DEFINE_bool(
+     present_render_pass_clear, true,
+@@ -72,6 +91,12 @@ DEFINE_int32(
+ namespace xe {
+ namespace ui {
+ 
++namespace {
++// The refresh number (Presenter::guest_output_refresh_count_) of the guest
++// output image the calling thread has acquired in its last ConsumeGuestOutput.
++thread_local uint64_t consumed_guest_output_refresh = 0;
++}  // namespace
++
+ void Presenter::FatalErrorHostGpuLossCallback(
+     [[maybe_unused]] bool is_responsible,
+     [[maybe_unused]] bool statically_from_ui_thread) {
+@@ -83,6 +108,12 @@ Presenter::~Presenter() {
+   // it if needed.
+   assert_false(is_executing_ui_drawers_);
+ 
++  // The implementation must have stopped the present thread in its destructor
++  // already, as the thread may be painting through the implementation, which
++  // has been destroyed by now. Not leaving a joinable std::thread though.
++  assert_false(present_thread_.joinable());
++  ShutdownPresentThread();
++
+ #if XE_PLATFORM_WIN32
+   if (dxgi_ui_tick_thread_.joinable()) {
+     {
+@@ -387,12 +418,19 @@ bool Presenter::RefreshGuestOutput(
+     guest_output_active_last_refresh_ = false;
+   }
+ 
++  // Number the image so the present thread can tell whether its paint has
++  // already taken an image newer than the refresh it has been notified about.
++  // Written for the writable image before publishing it, like its properties.
++  const uint64_t refresh = ++guest_output_refresh_count_;
++  guest_output_refresh_numbers_[guest_output_mailbox_writable_] = refresh;
++
+   // Make the new image the next to present on the host (the "ready" one),
+   // replacing the one already specified as the next (dropping it instead of
+   // enqueueing the new image after it) to achieve the lowest latency (also,
+   // after switching from UI thread painting to doing it in the guest output
+   // thread, will immediately recover to having the latest frame always sent to
+-  // the host present call on the CPU and all frames reaching a present call).
++  // the host present call on the CPU - and if painting on the refreshing thread
++  // rather than on the present thread, all frames reaching a present call).
+   uint32_t last_acquired_and_ready =
+       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+   // Desired acquired = current acquired (changed only by the consumers).
+@@ -404,6 +442,12 @@ bool Presenter::RefreshGuestOutput(
+       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
+       std::memory_order_acq_rel, std::memory_order_relaxed)) {
+   }
++  gpu::GpuThreadStats& stats = gpu::gpu_thread_stats();
++  stats.guest_output_refreshes.fetch_add(1, std::memory_order_relaxed);
++  if (((last_acquired_and_ready >> 2) & 3) != (last_acquired_and_ready & 3)) {
++    // The previous ready image hasn't been acquired by any consumer.
++    stats.guest_output_replaced.fetch_add(1, std::memory_order_relaxed);
++  }
+   // Now, it's known that `ready == writable` on the host presentation side.
+   // Take the next `writable` with this assumption about its current value in
+   // mind.
+@@ -427,35 +471,27 @@ bool Presenter::RefreshGuestOutput(
+   }
+ 
+   // Trigger the presentation on the host.
+-  PaintResult paint_result = PaintResult::kNotPresented;
++  // The cvar may be changed by per-game configuration while running. Switching
++  // is safe at any refresh: both the present thread and this thread paint only
++  // with paint_mode_mutex_ held for the whole paint.
++  if (cvars::host_present_thread && present_thread_started_) {
++    // Only notify the present thread, without locking paint_mode_mutex_ (that
++    // would make this thread wait for the paint that may be in progress on the
++    // present thread, including the host present call). The present thread
++    // also handles window paint requests in kUIThreadOnRequest, and GPU loss
++    // during its paints.
++    {
++      std::lock_guard<std::mutex> present_thread_lock(present_thread_mutex_);
++      present_thread_latest_refresh_ = refresh;
++      present_thread_latest_refresh_host_ticks_ = Clock::QueryHostTickCount();
++    }
++    present_thread_condition_.notify_one();
++    return is_active;
++  }
++  PaintResult paint_result;
+   {
+     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+-    switch (paint_mode_) {
+-      case PaintMode::kNone:
+-        // Neither painting nor window paint requesting is accessible.
+-        break;
+-      case PaintMode::kUIThreadOnRequest:
+-        // Only window paint requesting is accessible.
+-        RequestPaintOrConnectionRecoveryViaWindow(true);
+-        break;
+-      case PaintMode::kGuestOutputThreadImmediately:
+-        // Both painting and window paint requesting are accessible.
+-        if (surface_paint_connection_state_ ==
+-            SurfacePaintConnectionState::kConnectedPaintable) {
+-          {
+-            gpu::ScopedGpuThreadTicks paint_ticks(
+-                gpu::gpu_thread_stats().paint_ticks);
+-            gpu::painting_guest_output = true;
+-            paint_result = PaintAndPresent(false);
+-            gpu::painting_guest_output = false;
+-          }
+-          if (surface_paint_connection_state_ ==
+-              SurfacePaintConnectionState::kConnectedOutdated) {
+-            RequestPaintOrConnectionRecoveryViaWindow(true);
+-          }
+-        }
+-        break;
+-    }
++    paint_result = PresentGuestOutputWithPaintModeLocked(false);
+   }
+   // Handle GPU loss when not in the middle of the function anymore, and
+   // lifecycle management from the GPU loss callback is fine on the UI thread.
+@@ -603,9 +639,30 @@ bool Presenter::InitializeCommonSurfaceIndependent() {
+   dxgi_ui_tick_thread_ = std::thread(&Presenter::DXGIUITickThread, this);
+ #endif  // XE_PLATFORM
+ 
++  // Started regardless of host_present_thread, which may be enabled later by
++  // per-game configuration - idle until a refresh notifies it. This is the
++  // last step of the implementation's initialization, so everything painting
++  // needs exists by now. present_thread_started_ is written before the
++  // presenter is given to the thread refreshing the guest output.
++  present_thread_ = std::thread(&Presenter::PresentThread, this);
++  present_thread_started_ = true;
++
+   return true;
+ }
+ 
++void Presenter::ShutdownPresentThread() {
++  if (!present_thread_.joinable()) {
++    return;
++  }
++  {
++    std::lock_guard<std::mutex> present_thread_lock(present_thread_mutex_);
++    present_thread_shutdown_ = true;
++  }
++  present_thread_condition_.notify_all();
++  // Waits for the paint in progress, if there is one.
++  present_thread_.join();
++}
++
+ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+     uint32_t& mailbox_index_or_max_if_inactive_out,
+     GuestOutputProperties* properties_out,
+@@ -649,6 +706,7 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   }
+   uint32_t mailbox_index = desired_acquired_and_ready & 3;
++  consumed_guest_output_refresh = guest_output_refresh_numbers_[mailbox_index];
+   // Give the current acquired image to the caller, or UINT32_MAX if it's
+   // inactive.
+   const GuestOutputProperties& properties =
+@@ -1212,6 +1270,113 @@ bool Presenter::RequestPaintOrConnectionRecoveryViaWindow(
+   return true;
+ }
+ 
++Presenter::PaintResult Presenter::PresentGuestOutputWithPaintModeLocked(
++    bool on_present_thread) {
++  switch (paint_mode_) {
++    case PaintMode::kNone:
++      // Neither painting nor window paint requesting is accessible.
++      return PaintResult::kNotPresented;
++    case PaintMode::kUIThreadOnRequest:
++      // Only window paint requesting is accessible.
++      RequestPaintOrConnectionRecoveryViaWindow(true);
++      return PaintResult::kNotPresented;
++    case PaintMode::kGuestOutputThreadImmediately: {
++      // Both painting and window paint requesting are accessible.
++      if (surface_paint_connection_state_ !=
++          SurfacePaintConnectionState::kConnectedPaintable) {
++        // Outdated - the UI thread has been requested to reconnect.
++        return PaintResult::kNotPresented;
++      }
++      gpu::GpuThreadStats& stats = gpu::gpu_thread_stats();
++      gpu::GuestOutputPaintStats& paint_stats = on_present_thread
++                                                    ? stats.present_thread_paint
++                                                    : stats.gpu_thread_paint;
++      PaintResult paint_result;
++      {
++        gpu::ScopedGpuThreadTicks paint_ticks(paint_stats.ticks);
++        gpu::guest_output_paint_stats = &paint_stats;
++        paint_result = PaintAndPresent(false);
++        gpu::guest_output_paint_stats = nullptr;
++      }
++      paint_stats.paints.fetch_add(1, std::memory_order_relaxed);
++      if (surface_paint_connection_state_ ==
++          SurfacePaintConnectionState::kConnectedOutdated) {
++        RequestPaintOrConnectionRecoveryViaWindow(true);
++      }
++      return paint_result;
++    }
++  }
++  return PaintResult::kNotPresented;
++}
++
++void Presenter::PresentThread() {
++  xe::threading::set_name("Present");
++#if XE_PLATFORM_WIN32
++  // Above the GPU emulation thread and the guest threads (normal priority) so
++  // the paint is submitted and presented soon after the refresh even when they
++  // keep the cores busy - this thread sleeps for most of the frame otherwise.
++  // Not higher, in case the host present call ever spins.
++  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
++#endif  // XE_PLATFORM
++  // The newest refresh that has been presented (or of which the UI thread has
++  // been requested to paint, or that couldn't be presented in the current paint
++  // mode at all) - including the newer image a paint may have taken over the
++  // one it has been notified about, so a later notification about that image
++  // doesn't present it again (with variable refresh rate, presenting the same
++  // image twice would delay the next one).
++  uint64_t handled_refresh = 0;
++  std::unique_lock<std::mutex> present_thread_lock(present_thread_mutex_);
++  while (true) {
++    present_thread_condition_.wait(
++        present_thread_lock, [this, &handled_refresh]() {
++          return present_thread_shutdown_ ||
++                 present_thread_latest_refresh_ > handled_refresh;
++        });
++    if (present_thread_shutdown_) {
++      return;
++    }
++    // Coalesce all the refreshes since the last paint into one paint, of the
++    // newest ready image.
++    handled_refresh = present_thread_latest_refresh_;
++    const uint64_t refresh_host_ticks =
++        present_thread_latest_refresh_host_ticks_;
++    // present_thread_mutex_ is a leaf lock, not held while painting.
++    present_thread_lock.unlock();
++    PaintResult paint_result;
++    {
++      // Held for the whole check of the paint mode and the paint, so the UI
++      // thread can take over painting with SetPaintModeFromUIThread.
++      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
++      gpu::GpuThreadStats& stats = gpu::gpu_thread_stats();
++      stats.present_thread_wakes.fetch_add(1, std::memory_order_relaxed);
++      stats.present_thread_delay_ticks.fetch_add(
++          Clock::QueryHostTickCount() - refresh_host_ticks,
++          std::memory_order_relaxed);
++      consumed_guest_output_refresh = 0;
++      paint_result = PresentGuestOutputWithPaintModeLocked(true);
++      handled_refresh =
++          std::max(handled_refresh, consumed_guest_output_refresh);
++    }
++    if (paint_result == PaintResult::kGpuLostResponsible ||
++        paint_result == PaintResult::kGpuLostExternally) {
++      // The end of the entry point, with no locks held. The callback must not
++      // destroy the presenter synchronously from this thread, as destruction
++      // joins it.
++      if (host_gpu_loss_callback_) {
++        host_gpu_loss_callback_(
++            paint_result == PaintResult::kGpuLostResponsible, false);
++      }
++      // Don't paint with the lost device anymore - stay idle until the
++      // presenter is destroyed (without waiting for any other thread).
++      present_thread_lock.lock();
++      present_thread_condition_.wait(
++          present_thread_lock, [this]() { return present_thread_shutdown_; });
++      return;
++    }
++    present_thread_lock.lock();
++  }
++}
++
+ void Presenter::UpdateSurfaceMonitorFromUIThread(
+     bool old_monitor_potentially_disconnected) {
+   // For dropping the monitor when the window is closing and is losing its
+diff --git a/src/xenia/ui/presenter.h b/src/xenia/ui/presenter.h
+index b1d3822..be7fe43 100644
+--- a/src/xenia/ui/presenter.h
++++ b/src/xenia/ui/presenter.h
+@@ -103,11 +103,18 @@ struct RawImage {
+ //
+ // Painting on the host surface may occur in two places:
+ // - If there are no UI overlays, painting of the guest output may be performed
+-//   immediately from the thread refreshing it, to bypass the OS scheduling and
+-//   event handling. This is especially important on platforms where the native
+-//   surface paint event has a frame rate limit (such as the display refresh
+-//   rate), and the limit may differ greatly from the guest frame rate (such as
+-//   presenting a 30 or 60 FPS guest to a 144 Hz host surface).
++//   immediately after refreshing it, outside the UI thread, to bypass the OS
++//   scheduling and event handling. This is especially important on platforms
++//   where the native surface paint event has a frame rate limit (such as the
++//   display refresh rate), and the limit may differ greatly from the guest
++//   frame rate (such as presenting a 30 or 60 FPS guest to a 144 Hz host
++//   surface). This is done by the presenter's present thread, notified by the
++//   thread refreshing the guest output, so the latter (usually the GPU
++//   emulation thread) doesn't wait for painting and the host present call - or,
++//   with host_present_thread disabled, by the refreshing thread itself. Below,
++//   the "guest output thread", when referring to painting, is the one of these
++//   two doing it - it holds paint_mode_mutex_ while painting, and only one of
++//   them can paint at once.
+ // - If the UI overlays (owned by the UI thread) are present, painting of both
+ //   the guest output (is available) and the UI is done exclusively from the
+ //   platform paint event handler. The guest output without UI overlays may also
+@@ -156,11 +163,11 @@ struct RawImage {
+ // windows will result in native composition disabling it.
+ //
+ // The painting connection between the Presenter and the Surface can be managed
+-// only by the UI thread. However, the thread refreshing the guest output may
+-// still mark the current connection as outdated and ask the UI thread (by
+-// requesting painting) to try to recover - but the guest output refresh thread
+-// must not try to reconnect by itself, as methods of the Surface are available
+-// only to the UI thread.
++// only by the UI thread. However, the guest output thread painting may still
++// mark the current connection as outdated and ask the UI thread (by requesting
++// painting) to try to recover - but the guest output thread must not try to
++// reconnect by itself, as methods of the Surface are available only to the UI
++// thread.
+ class Presenter {
+  public:
+   // May be actually called on the UI thread even if statically_from_ui_thread
+@@ -588,9 +595,17 @@ class Presenter {
+   explicit Presenter(HostGpuLossCallback host_gpu_loss_callback)
+       : host_gpu_loss_callback_(host_gpu_loss_callback) {}
+ 
+-  // Must be called by the implementation's initialization, before the presenter
+-  // is used for anything.
++  // Must be called by the implementation's initialization as its last step,
++  // before the presenter is used for anything (starts the present thread, which
++  // may call PaintAndPresentImpl).
+   bool InitializeCommonSurfaceIndependent();
++  // Stops the present thread once its current paint, if there is one, is over.
++  // Must be the first thing the implementation's destructor does, before it
++  // awaits or releases anything painting may use, as the present thread calls
++  // PaintAndPresentImpl. Call from the thread owning the presenter (the UI
++  // thread) after the guest output isn't refreshed anymore, without holding
++  // paint_mode_mutex_. Does nothing if the thread has been stopped already.
++  void ShutdownPresentThread();
+ 
+   // ConnectOrReconnect and Disconnect are callable only by the UI thread and
+   // only when it has access to painting (PaintMode is not
+@@ -688,8 +703,9 @@ class Presenter {
+   // Paints and presents the guest output if available (or just solid black
+   // color), and if requested, the UI on top of it.
+   //
+-  // May be called from the non-UI thread, but only to paint the guest output
+-  // (no UI drawing, with execute_ui_drawers disabled).
++  // May be called from the non-UI thread (the present thread, or the thread
++  // refreshing the guest output), but only to paint the guest output (no UI
++  // drawing, with execute_ui_drawers disabled).
+   //
+   // Call via PaintAndPresent.
+   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+@@ -715,12 +731,13 @@ class Presenter {
+     // thread (including the UI if needed). Painting is possible, and painting
+     // lifecycle is accessible, only by the UI thread.
+     kUIThreadOnRequest,
+-    // Paint immediately in the guest output thread for lower latency. The
+-    // `window_`, however, may be notified that the surface painting connection
+-    // has become outdated (via RequestPaint, as in this case the UI thread will
+-    // need to repaint as sooner as possible after reconnecting anyway), and
+-    // change the surface connection state accordingly (only to
+-    // kConnectedOutdated).
++    // Paint immediately in the guest output thread (the present thread, or the
++    // refreshing thread with host_present_thread disabled) after each refresh
++    // for lower latency. The `window_`, however, may be notified that the
++    // surface painting connection has become outdated (via RequestPaint, as in
++    // this case the UI thread will need to repaint as sooner as possible after
++    // reconnecting anyway), and change the surface connection state
++    // accordingly (only to kConnectedOutdated).
+     // Painting is possible only by the guest output thread, lifecycle
+     // management cannot be done from the UI thread until it takes over.
+     kGuestOutputThreadImmediately,
+@@ -828,6 +845,14 @@ class Presenter {
+   // has been successfully sent to the OS presentation at least.
+   PaintResult PaintAndPresent(bool execute_ui_drawers);
+ 
++  // For the guest output thread after a guest output refresh (on the present
++  // thread, or on the refreshing thread if host_present_thread is disabled),
++  // with paint_mode_mutex_ held: depending on the paint mode, paints the guest
++  // output, or requests painting from the UI thread. Doesn't call
++  // host_gpu_loss_callback_ - the caller must do that after unlocking.
++  PaintResult PresentGuestOutputWithPaintModeLocked(bool on_present_thread);
++  void PresentThread();
++
+   void HandleUIDrawersChangeFromUIThread(bool drawers_were_empty);
+ 
+   bool AreUITicksNeededFromUIThread() const {
+@@ -848,7 +873,8 @@ class Presenter {
+   // Must be called only in the end of entry points - reinitialization of the
+   // presenter may be done by the handler if it was called from the UI thread
+   // (even if the UI thread argument is false - such as when the guest output is
+-  // refreshed on the UI thread).
++  // refreshed on the UI thread). Also called on the present thread, from which
++  // the handler must not destroy the presenter, as that joins the thread.
+   HostGpuLossCallback host_gpu_loss_callback_;
+ 
+   // May be accessed by the guest output thread if the paint mode is not kNone,
+@@ -872,7 +898,10 @@ class Presenter {
+   //    painting.
+   //
+   // On the other hand, the guest output thread _must_ hold it all the time it's
+-  // painting, to ensure the mode stays the same while it's painting.
++  // painting, to ensure the mode stays the same while it's painting - checking
++  // the mode and painting in one critical section. This applies to both the
++  // present thread and the refreshing thread, which also serializes their
++  // painting if host_present_thread is changed while running.
+   std::mutex paint_mode_mutex_;
+   // UI thread: writable, guest output thread: read-only.
+   PaintMode paint_mode_ = PaintMode::kNone;
+@@ -960,6 +989,32 @@ class Presenter {
+   // Accessible only by refreshing, whether the last refresh contained an image
+   // rather than being blank.
+   bool guest_output_active_last_refresh_ = false;
++  // Accessible only by refreshing, the number of images published so far.
++  uint64_t guest_output_refresh_count_ = 0;
++  // The value of guest_output_refresh_count_ when each image was published.
++  // Like guest_output_properties_, written by refreshing for the writable
++  // image, and read by the consumers for the acquired image.
++  std::array<uint64_t, kGuestOutputMailboxSize> guest_output_refresh_numbers_{};
++
++  // The present thread, painting the guest output (in
++  // kGuestOutputThreadImmediately) or requesting painting from the UI thread
++  // (in kUIThreadOnRequest) after refreshes while host_present_thread is
++  // enabled. Refreshing only notifies it, and it coalesces the refreshes that
++  // happen while it's painting into one paint of the newest image.
++  // A leaf lock: nothing else is locked while it's held, and it's not locked
++  // while holding paint_mode_mutex_ or guest_output_mailbox_consumer_mutex_.
++  std::mutex present_thread_mutex_;
++  std::condition_variable present_thread_condition_;
++  // Protected by present_thread_mutex_: the newest refresh the present thread
++  // has been notified about, and when it was published (host ticks).
++  uint64_t present_thread_latest_refresh_ = 0;
++  uint64_t present_thread_latest_refresh_host_ticks_ = 0;
++  bool present_thread_shutdown_ = false;
++  // Accessible only by the thread owning the presenter (the UI thread).
++  std::thread present_thread_;
++  // Written once before the presenter is given to the refreshing thread, so
++  // refreshing can read it.
++  bool present_thread_started_ = false;
+ 
+   // Ordered by the Z order, and then by the time of addition.
+   // Note: All the iteration logic involving this Z ordering must be the same as
+diff --git a/src/xenia/ui/vulkan/vulkan_presenter.cc b/src/xenia/ui/vulkan/vulkan_presenter.cc
+index 68b97e7..aaeb7a1 100644
+--- a/src/xenia/ui/vulkan/vulkan_presenter.cc
++++ b/src/xenia/ui/vulkan/vulkan_presenter.cc
+@@ -133,6 +133,10 @@ bool VulkanPresenter::PaintContext::Submission::Initialize() {
+ }
+ 
+ VulkanPresenter::~VulkanPresenter() {
++  // Stop painting on the present thread first, so its last paint is awaited
++  // below, and nothing it uses is destroyed while it may be painting.
++  ShutdownPresentThread();
++
+   // Destroy the swapchain after its images are not used for drawing anymore.
+   // This is a confusing part in Vulkan, as vkQueuePresentKHR doesn't signal a
+   // fence clearly indicating when it's safe to destroy a swapchain, so we

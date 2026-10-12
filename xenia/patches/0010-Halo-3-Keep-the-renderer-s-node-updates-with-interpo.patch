@@ -1,0 +1,237 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Keep the renderer's node updates with interpolation
+
+The renderer updates some objects' nodes once per tick, on the first
+frame after the tick computed them (sub_8215B0E8, then flag 0x4000):
+
+- Bipeds may turn their head and neck nodes toward a look target
+  (sub_823625F8): a point the object stores or the local player's camera.
+  Interpolation rewrote all nodes on the later frames of each tick, so the
+  turn was lost there and heads twitched at 30 Hz; and the restore saw the
+  turn as an outside change, dropped the biped from interpolation and left
+  blended nodes in the game state. The turn is now measured in each node's
+  own frame on that first frame, re-applied to the blends of the rest of
+  the tick, and counted as written, so the restore puts the tick's own
+  state back.
+- Objects whose nodes the renderer rebuilds from the animation are left
+  to the renderer and not blended.
+
+halo3_log_stats counts both.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        | 10 ++-
+ src/xenia/kernel/title/halo3/halo3.h         |  4 ++
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 72 ++++++++++++++++++--
+ src/xenia/kernel/title/halo3/halo3_math.h    | 32 +++++++++
+ 4 files changed, 111 insertions(+), 7 deletions(-)
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+index 3af6666..87c3b2f 100644
+--- a/src/xenia/kernel/title/halo3/halo3.cc
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -60,14 +60,18 @@ void LogStats() {
+   const uint32_t mouse_frames = s.mouse_frames.exchange(0);
+   const uint32_t objects = s.blended_objects.exchange(0);
+   const uint32_t poses = s.blended_poses.exchange(0);
++  const uint32_t rebuilds = s.render_rebuilds.exchange(0);
++  const uint32_t adjusted = s.adjusted_nodes.exchange(0);
+   XELOGI(
+       "Halo 3: {:.1f} frames/s, {:.1f} ticks/s, {:.1f} presents/s; mouse "
+       "turned the view in {} frames; {:.1f} objects and {:.1f} first-person "
+-      "poses blended per frame (unlock {}, interpolation {}, hooks {})",
++      "poses blended per frame; {} render node rebuilds, {} look-at node "
++      "turns (unlock {}, interpolation {}, hooks {})",
+       frames / seconds, ticks / seconds, presents / seconds, mouse_frames,
+       frames ? double(objects) / frames : 0.0,
+-      frames ? double(poses) / frames : 0.0, cvars::halo3_unlock_framerate,
+-      cvars::halo3_interpolation, cpu::GuestHooks::Get().active());
++      frames ? double(poses) / frames : 0.0, rebuilds, adjusted,
++      cvars::halo3_unlock_framerate, cvars::halo3_interpolation,
++      cpu::GuestHooks::Get().active());
+ }
+ 
+ void OnMainLoopBodyEntry(cpu::ppc::PPCContext* ctx, void*) {
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+index 8aec580..885390a 100644
+--- a/src/xenia/kernel/title/halo3/halo3.h
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -43,6 +43,10 @@ struct Stats {
+   std::atomic<uint32_t> mouse_frames{0};  // frames that turned the view
+   std::atomic<uint32_t> blended_objects{0};
+   std::atomic<uint32_t> blended_poses{0};
++  // Renderer node updates: full rebuilds (objects left unblended) and
++  // single nodes it turned (biped head look-at) on top of a blend.
++  std::atomic<uint32_t> render_rebuilds{0};
++  std::atomic<uint32_t> adjusted_nodes{0};
+ };
+ Stats& stats();
+ 
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+index 777d785..af63a74 100644
+--- a/src/xenia/kernel/title/halo3/halo3_interp.cc
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -63,6 +63,13 @@ constexpr uint32_t kAfterGameTick = 0x820A3964;
+ // main loop body: first instruction after `bl game_update`, before the
+ // director, observer and first-person frame updates and rendering.
+ constexpr uint32_t kAfterGameUpdate = 0x821A91C4;
++// sub_8215B0E8, the renderer's once-per-tick node update of an object, after
++// both of its paths and right before it marks the object done (0x4000):
++// r20 = object handle, r31 = object; the rebuild path (r23 != 0 or the low
++// byte of r27 != 0) recomputed every node from the animation, the other
++// path only lets bipeds turn their head and neck nodes toward a look target
++// (sub_823625F8).
++constexpr uint32_t kRenderNodesUpdated = 0x8215B480;
+ 
+ // Thread-local game globals are reached through r13 (KPCR); its first word is
+ // the TLS block holding pointers to every subsystem's globals.
+@@ -154,6 +161,12 @@ struct ObjectSnapshot {
+   std::vector<Matrix4x3> previous_nodes;
+   std::vector<Matrix4x3> current_nodes;
+   std::vector<Matrix4x3> written_nodes;
++  // The renderer rebuilds this object's nodes itself; it isn't blended.
++  bool render_animated = false;
++  // Node turns the renderer added on the first frame after the last tick
++  // (biped head look-at), in the node's own frame, re-applied to the blends
++  // of the later frames, when the renderer doesn't run them again.
++  std::vector<std::pair<uint32_t, Matrix4x3>> node_adjustments;
+ };
+ 
+ struct PoseSnapshot {
+@@ -366,9 +379,14 @@ void SnapshotObjects(cpu::ppc::PPCContext* ctx, bool consecutive) {
+     const uint32_t node_count =
+         std::min<uint32_t>(nodes_size / kMatrixSize, kMaxNodes);
+ 
+-    const bool same_object =
+-        consecutive && salt == o.salt && address == o.address &&
+-        nodes_size == o.nodes_size && nodes_offset == o.nodes_offset;
++    const bool same_identity = salt == o.salt && address == o.address &&
++                               nodes_size == o.nodes_size &&
++                               nodes_offset == o.nodes_offset;
++    const bool same_object = consecutive && same_identity;
++    if (!same_identity) {
++      o.render_animated = false;
++    }
++    o.node_adjustments.clear();
+     if (same_object) {
+       std::swap(o.previous_nodes, o.current_nodes);
+       o.previous = o.current;
+@@ -405,7 +423,7 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+   const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
+   for (uint32_t i = 0; i < state->high_water_mark; ++i) {
+     ObjectSnapshot& o = state->objects[i];
+-    if (!o.has_previous || !o.moved || o.applied ||
++    if (!o.has_previous || !o.moved || o.applied || o.render_animated ||
+         !StillValid(ctx, data, i, o)) {
+       continue;
+     }
+@@ -414,6 +432,9 @@ void BlendObjects(cpu::ppc::PPCContext* ctx, float alpha) {
+       o.written_nodes[n] =
+           Interpolate(o.previous_nodes[n], o.current_nodes[n], alpha);
+     }
++    for (const auto& [n, adjustment] : o.node_adjustments) {
++      o.written_nodes[n] = Multiply(o.written_nodes[n], adjustment);
++    }
+     o.written = BlendTransform(o.previous, o.current, alpha);
+     const uint32_t nodes = o.address + o.nodes_offset;
+     for (uint32_t n = 0; n < o.node_count; ++n) {
+@@ -458,6 +479,48 @@ void RestoreObjects(cpu::ppc::PPCContext* ctx) {
+   }
+ }
+ 
++// The renderer's once-per-tick node update ran for an object (after our
++// blend, on the first frame after the tick that computed its nodes).
++void OnRenderNodesUpdated(cpu::ppc::PPCContext* ctx, void*) {
++  if (!state || !Enabled() || !state->object_array) {
++    return;
++  }
++  const uint32_t index = static_cast<uint32_t>(ctx->r[20]) & 0xFFFF;
++  if (index >= state->high_water_mark) {
++    return;
++  }
++  ObjectSnapshot& o = state->objects[index];
++  if (!o.salt || o.address != static_cast<uint32_t>(ctx->r[31])) {
++    return;
++  }
++  const bool rebuilt = ctx->r[23] != 0 || (ctx->r[27] & 0xFF) != 0;
++  if (rebuilt) {
++    // Every node was recomputed from the animation: leave this object to
++    // the renderer from now on.
++    stats().render_rebuilds++;
++    o.render_animated = true;
++  }
++  if (!o.applied) {
++    return;
++  }
++  // Whatever the renderer changed counts as written, so the restore still
++  // puts the tick's own state back.
++  std::vector<Matrix4x3> guest;
++  LoadNodes(ctx, o.address + o.nodes_offset, o.node_count, guest);
++  for (uint32_t n = 0; n < o.node_count; ++n) {
++    if (SameBits(guest[n], o.written_nodes[n])) {
++      continue;
++    }
++    if (!rebuilt) {
++      // A turned node (head look-at): keep the turn for the rest of the tick.
++      o.node_adjustments.emplace_back(
++          n, Multiply(Inverse(o.written_nodes[n]), guest[n]));
++      stats().adjusted_nodes++;
++    }
++    o.written_nodes[n] = guest[n];
++  }
++}
++
+ // First-person weapons.
+ 
+ uint32_t FpSlotAddress(uint32_t first_person, uint32_t pose_index) {
+@@ -721,6 +784,7 @@ void InstallInterpolation(KernelState* kernel_state) {
+   hooks.Add(processor, kGameUpdateEntry, OnGameUpdateEntry);
+   hooks.Add(processor, kAfterGameTick, OnAfterGameTick);
+   hooks.Add(processor, kAfterGameUpdate, OnAfterGameUpdate);
++  hooks.Add(processor, kRenderNodesUpdated, OnRenderNodesUpdated);
+ }
+ 
+ }  // namespace halo3
+diff --git a/src/xenia/kernel/title/halo3/halo3_math.h b/src/xenia/kernel/title/halo3/halo3_math.h
+index f2cd245..1d92e9e 100644
+--- a/src/xenia/kernel/title/halo3/halo3_math.h
++++ b/src/xenia/kernel/title/halo3/halo3_math.h
+@@ -125,6 +125,38 @@ struct Matrix4x3 {
+   Vector3 position;
+ };
+ 
++// m's rotation applied to v.
++inline Vector3 Rotate(const Matrix4x3& m, const Vector3& v) {
++  return {m.forward.x * v.x + m.left.x * v.y + m.up.x * v.z,
++          m.forward.y * v.x + m.left.y * v.y + m.up.y * v.z,
++          m.forward.z * v.x + m.left.z * v.y + m.up.z * v.z};
++}
++
++// a * b: transforms by b, then by a (a point p maps to s R p + t).
++inline Matrix4x3 Multiply(const Matrix4x3& a, const Matrix4x3& b) {
++  Matrix4x3 r;
++  r.scale = a.scale * b.scale;
++  r.forward = Rotate(a, b.forward);
++  r.left = Rotate(a, b.left);
++  r.up = Rotate(a, b.up);
++  const Vector3 t = Rotate(a, b.position);
++  r.position = {a.scale * t.x + a.position.x, a.scale * t.y + a.position.y,
++                a.scale * t.z + a.position.z};
++  return r;
++}
++
++// Inverse of a rigid transform with uniform scale.
++inline Matrix4x3 Inverse(const Matrix4x3& m) {
++  Matrix4x3 r;
++  r.scale = m.scale != 0.0f ? 1.0f / m.scale : 0.0f;
++  r.forward = {m.forward.x, m.left.x, m.up.x};
++  r.left = {m.forward.y, m.left.y, m.up.y};
++  r.up = {m.forward.z, m.left.z, m.up.z};
++  const Vector3 t = Rotate(r, m.position);
++  r.position = {-r.scale * t.x, -r.scale * t.y, -r.scale * t.z};
++  return r;
++}
++
+ inline Matrix4x3 Interpolate(const Matrix4x3& a, const Matrix4x3& b, float t) {
+   Matrix4x3 r;
+   r.scale = a.scale + (b.scale - a.scale) * t;

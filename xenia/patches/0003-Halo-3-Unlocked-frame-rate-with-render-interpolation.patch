@@ -1,0 +1,713 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [Halo 3] Unlocked frame rate with render interpolation
+
+For the disc release (default.xex hash 19EB90F06A070ED6):
+- halo3_unlock_framerate skips the two vblank waits that hold the game at
+  30 FPS and feeds the main loop's frame time from the host clock. The
+  simulation converts real time into 30 Hz ticks, so game speed is
+  unchanged. halo3_framerate_limit caps the frame rate.
+- halo3_interpolation snapshots object node matrices and positions after
+  every tick, draws a blend of the last two ticks weighted by the leftover
+  tick fraction, and restores the real state before the next tick.
+---
+ src/xenia/kernel/title/halo3/halo3.cc        |  38 +++
+ src/xenia/kernel/title/halo3/halo3.h         |  45 +++
+ src/xenia/kernel/title/halo3/halo3_frame.cc  | 120 +++++++
+ src/xenia/kernel/title/halo3/halo3_interp.cc | 311 +++++++++++++++++++
+ src/xenia/kernel/title/halo3/halo3_math.h    | 143 +++++++++
+ 5 files changed, 657 insertions(+)
+ create mode 100644 src/xenia/kernel/title/halo3/halo3.cc
+ create mode 100644 src/xenia/kernel/title/halo3/halo3.h
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_frame.cc
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_interp.cc
+ create mode 100644 src/xenia/kernel/title/halo3/halo3_math.h
+
+diff --git a/src/xenia/kernel/title/halo3/halo3.cc b/src/xenia/kernel/title/halo3/halo3.cc
+new file mode 100644
+index 0000000..0dc208e
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3.cc
+@@ -0,0 +1,38 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#include "xenia/kernel/title/halo3/halo3.h"
++
++#include "xenia/base/logging.h"
++
++DEFINE_bool(halo3_unlock_framerate, false,
++            "Halo 3: remove the 30 FPS cap. The simulation keeps running at "
++            "30 ticks per second of real time; frames are drawn as fast as "
++            "halo3_framerate_limit allows.",
++            "Halo3");
++DEFINE_int32(halo3_framerate_limit, 0,
++             "Halo 3: frame-rate cap used when halo3_unlock_framerate is on. "
++             "0 means no cap.",
++             "Halo3");
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++
++void Install(KernelState* kernel_state, UserModule* module) {
++  XELOGI("Halo 3 (TU0) detected; installing hooks");
++  InstallFramePacing(kernel_state);
++  InstallInterpolation(kernel_state);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
+diff --git a/src/xenia/kernel/title/halo3/halo3.h b/src/xenia/kernel/title/halo3/halo3.h
+new file mode 100644
+index 0000000..ace2a70
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3.h
+@@ -0,0 +1,45 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_KERNEL_TITLE_HALO3_HALO3_H_
++#define XENIA_KERNEL_TITLE_HALO3_HALO3_H_
++
++#include <cstdint>
++
++#include "xenia/base/cvar.h"
++
++DECLARE_bool(halo3_unlock_framerate);
++DECLARE_int32(halo3_framerate_limit);
++DECLARE_bool(halo3_interpolation);
++
++namespace xe {
++namespace kernel {
++class KernelState;
++class UserModule;
++namespace title {
++namespace halo3 {
++
++// Halo 3, Xbox 360 disc release without a title update. Every guest address in
++// this directory is specific to this exact default.xex.
++constexpr uint32_t kTitleId = 0x4D5307E6;
++constexpr uint64_t kModuleHash = 0x19EB90F06A070ED6ull;
++
++void Install(KernelState* kernel_state, UserModule* module);
++
++// halo3_frame.cc
++void InstallFramePacing(KernelState* kernel_state);
++// halo3_interp.cc
++void InstallInterpolation(KernelState* kernel_state);
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
++
++#endif  // XENIA_KERNEL_TITLE_HALO3_HALO3_H_
+diff --git a/src/xenia/kernel/title/halo3/halo3_frame.cc b/src/xenia/kernel/title/halo3/halo3_frame.cc
+new file mode 100644
+index 0000000..d913c8f
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_frame.cc
+@@ -0,0 +1,120 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// Frame pacing.
++//
++// Halo 3 measures real time in vblanks. main_time_update (82088640) waits for
++// at least one vblank since the previous frame, then returns
++// dt = vblanks elapsed / refresh rate. The renderer's present (821924C0) then
++// waits until two vblanks after the frame started, which is what holds the
++// game at 30 FPS on a 60 Hz display. The simulation itself is driven by real
++// elapsed time: game_time_update (820983E0) converts dt into whole 30 Hz ticks
++// and carries the fraction in game_time_globals+0x14.
++//
++// To unlock the frame rate we skip both vblank waits and feed
++// main_time_update's result from the host clock instead of the vblank
++// counter, so dt stays exact at any frame rate and the simulation speed is
++// unchanged. Everything is decided per frame from cvars, because the per-game
++// config is only loaded after the title module (and these hooks) are set up.
++
++#include <cstdint>
++
++#include "xenia/base/clock.h"
++#include "xenia/base/logging.h"
++#include "xenia/base/threading.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/cpu/ppc/ppc_context.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// main_time_update: `beq cr6, skip_wait`, taken when throttling is disabled.
++constexpr uint32_t kMainTimeWaitBranch = 0x8208870C;
++// main_time_update: `lfs f0, ...` right after `fdivs f1, f31, f0` computed
++// dt from vblanks; the [0, 10 s] clamp follows.
++constexpr uint32_t kMainTimeDtComputed = 0x820887B0;
++// Present (821924C0): `beq cr6, present`, taken when throttling is disabled.
++constexpr uint32_t kPresentWaitBranch = 0x821924EC;
++
++// Only the game's main thread runs main_time_update.
++struct FramePacer {
++  uint64_t last_ticks = 0;
++  uint64_t deadline = 0;
++};
++FramePacer pacer;
++
++void WaitForFrameDeadline(uint64_t frequency) {
++  const int32_t limit = cvars::halo3_framerate_limit;
++  if (limit <= 0) {
++    pacer.deadline = 0;
++    return;
++  }
++  const uint64_t period = frequency / uint64_t(limit);
++  uint64_t now = Clock::QueryGuestTickCount();
++  if (!pacer.deadline || now > pacer.deadline + period) {
++    // First frame, or we fell more than a frame behind: restart the cadence.
++    pacer.deadline = now + period;
++    return;
++  }
++  while (now < pacer.deadline) {
++    const int64_t remaining_ns =
++        int64_t((pacer.deadline - now) * 1000000000ull / frequency);
++    if (remaining_ns > 1500000) {
++      // Coarse sleep, leaving ~1 ms to absorb scheduler wake-up jitter.
++      threading::NanoSleep(remaining_ns - 1000000);
++    } else {
++      threading::MaybeYield();
++    }
++    now = Clock::QueryGuestTickCount();
++  }
++  pacer.deadline += period;
++}
++
++// Runs right before a `beq cr6` that skips a vblank wait: force it taken.
++void SkipVblankWait(cpu::ppc::PPCContext* ctx, void*) {
++  if (cvars::halo3_unlock_framerate) {
++    ctx->cr6.cr6_none_equal = 1;  // CR6[EQ]
++  }
++}
++
++void OnMainTimeDtComputed(cpu::ppc::PPCContext* ctx, void*) {
++  if (!cvars::halo3_unlock_framerate) {
++    pacer = {};
++    return;
++  }
++  const uint64_t frequency = Clock::guest_tick_frequency();
++  WaitForFrameDeadline(frequency);
++  const uint64_t now = Clock::QueryGuestTickCount();
++  double dt = 0.0;
++  if (pacer.last_ticks) {
++    dt = double(now - pacer.last_ticks) / double(frequency);
++  }
++  pacer.last_ticks = now;
++  ctx->f[1] = dt;
++}
++
++}  // namespace
++
++void InstallFramePacing(KernelState* kernel_state) {
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  hooks.Add(processor, kMainTimeWaitBranch, SkipVblankWait);
++  hooks.Add(processor, kMainTimeDtComputed, OnMainTimeDtComputed);
++  hooks.Add(processor, kPresentWaitBranch, SkipVblankWait);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
+diff --git a/src/xenia/kernel/title/halo3/halo3_interp.cc b/src/xenia/kernel/title/halo3/halo3_interp.cc
+new file mode 100644
+index 0000000..967c2c5
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_interp.cc
+@@ -0,0 +1,311 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++// Render interpolation of objects.
++//
++// The simulation runs in 30 Hz ticks; with the frame rate unlocked several
++// frames are drawn per tick. After every tick we snapshot each object's world
++// space node matrices (what the renderer draws skinned and rigid models from)
++// and position. Once a frame's ticks are done we write a blend of the last two
++// snapshots into the objects, weighted by the fraction of a tick that has
++// elapsed since the last one (game_time_globals + 0x14). The per-frame camera
++// and the renderer then see smooth motion. Before the next tick runs, the
++// real state is written back so the simulation never sees blended values.
++
++#include <algorithm>
++#include <array>
++#include <cstring>
++#include <vector>
++
++#include "xenia/base/byte_order.h"
++#include "xenia/base/logging.h"
++#include "xenia/cpu/guest_hooks.h"
++#include "xenia/cpu/ppc/ppc_context.h"
++#include "xenia/kernel/kernel_state.h"
++#include "xenia/kernel/title/halo3/halo3.h"
++#include "xenia/kernel/title/halo3/halo3_math.h"
++
++DEFINE_bool(halo3_interpolation, true,
++            "Halo 3: smooth object motion between 30 Hz simulation ticks when "
++            "the frame rate is unlocked.",
++            "Halo3");
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++namespace {
++
++// game_update (820A3918): entry, before any tick runs.
++constexpr uint32_t kGameUpdateEntry = 0x820A3918;
++// game_update: `addi r31, r31, 1` right after each `bl game_tick`.
++constexpr uint32_t kAfterGameTick = 0x820A3964;
++// main loop body: first instruction after `bl game_update`.
++constexpr uint32_t kAfterGameUpdate = 0x821A91C4;
++
++// Thread-local game globals are reached through r13 (KPCR); its first word is
++// the TLS block holding pointers to every subsystem's globals.
++constexpr uint32_t kTlsObjectDataArray = 0xA8;
++constexpr uint32_t kTlsGameTimeGlobals = 0xBC;
++constexpr uint32_t kGameTimeTicksLeftover = 0x14;
++
++// s_data_array.
++constexpr uint32_t kDataArrayHighWaterMark = 0x38;  // one past the last used
++constexpr uint32_t kDataArrayData = 0x44;
++constexpr uint32_t kDataArrayInUseBits = 0x48;
++// Object header, 0x10 bytes per object.
++constexpr uint32_t kObjectHeaderSize = 0x10;
++constexpr uint32_t kObjectHeaderSalt = 0x0;
++constexpr uint32_t kObjectHeaderAddress = 0xC;
++// Object data.
++constexpr uint32_t kObjectPosition = 0x54;
++constexpr uint32_t kObjectNodeMatricesSize = 0x13A;    // bytes
++constexpr uint32_t kObjectNodeMatricesOffset = 0x13C;  // from the object
++constexpr uint32_t kMatrixSize = 0x34;                 // real_matrix4x3
++
++constexpr uint32_t kMaxObjects = 2048;
++constexpr uint32_t kMaxNodes = 256;
++// Anything that moves further than this in one tick (world units, ~3 m each)
++// teleported; draw it where it is instead of sliding it across the map.
++constexpr float kTeleportDistance = 4.0f;
++
++struct ObjectSnapshot {
++  uint16_t salt = 0;
++  uint32_t address = 0;
++  uint32_t node_count = 0;
++  bool has_previous = false;
++  bool moved = false;
++  bool applied = false;
++  Vector3 previous_position;
++  Vector3 current_position;
++  std::vector<Matrix4x3> previous_nodes;
++  std::vector<Matrix4x3> current_nodes;
++};
++
++// Only the game's main thread runs ticks and the main loop.
++struct InterpolationState {
++  uint32_t object_array = 0;
++  uint32_t high_water_mark = 0;
++  std::array<ObjectSnapshot, kMaxObjects> objects;
++};
++InterpolationState* state = nullptr;
++
++uint32_t LoadU32(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<uint32_t>(ctx->TranslateVirtual(address));
++}
++uint16_t LoadU16(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<uint16_t>(ctx->TranslateVirtual(address));
++}
++float LoadF32(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return xe::load_and_swap<float>(ctx->TranslateVirtual(address));
++}
++void StoreF32(cpu::ppc::PPCContext* ctx, uint32_t address, float value) {
++  xe::store_and_swap<float>(ctx->TranslateVirtual(address), value);
++}
++
++Vector3 LoadVector3(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  return {LoadF32(ctx, address), LoadF32(ctx, address + 4),
++          LoadF32(ctx, address + 8)};
++}
++void StoreVector3(cpu::ppc::PPCContext* ctx, uint32_t address,
++                  const Vector3& v) {
++  StoreF32(ctx, address, v.x);
++  StoreF32(ctx, address + 4, v.y);
++  StoreF32(ctx, address + 8, v.z);
++}
++
++Matrix4x3 LoadMatrix(cpu::ppc::PPCContext* ctx, uint32_t address) {
++  Matrix4x3 m;
++  m.scale = LoadF32(ctx, address);
++  m.forward = LoadVector3(ctx, address + 0x04);
++  m.left = LoadVector3(ctx, address + 0x10);
++  m.up = LoadVector3(ctx, address + 0x1C);
++  m.position = LoadVector3(ctx, address + 0x28);
++  return m;
++}
++void StoreMatrix(cpu::ppc::PPCContext* ctx, uint32_t address,
++                 const Matrix4x3& m) {
++  StoreF32(ctx, address, m.scale);
++  StoreVector3(ctx, address + 0x04, m.forward);
++  StoreVector3(ctx, address + 0x10, m.left);
++  StoreVector3(ctx, address + 0x1C, m.up);
++  StoreVector3(ctx, address + 0x28, m.position);
++}
++
++uint32_t TlsSlot(cpu::ppc::PPCContext* ctx, uint32_t offset) {
++  const uint32_t tls = LoadU32(ctx, static_cast<uint32_t>(ctx->r[13]));
++  return tls ? LoadU32(ctx, tls + offset) : 0;
++}
++
++bool Enabled() {
++  return cvars::halo3_unlock_framerate && cvars::halo3_interpolation;
++}
++
++// Whether object slot i still holds the object we snapshotted.
++bool StillValid(cpu::ppc::PPCContext* ctx, uint32_t data, uint32_t index,
++                const ObjectSnapshot& o) {
++  const uint32_t header = data + index * kObjectHeaderSize;
++  return LoadU16(ctx, header + kObjectHeaderSalt) == o.salt &&
++         LoadU32(ctx, header + kObjectHeaderAddress) == o.address;
++}
++
++// Writes the real (last tick) state back over any blended values.
++void Restore(cpu::ppc::PPCContext* ctx) {
++  if (!state || !state->object_array) {
++    return;
++  }
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    ObjectSnapshot& o = state->objects[i];
++    if (!o.applied) {
++      continue;
++    }
++    o.applied = false;
++    if (!StillValid(ctx, data, i, o)) {
++      continue;
++    }
++    const uint32_t nodes =
++        o.address + LoadU16(ctx, o.address + kObjectNodeMatricesOffset);
++    for (uint32_t n = 0; n < o.node_count; ++n) {
++      StoreMatrix(ctx, nodes + n * kMatrixSize, o.current_nodes[n]);
++    }
++    StoreVector3(ctx, o.address + kObjectPosition, o.current_position);
++  }
++}
++
++void OnGameUpdateEntry(cpu::ppc::PPCContext* ctx, void*) { Restore(ctx); }
++
++void OnAfterGameTick(cpu::ppc::PPCContext* ctx, void*) {
++  if (!Enabled()) {
++    return;
++  }
++  if (!state) {
++    state = new InterpolationState();
++  }
++  const uint32_t array = TlsSlot(ctx, kTlsObjectDataArray);
++  if (!array) {
++    return;
++  }
++  if (array != state->object_array) {
++    // New map or game state: nothing to blend against.
++    for (auto& o : state->objects) {
++      o = ObjectSnapshot();
++    }
++    state->object_array = array;
++  }
++  const uint32_t data = LoadU32(ctx, array + kDataArrayData);
++  const uint32_t in_use = LoadU32(ctx, array + kDataArrayInUseBits);
++  const uint32_t high_water_mark =
++      std::min(LoadU32(ctx, array + kDataArrayHighWaterMark), kMaxObjects);
++  for (uint32_t i = high_water_mark; i < state->high_water_mark; ++i) {
++    state->objects[i].salt = 0;
++    state->objects[i].has_previous = false;
++  }
++  state->high_water_mark = high_water_mark;
++
++  for (uint32_t i = 0; i < high_water_mark; ++i) {
++    ObjectSnapshot& o = state->objects[i];
++    o.applied = false;
++    const bool used = (LoadU32(ctx, in_use + (i >> 5) * 4) >> (i & 31)) & 1;
++    const uint32_t header = data + i * kObjectHeaderSize;
++    const uint16_t salt = used ? LoadU16(ctx, header + kObjectHeaderSalt) : 0;
++    const uint32_t address =
++        used ? LoadU32(ctx, header + kObjectHeaderAddress) : 0;
++    if (!salt || !address) {
++      o.salt = 0;
++      o.has_previous = false;
++      continue;
++    }
++    const uint32_t node_count = std::min<uint32_t>(
++        LoadU16(ctx, address + kObjectNodeMatricesSize) / kMatrixSize,
++        kMaxNodes);
++    const uint32_t nodes =
++        address + LoadU16(ctx, address + kObjectNodeMatricesOffset);
++
++    const bool same_object =
++        salt == o.salt && address == o.address && node_count == o.node_count;
++    if (same_object) {
++      std::swap(o.previous_nodes, o.current_nodes);
++      o.previous_position = o.current_position;
++    } else {
++      o.salt = salt;
++      o.address = address;
++      o.node_count = node_count;
++    }
++    o.current_nodes.resize(node_count);
++    for (uint32_t n = 0; n < node_count; ++n) {
++      o.current_nodes[n] = LoadMatrix(ctx, nodes + n * kMatrixSize);
++    }
++    o.current_position = LoadVector3(ctx, address + kObjectPosition);
++
++    o.has_previous = same_object;
++    if (!same_object) {
++      o.moved = false;
++      continue;
++    }
++    if (DistanceSquared(o.previous_position, o.current_position) >
++        kTeleportDistance * kTeleportDistance) {
++      o.has_previous = false;
++      o.moved = false;
++      continue;
++    }
++    o.moved = std::memcmp(o.previous_nodes.data(), o.current_nodes.data(),
++                          node_count * sizeof(Matrix4x3)) != 0;
++  }
++}
++
++void OnAfterGameUpdate(cpu::ppc::PPCContext* ctx, void*) {
++  if (!state || !Enabled() || !state->object_array) {
++    return;
++  }
++  const uint32_t time_globals = TlsSlot(ctx, kTlsGameTimeGlobals);
++  if (!time_globals) {
++    return;
++  }
++  float alpha = LoadF32(ctx, time_globals + kGameTimeTicksLeftover);
++  if (!(alpha > 0.0f)) {
++    return;  // also rejects NaN
++  }
++  alpha = std::min(alpha, 1.0f);
++  const uint32_t data = LoadU32(ctx, state->object_array + kDataArrayData);
++  for (uint32_t i = 0; i < state->high_water_mark; ++i) {
++    ObjectSnapshot& o = state->objects[i];
++    if (!o.has_previous || !o.moved || o.applied ||
++        !StillValid(ctx, data, i, o)) {
++      continue;
++    }
++    const uint32_t nodes =
++        o.address + LoadU16(ctx, o.address + kObjectNodeMatricesOffset);
++    for (uint32_t n = 0; n < o.node_count; ++n) {
++      StoreMatrix(ctx, nodes + n * kMatrixSize,
++                  Interpolate(o.previous_nodes[n], o.current_nodes[n], alpha));
++    }
++    StoreVector3(ctx, o.address + kObjectPosition,
++                 Lerp(o.previous_position, o.current_position, alpha));
++    o.applied = true;
++  }
++}
++
++}  // namespace
++
++void InstallInterpolation(KernelState* kernel_state) {
++  // A relaunch starts from a clean slate.
++  delete state;
++  state = nullptr;
++  auto& hooks = cpu::GuestHooks::Get();
++  auto processor = kernel_state->processor();
++  hooks.Add(processor, kGameUpdateEntry, OnGameUpdateEntry);
++  hooks.Add(processor, kAfterGameTick, OnAfterGameTick);
++  hooks.Add(processor, kAfterGameUpdate, OnAfterGameUpdate);
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
+diff --git a/src/xenia/kernel/title/halo3/halo3_math.h b/src/xenia/kernel/title/halo3/halo3_math.h
+new file mode 100644
+index 0000000..46a3a3b
+--- /dev/null
++++ b/src/xenia/kernel/title/halo3/halo3_math.h
+@@ -0,0 +1,143 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_KERNEL_TITLE_HALO3_HALO3_MATH_H_
++#define XENIA_KERNEL_TITLE_HALO3_HALO3_MATH_H_
++
++#include <cmath>
++
++namespace xe {
++namespace kernel {
++namespace title {
++namespace halo3 {
++
++struct Vector3 {
++  float x, y, z;
++};
++
++inline Vector3 Lerp(const Vector3& a, const Vector3& b, float t) {
++  return {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t, a.z + (b.z - a.z) * t};
++}
++
++inline float DistanceSquared(const Vector3& a, const Vector3& b) {
++  const float dx = b.x - a.x, dy = b.y - a.y, dz = b.z - a.z;
++  return dx * dx + dy * dy + dz * dz;
++}
++
++inline float Dot(const Vector3& a, const Vector3& b) {
++  return a.x * b.x + a.y * b.y + a.z * b.z;
++}
++
++inline Vector3 Cross(const Vector3& a, const Vector3& b) {
++  return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
++}
++
++inline Vector3 Normalized(const Vector3& v, const Vector3& fallback) {
++  const float length_squared = Dot(v, v);
++  if (!(length_squared > 1e-12f)) {
++    return fallback;
++  }
++  const float inv = 1.0f / std::sqrt(length_squared);
++  return {v.x * inv, v.y * inv, v.z * inv};
++}
++
++struct Quaternion {
++  float x, y, z, w;
++};
++
++// Blam stores orientations as forward/left/up basis vectors (real_matrix4x3:
++// scale, forward, left, up, position), i.e. a rotation matrix with those
++// vectors as columns.
++inline Quaternion QuaternionFromBasis(const Vector3& forward,
++                                      const Vector3& left, const Vector3& up) {
++  // m[row][col] with columns forward, left, up.
++  const float m00 = forward.x, m01 = left.x, m02 = up.x;
++  const float m10 = forward.y, m11 = left.y, m12 = up.y;
++  const float m20 = forward.z, m21 = left.z, m22 = up.z;
++  Quaternion q;
++  const float trace = m00 + m11 + m22;
++  if (trace > 0.0f) {
++    const float s = std::sqrt(trace + 1.0f) * 2.0f;
++    q.w = 0.25f * s;
++    q.x = (m21 - m12) / s;
++    q.y = (m02 - m20) / s;
++    q.z = (m10 - m01) / s;
++  } else if (m00 > m11 && m00 > m22) {
++    const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
++    q.w = (m21 - m12) / s;
++    q.x = 0.25f * s;
++    q.y = (m01 + m10) / s;
++    q.z = (m02 + m20) / s;
++  } else if (m11 > m22) {
++    const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
++    q.w = (m02 - m20) / s;
++    q.x = (m01 + m10) / s;
++    q.y = 0.25f * s;
++    q.z = (m12 + m21) / s;
++  } else {
++    const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
++    q.w = (m10 - m01) / s;
++    q.x = (m02 + m20) / s;
++    q.y = (m12 + m21) / s;
++    q.z = 0.25f * s;
++  }
++  return q;
++}
++
++inline void BasisFromQuaternion(const Quaternion& q, Vector3* forward,
++                                Vector3* left, Vector3* up) {
++  const float xx = q.x * q.x, yy = q.y * q.y, zz = q.z * q.z;
++  const float xy = q.x * q.y, xz = q.x * q.z, yz = q.y * q.z;
++  const float wx = q.w * q.x, wy = q.w * q.y, wz = q.w * q.z;
++  *forward = {1.0f - 2.0f * (yy + zz), 2.0f * (xy + wz), 2.0f * (xz - wy)};
++  *left = {2.0f * (xy - wz), 1.0f - 2.0f * (xx + zz), 2.0f * (yz + wx)};
++  *up = {2.0f * (xz + wy), 2.0f * (yz - wx), 1.0f - 2.0f * (xx + yy)};
++}
++
++// Normalized lerp along the shorter arc. Rotations between two 30 Hz ticks are
++// small, where nlerp is visually identical to slerp and much cheaper.
++inline Quaternion Nlerp(const Quaternion& a, Quaternion b, float t) {
++  if (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w < 0.0f) {
++    b = {-b.x, -b.y, -b.z, -b.w};
++  }
++  Quaternion r = {a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
++                  a.z + (b.z - a.z) * t, a.w + (b.w - a.w) * t};
++  const float length_squared = r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w;
++  if (!(length_squared > 1e-12f)) {
++    return a;
++  }
++  const float inv = 1.0f / std::sqrt(length_squared);
++  return {r.x * inv, r.y * inv, r.z * inv, r.w * inv};
++}
++
++// real_matrix4x3 in host byte order.
++struct Matrix4x3 {
++  float scale;
++  Vector3 forward;
++  Vector3 left;
++  Vector3 up;
++  Vector3 position;
++};
++
++inline Matrix4x3 Interpolate(const Matrix4x3& a, const Matrix4x3& b, float t) {
++  Matrix4x3 r;
++  r.scale = a.scale + (b.scale - a.scale) * t;
++  r.position = Lerp(a.position, b.position, t);
++  const Quaternion q = Nlerp(QuaternionFromBasis(a.forward, a.left, a.up),
++                             QuaternionFromBasis(b.forward, b.left, b.up), t);
++  BasisFromQuaternion(q, &r.forward, &r.left, &r.up);
++  return r;
++}
++
++}  // namespace halo3
++}  // namespace title
++}  // namespace kernel
++}  // namespace xe
++
++#endif  // XENIA_KERNEL_TITLE_HALO3_HALO3_MATH_H_

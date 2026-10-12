@@ -1,0 +1,661 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: damnbitimcrit <333091414+damnbitimcrit@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 00:00:00 +0000
+Subject: [PATCH] [GPU] Small asynchronous resolve readback; GPU thread timing
+ counters
+
+readback_resolve = "small" (Direct3D 12) reads back only resolves of up to
+readback_resolve_small_bytes (16 KB) without ever waiting for the GPU. A
+resolve that small is a few pixels the game reads on the CPU, such as an
+auto exposure luminance sample; larger resolves behave like "none".
+
+- The resolve is copied from shared memory into a slot of a 4 MB readback
+  buffer when its submission ends, and the data is written to guest memory
+  once that submission has completed, polled at the end of each primary
+  buffer and submission check. Delivery is skipped if the CPU wrote the
+  range since (the pages are no longer GPU-written).
+- "fast" flips every destination's two buffers once per frame. A game that
+  resolves into a ring of an even number of targets, one per frame, always
+  writes the same buffer of each, finds the other one missing and waits
+  for the GPU on every resolve; "small" never waits.
+- Resolution-scaled resolves are skipped (not read back).
+- Vulkan treats "small" like "none".
+
+GPU thread counters (gpu_thread_stats.h, header only) for titles that log
+performance: time idle, executing, in swaps, refreshing the guest output,
+waiting for the host GPU and for guest WAIT_REG_MEM, swap/draw/resolve
+counts and the small readback counts.
+---
+ src/xenia/app/emulator_window.cc              |   2 +
+ src/xenia/gpu/command_processor.cc            |  22 ++-
+ src/xenia/gpu/command_processor.h             |   3 +-
+ .../gpu/d3d12/d3d12_command_processor.cc      | 179 +++++++++++++++++-
+ src/xenia/gpu/d3d12/d3d12_command_processor.h |  27 +++
+ src/xenia/gpu/gpu_thread_stats.h              |  70 +++++++
+ .../gpu/pm4_command_processor_implement.h     |  20 +-
+ src/xenia/gpu/shared_memory.cc                |  30 +++
+ src/xenia/gpu/shared_memory.h                 |   3 +
+ .../gpu/vulkan/vulkan_command_processor.cc    |   5 +-
+ 10 files changed, 354 insertions(+), 7 deletions(-)
+ create mode 100644 src/xenia/gpu/gpu_thread_stats.h
+
+diff --git a/src/xenia/app/emulator_window.cc b/src/xenia/app/emulator_window.cc
+index 6aa7ba6..2994f67 100644
+--- a/src/xenia/app/emulator_window.cc
++++ b/src/xenia/app/emulator_window.cc
+@@ -2206,6 +2206,8 @@ void EmulatorWindow::CycleReadbackResolve() {
+     gpu::SetReadbackResolveMode("full");
+   } else if (current == "full") {
+     gpu::SetReadbackResolveMode("none");
++  } else if (current == "none") {
++    gpu::SetReadbackResolveMode("small");
+   } else {
+     gpu::SetReadbackResolveMode("fast");
+   }
+diff --git a/src/xenia/gpu/command_processor.cc b/src/xenia/gpu/command_processor.cc
+index eadd8f5..418c355 100644
+--- a/src/xenia/gpu/command_processor.cc
++++ b/src/xenia/gpu/command_processor.cc
+@@ -16,6 +16,7 @@
+ #include "xenia/base/logging.h"
+ #include "xenia/base/profiling.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/graphics_system.h"
+ #include "xenia/gpu/packet_disassembler.h"
+ #include "xenia/gpu/sampler_info.h"
+@@ -95,11 +96,20 @@ DEFINE_string(
+     " fast: Read from previous frame (1 frame delay, no GPU stall, slight "
+     "performance hit)\n"
+     " full: Wait for GPU to finish (accurate but slow, GPU-CPU sync stall)\n"
+-    " none: Disable readback completely (some games render better without it)",
++    " none: Disable readback completely (some games render better without it)\n"
++    " small: Read back only small resolves (up to "
++    "readback_resolve_small_bytes, such as auto exposure luminance), once the "
++    "GPU has finished them, without stalling; larger resolves behave like none",
+     "GPU");
+ 
+ UPDATE_from_string(readback_resolve, 2025, 12, 4, 21, "fast");
+ 
++DEFINE_uint32(readback_resolve_small_bytes, 16384,
++              "Largest resolve destination, in bytes, that readback_resolve = "
++              "\"small\" reads back. A resolve within one 32x32 tile takes "
++              "8192 bytes at 64 bits per pixel. At most 65536.",
++              "GPU");
++
+ DEFINE_bool(
+     readback_resolve_half_pixel_offset, false,
+     "When resolution scaling and readback resolve are enabled, resolve "
+@@ -154,6 +164,8 @@ ReadbackResolveMode GetReadbackResolveMode() {
+     return ReadbackResolveMode::kFull;
+   } else if (mode == "none") {
+     return ReadbackResolveMode::kDisabled;
++  } else if (mode == "small") {
++    return ReadbackResolveMode::kSmall;
+   } else {
+     // Default to "fast" for any unrecognized value
+     return ReadbackResolveMode::kFast;
+@@ -368,6 +380,7 @@ void CommandProcessor::WorkerThreadMain() {
+       // We've run out of commands to execute.
+       // We spin here waiting for new ones, as the overhead of waiting on our
+       // event is too high.
++      const uint64_t idle_start = Clock::QueryHostTickCount();
+       PrepareForWait();
+       uint32_t loop_count = 0;
+       do {
+@@ -390,6 +403,8 @@ void CommandProcessor::WorkerThreadMain() {
+                (write_ptr_index == 0xBAADF00D ||
+                 read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
++      gpu_thread_stats().idle_ticks.fetch_add(
++          Clock::QueryHostTickCount() - idle_start, std::memory_order_relaxed);
+       if (!worker_running_ || !pending_fns_.empty()) {
+         continue;
+       }
+@@ -397,7 +412,10 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
+-    read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    {
++      ScopedGpuThreadTicks execute_ticks(gpu_thread_stats().execute_ticks);
++      read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    }
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+     //     that many indices.
+diff --git a/src/xenia/gpu/command_processor.h b/src/xenia/gpu/command_processor.h
+index dfe4273..79af753 100644
+--- a/src/xenia/gpu/command_processor.h
++++ b/src/xenia/gpu/command_processor.h
+@@ -41,7 +41,8 @@ enum class GPUSetting { ClearMemoryPageState, ReadbackMemexport };
+ enum class ReadbackResolveMode {
+   kDisabled,  // No readback (none)
+   kFast,      // Delayed sync, 1 frame behind (fast)
+-  kFull       // Immediate sync with GPU stall (full)
++  kFull,      // Immediate sync with GPU stall (full)
++  kSmall      // Only small resolves, once the GPU has done them (small)
+ };
+ 
+ // Occlusion queries - ZPD report mode.
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.cc b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+index 7149982..8469550 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.cc
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.cc
+@@ -21,6 +21,7 @@
+ #include "xenia/gpu/d3d12/d3d12_shader.h"
+ #include "xenia/gpu/draw_util.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/packet_disassembler.h"
+ #include "xenia/gpu/registers.h"
+ #include "xenia/gpu/xenos.h"
+@@ -41,6 +42,7 @@ DEFINE_bool(d3d12_submit_on_primary_buffer_end, true,
+ 
+ DECLARE_bool(clear_memory_page_state);
+ DECLARE_bool(readback_resolve_half_pixel_offset);
++DECLARE_uint32(readback_resolve_small_bytes);
+ 
+ namespace xe {
+ namespace gpu {
+@@ -106,6 +108,7 @@ void D3D12CommandProcessor::PollCompletedSubmission() {
+   // resolves drained here.
+   completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
+   PumpQueryResolves();
++  PumpSmallReadbacks();
+ }
+ 
+ bool D3D12CommandProcessor::PushTransitionBarrier(
+@@ -1696,6 +1699,12 @@ void D3D12CommandProcessor::ShutdownContext() {
+   ui::d3d12::util::ReleaseAndNull(memexport_readback_buffer_);
+   memexport_readback_buffer_size_ = 0;
+ 
++  small_readback_requests_.clear();
++  small_readbacks_pending_.clear();
++  small_readback_next_slot_ = 0;
++  small_readback_slots_used_ = 0;
++  ui::d3d12::util::ReleaseAndNull(small_readback_buffer_);
++
+   ShutdownQueryResources();
+   host_query_pool_.reset();
+ 
+@@ -2276,6 +2285,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
+ 
+   auto aspect = graphics_system_->GetScaledAspectRatio();
+ 
++  ScopedGpuThreadTicks present_ticks(gpu_thread_stats().present_ticks);
+   presenter->RefreshGuestOutput(
+       uint32_t(swap_texture_desc.Width), uint32_t(swap_texture_desc.Height),
+       aspect.first, aspect.second,
+@@ -2603,6 +2613,10 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
+   // Pump any completed resolves now since the guest is likely about to poll.
+   PumpQueryResolves();
+   PumpPendingRetire();
++  if (!small_readbacks_pending_.empty()) {
++    completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
++    PumpSmallReadbacks();
++  }
+ 
+   if (cvars::d3d12_submit_on_primary_buffer_end && submission_open_ &&
+       CanEndSubmissionImmediately()) {
+@@ -3312,16 +3326,173 @@ bool D3D12CommandProcessor::IssueCopy() {
+   if (!BeginSubmission(true)) {
+     return false;
+   }
++  gpu_thread_stats().copies.fetch_add(1, std::memory_order_relaxed);
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+   if (readback_mode == ReadbackResolveMode::kDisabled) {
+     uint32_t written_address, written_length;
+     return render_target_cache_->Resolve(*memory_, *shared_memory_,
+                                          *texture_cache_, written_address,
+                                          written_length);
++  } else if (readback_mode == ReadbackResolveMode::kSmall) {
++    return IssueCopy_SmallReadbackPath();
+   } else {
+     return IssueCopy_ReadbackResolvePath();
+   }
+ }
++
++XE_NOINLINE
++bool D3D12CommandProcessor::IssueCopy_SmallReadbackPath() {
++  uint32_t written_address, written_length;
++  reg::RB_COPY_DEST_INFO copy_dest_info;
++  bool is_scaled;
++  if (!render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
++                                     written_address, written_length,
++                                     &copy_dest_info, &is_scaled)) {
++    return false;
++  }
++  const uint32_t max_length = std::min(
++      uint32_t(cvars::readback_resolve_small_bytes), kSmallReadbackSlotSize);
++  // Larger resolves behave like "none". Resolution-scaled resolves go to the
++  // scaled resolve buffer, not to shared memory, and are not read back.
++  if (!written_length || written_length > max_length || is_scaled) {
++    return true;
++  }
++  if (!small_readback_logged_) {
++    small_readback_logged_ = true;
++    XELOGI(
++        "GPU: readback_resolve = \"small\": reading back resolves of up to {} "
++        "bytes",
++        max_length);
++  }
++
++  // Skip if the destination memory isn't writable, as the readback path does.
++  VirtualHeap* physical_heap = memory_->GetPhysicalHeap();
++  if (!physical_heap) {
++    return true;
++  }
++  HeapAllocationInfo alloc_info;
++  if (!physical_heap->QueryRegionInfo(written_address, &alloc_info) ||
++      !(alloc_info.state & kMemoryAllocationCommit) ||
++      !(alloc_info.protect & kMemoryProtectWrite) ||
++      written_address + written_length >
++          alloc_info.base_address + alloc_info.region_size) {
++    return true;
++  }
++
++  // The same range resolved again in this submission: the copy at the end of
++  // the submission takes the newest data.
++  for (const SmallReadback& request : small_readback_requests_) {
++    if (request.address == written_address &&
++        request.length == written_length) {
++      return true;
++    }
++  }
++
++  GpuThreadStats& stats = gpu_thread_stats();
++  if (small_readback_slots_used_ >= kSmallReadbackSlots) {
++    completion_timeline_->AwaitSubmissionAndUpdateCompleted(0);
++    PumpSmallReadbacks();
++    if (small_readback_slots_used_ >= kSmallReadbackSlots) {
++      // Never wait for the GPU here.
++      stats.small_readbacks_skipped.fetch_add(1, std::memory_order_relaxed);
++      return true;
++    }
++  }
++  if (!small_readback_buffer_) {
++    const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
++    D3D12_RESOURCE_DESC buffer_desc;
++    ui::d3d12::util::FillBufferResourceDesc(
++        buffer_desc, uint64_t(kSmallReadbackSlots) * kSmallReadbackSlotSize,
++        D3D12_RESOURCE_FLAG_NONE);
++    if (FAILED(provider.GetDevice()->CreateCommittedResource(
++            &ui::d3d12::util::kHeapPropertiesReadback,
++            provider.GetHeapFlagCreateNotZeroed(), &buffer_desc,
++            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++            IID_PPV_ARGS(&small_readback_buffer_)))) {
++      XELOGE("Failed to create the small resolve readback buffer");
++      small_readback_buffer_ = nullptr;
++      return true;
++    }
++  }
++
++  SmallReadback request;
++  request.address = written_address;
++  request.length = written_length;
++  request.slot = small_readback_next_slot_;
++  request.frame = frame_current_;
++  request.submission = 0;
++  small_readback_next_slot_ =
++      (small_readback_next_slot_ + 1) % kSmallReadbackSlots;
++  ++small_readback_slots_used_;
++  small_readback_requests_.push_back(request);
++  stats.small_readbacks_queued.fetch_add(1, std::memory_order_relaxed);
++  return true;
++}
++
++void D3D12CommandProcessor::FlushSmallReadbackCopies() {
++  if (small_readback_requests_.empty()) {
++    return;
++  }
++  shared_memory_->UseAsCopySource();
++  SubmitBarriers();
++  ID3D12Resource* shared_memory_buffer = shared_memory_->GetBuffer();
++  const uint64_t submission = GetCurrentSubmission();
++  for (SmallReadback& request : small_readback_requests_) {
++    deferred_command_list_.D3DCopyBufferRegion(
++        small_readback_buffer_, uint64_t(request.slot) * kSmallReadbackSlotSize,
++        shared_memory_buffer, request.address, request.length);
++    request.submission = submission;
++    small_readbacks_pending_.push_back(request);
++  }
++  small_readback_requests_.clear();
++}
++
++void D3D12CommandProcessor::PumpSmallReadbacks() {
++  if (small_readbacks_pending_.empty() || !small_readback_buffer_) {
++    return;
++  }
++  const uint64_t completed_submission = GetCompletedSubmission();
++  if (small_readbacks_pending_.front().submission > completed_submission) {
++    return;
++  }
++  D3D12_RANGE read_range;
++  read_range.Begin = 0;
++  read_range.End = SIZE_T(kSmallReadbackSlots) * kSmallReadbackSlotSize;
++  void* mapping = nullptr;
++  const bool mapped =
++      SUCCEEDED(small_readback_buffer_->Map(0, &read_range, &mapping));
++  GpuThreadStats& stats = gpu_thread_stats();
++  {
++    // Ordered against CPU writes to watched pages, which clear the flags
++    // checked below under this lock.
++    auto global_lock = global_critical_region::Acquire();
++    while (!small_readbacks_pending_.empty() &&
++           small_readbacks_pending_.front().submission <=
++               completed_submission) {
++      const SmallReadback readback = small_readbacks_pending_.front();
++      small_readbacks_pending_.pop_front();
++      --small_readback_slots_used_;
++      if (!mapped || !shared_memory_->IsRangeValidAndGpuWritten(
++                         readback.address, readback.length)) {
++        // The CPU wrote the range since the resolve: its data is newer.
++        stats.small_readbacks_skipped.fetch_add(1, std::memory_order_relaxed);
++        continue;
++      }
++      // Not vastcpy: the length isn't a multiple of its block size.
++      std::memcpy(memory_->TranslatePhysical(readback.address),
++                  static_cast<const uint8_t*>(mapping) +
++                      uint64_t(readback.slot) * kSmallReadbackSlotSize,
++                  readback.length);
++      stats.small_readbacks_delivered.fetch_add(1, std::memory_order_relaxed);
++      stats.small_readback_latency_frames.fetch_add(
++          uint32_t(frame_current_ - readback.frame), std::memory_order_relaxed);
++    }
++  }
++  if (mapped) {
++    D3D12_RANGE written_range = {};
++    small_readback_buffer_->Unmap(0, &written_range);
++  }
++}
+ XE_NOINLINE
+ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+   uint32_t written_address, written_length;
+@@ -3642,7 +3813,10 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
+     await_submission = GetCurrentSubmission() - 1;
+   }
+ 
+-  completion_timeline_->AwaitSubmissionAndUpdateCompleted(await_submission);
++  {
++    ScopedGpuThreadTicks gpu_wait_ticks(gpu_thread_stats().gpu_wait_ticks);
++    completion_timeline_->AwaitSubmissionAndUpdateCompleted(await_submission);
++  }
+ 
+   const uint64_t completed_submission = GetCompletedSubmission();
+ 
+@@ -3698,6 +3872,7 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(
+   // Pull completed query resolves so ZPD reports can retire.
+   PumpQueryResolves();
+   PumpPendingRetire();
++  PumpSmallReadbacks();
+ }
+ 
+ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
+@@ -3908,6 +4083,8 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     host_query_pool_->FlushResolveBatch(deferred_command_list_,
+                                         submission_open_);
+ 
++    FlushSmallReadbackCopies();
++
+     pipeline_cache_->EndSubmission();
+ 
+     // Submit barriers now because resources with the queued barriers may be
+diff --git a/src/xenia/gpu/d3d12/d3d12_command_processor.h b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+index 7c6324c..d338854 100644
+--- a/src/xenia/gpu/d3d12/d3d12_command_processor.h
++++ b/src/xenia/gpu/d3d12/d3d12_command_processor.h
+@@ -329,6 +329,13 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   bool IssueCopy() override;
+   XE_NOINLINE
+   bool IssueCopy_ReadbackResolvePath();
++  // readback_resolve = "small": small resolves are copied into a staging
++  // buffer at the end of their submission and written to guest memory once
++  // that submission has completed, without ever waiting for the GPU.
++  XE_NOINLINE
++  bool IssueCopy_SmallReadbackPath();
++  void FlushSmallReadbackCopies();
++  void PumpSmallReadbacks();
+   void InitializeTrace() override;
+ 
+  private:
+@@ -789,6 +796,26 @@ class D3D12CommandProcessor final : public CommandProcessor {
+   // Map: (written_address << 32 | written_length) -> ReadbackBuffer
+   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
+ 
++  // readback_resolve = "small". Each request owns a slot of the staging buffer
++  // from its resolve until its data is delivered; slots are used in order.
++  struct SmallReadback {
++    uint32_t address;
++    uint32_t length;
++    uint32_t slot;
++    uint64_t frame;
++    uint64_t submission;  // the submission that copies it, once recorded
++  };
++  static constexpr uint32_t kSmallReadbackSlots = 64;
++  static constexpr uint32_t kSmallReadbackSlotSize = 65536;
++  ID3D12Resource* small_readback_buffer_ = nullptr;
++  uint32_t small_readback_next_slot_ = 0;
++  uint32_t small_readback_slots_used_ = 0;
++  // Resolved in the open submission, copied when it ends.
++  std::vector<SmallReadback> small_readback_requests_;
++  // Copied by a submitted submission, waiting for it to complete.
++  std::deque<SmallReadback> small_readbacks_pending_;
++  bool small_readback_logged_ = false;
++
+   // Simple single buffer for memexport (always syncs, no double-buffering)
+   ID3D12Resource* memexport_readback_buffer_ = nullptr;
+   uint32_t memexport_readback_buffer_size_ = 0;
+diff --git a/src/xenia/gpu/gpu_thread_stats.h b/src/xenia/gpu/gpu_thread_stats.h
+new file mode 100644
+index 0000000..34961fc
+--- /dev/null
++++ b/src/xenia/gpu/gpu_thread_stats.h
+@@ -0,0 +1,70 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2026 damnbitimcrit. All rights reserved.                         *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ */
++
++#ifndef XENIA_GPU_GPU_THREAD_STATS_H_
++#define XENIA_GPU_GPU_THREAD_STATS_H_
++
++#include <atomic>
++#include <cstdint>
++
++#include "xenia/base/clock.h"
++
++namespace xe {
++namespace gpu {
++
++// Counters for what the GPU command processor thread spends its time on, for
++// titles that log performance statistics. Written by the command processor
++// thread (and the presenter); readers exchange them with 0. Header-only, so
++// any library can read them without linking the GPU code.
++struct GpuThreadStats {
++  // Host ticks (Clock::QueryHostTickCount).
++  std::atomic<uint64_t> idle_ticks{0};          // waiting for new commands
++  std::atomic<uint64_t> execute_ticks{0};       // executing command buffers
++  std::atomic<uint64_t> swap_ticks{0};          // inside IssueSwap
++  std::atomic<uint64_t> present_ticks{0};       // the host Present call
++  std::atomic<uint64_t> gpu_wait_ticks{0};      // waiting for host GPU work
++  std::atomic<uint64_t> wait_reg_mem_ticks{0};  // guest WAIT_REG_MEM polls
++  std::atomic<uint32_t> swaps{0};
++  std::atomic<uint32_t> draws{0};
++  std::atomic<uint32_t> copies{0};  // resolves (Direct3D 12)
++  std::atomic<uint32_t> wait_reg_mem_waits{0};
++  // readback_resolve = "small".
++  std::atomic<uint32_t> small_readbacks_queued{0};
++  std::atomic<uint32_t> small_readbacks_delivered{0};
++  // The CPU wrote the range after the resolve, or there was no free slot.
++  std::atomic<uint32_t> small_readbacks_skipped{0};
++  std::atomic<uint32_t> small_readback_latency_frames{0};  // sum, delivered
++};
++
++inline GpuThreadStats& gpu_thread_stats() {
++  static GpuThreadStats stats;
++  return stats;
++}
++
++// Adds the host ticks of its lifetime to a counter.
++class ScopedGpuThreadTicks {
++ public:
++  explicit ScopedGpuThreadTicks(std::atomic<uint64_t>& ticks)
++      : ticks_(ticks), start_(Clock::QueryHostTickCount()) {}
++  ~ScopedGpuThreadTicks() {
++    ticks_.fetch_add(Clock::QueryHostTickCount() - start_,
++                     std::memory_order_relaxed);
++  }
++  ScopedGpuThreadTicks(const ScopedGpuThreadTicks&) = delete;
++  ScopedGpuThreadTicks& operator=(const ScopedGpuThreadTicks&) = delete;
++
++ private:
++  std::atomic<uint64_t>& ticks_;
++  uint64_t start_;
++};
++
++}  // namespace gpu
++}  // namespace xe
++
++#endif  // XENIA_GPU_GPU_THREAD_STATS_H_
+diff --git a/src/xenia/gpu/pm4_command_processor_implement.h b/src/xenia/gpu/pm4_command_processor_implement.h
+index 1311d5e..260cea0 100644
+--- a/src/xenia/gpu/pm4_command_processor_implement.h
++++ b/src/xenia/gpu/pm4_command_processor_implement.h
+@@ -667,8 +667,12 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_XE_SWAP(uint32_t packet,
+   uint32_t frontbuffer_height = reader_.ReadAndSwap<uint32_t>();
+   reader_.AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
+-  COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
+-                               frontbuffer_height);
++  {
++    ScopedGpuThreadTicks swap_ticks(gpu_thread_stats().swap_ticks);
++    COMMAND_PROCESSOR::IssueSwap(frontbuffer_ptr, frontbuffer_width,
++                                 frontbuffer_height);
++  }
++  gpu_thread_stats().swaps.fetch_add(1, std::memory_order_relaxed);
+ 
+   ++counter_;
+   return true;
+@@ -722,6 +726,8 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+                 : register_file_->values[poll_reg_addr];
+ 
+   bool matched = false;
++  // Host ticks when the first poll didn't match.
++  uint64_t wait_start = 0;
+ 
+   do {
+     uint32_t value = value_ref;
+@@ -739,6 +745,11 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+     matched = MatchValueAndRef(value & mask, ref, wait_info);
+ 
+     if (!matched) {
++      if (!wait_start) {
++        wait_start = Clock::QueryHostTickCount();
++        gpu_thread_stats().wait_reg_mem_waits.fetch_add(
++            1, std::memory_order_relaxed);
++      }
+       // Wait.
+       if (wait >= 0x100) {
+         PrepareForWait();
+@@ -759,6 +770,10 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
+     }
+   } while (!matched);
+ 
++  if (wait_start) {
++    gpu_thread_stats().wait_reg_mem_ticks.fetch_add(
++        Clock::QueryHostTickCount() - wait_start, std::memory_order_relaxed);
++  }
+   return true;
+ }
+ XE_NOINLINE
+@@ -1098,6 +1113,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3Draw(
+     // backend's predicate instead of blocking. Surveys themselves are
+     // ordinary draws here.
+     if (COMMAND_PROCESSOR::PrepareVIZDraw(viz_query_condition)) {
++      gpu_thread_stats().draws.fetch_add(1, std::memory_order_relaxed);
+       draw_succeeded = COMMAND_PROCESSOR::IssueDraw(
+           vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+           is_indexed ? &index_buffer_info : nullptr,
+diff --git a/src/xenia/gpu/shared_memory.cc b/src/xenia/gpu/shared_memory.cc
+index 3afb391..1df729e 100644
+--- a/src/xenia/gpu/shared_memory.cc
++++ b/src/xenia/gpu/shared_memory.cc
+@@ -446,6 +446,36 @@ bool SharedMemory::IsRangeValid(uint32_t start, uint32_t length) const {
+   return true;
+ }
+ 
++bool SharedMemory::IsRangeValidAndGpuWritten(uint32_t start,
++                                             uint32_t length) const {
++  if (!length) {
++    return true;
++  }
++  if (start > kBufferSize || (kBufferSize - start) < length) {
++    return false;
++  }
++
++  const uint32_t page_first = start >> page_size_log2_;
++  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  const uint32_t block_first = page_first >> 6;
++  const uint32_t block_last = page_last >> 6;
++
++  for (uint32_t i = block_first; i <= block_last; ++i) {
++    uint64_t valid_mask = UINT64_MAX;
++    if (i == block_first) {
++      valid_mask &= ~((uint64_t(1) << (page_first & 63)) - 1);
++    }
++    if (i == block_last && (page_last & 63) != 63) {
++      valid_mask &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
++    }
++    if ((system_page_flags_valid_and_gpu_written_[i] & valid_mask) !=
++        valid_mask) {
++      return false;
++    }
++  }
++  return true;
++}
++
+ template <typename T>
+ XE_FORCEINLINE XE_NOALIAS static T mod_shift_left(T value, uint32_t by) {
+ #if XE_ARCH_AMD64 == 1
+diff --git a/src/xenia/gpu/shared_memory.h b/src/xenia/gpu/shared_memory.h
+index 2b56757..fe86cfd 100644
+--- a/src/xenia/gpu/shared_memory.h
++++ b/src/xenia/gpu/shared_memory.h
+@@ -76,6 +76,9 @@ class SharedMemory {
+   // memory copy. Hold the global critical region if relying on this for state
+   // transitions such as watch installation.
+   bool IsRangeValid(uint32_t start, uint32_t length) const;
++  // Whether every page in the range was last written by the GPU (a resolve or
++  // memory export) with no CPU write since. Hold the global critical region.
++  bool IsRangeValidAndGpuWritten(uint32_t start, uint32_t length) const;
+ 
+   void TryFindUploadRange(const uint32_t& block_first,
+                           const uint32_t& block_last,
+diff --git a/src/xenia/gpu/vulkan/vulkan_command_processor.cc b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+index 65bb0e3..aa0874e 100644
+--- a/src/xenia/gpu/vulkan/vulkan_command_processor.cc
++++ b/src/xenia/gpu/vulkan/vulkan_command_processor.cc
+@@ -21,6 +21,7 @@
+ #include "xenia/emulator.h"
+ #include "xenia/gpu/draw_util.h"
+ #include "xenia/gpu/gpu_flags.h"
++#include "xenia/gpu/gpu_thread_stats.h"
+ #include "xenia/gpu/packet_disassembler.h"
+ #include "xenia/gpu/registers.h"
+ #include "xenia/gpu/shader.h"
+@@ -3171,7 +3172,9 @@ bool VulkanCommandProcessor::IssueCopy() {
+ 
+   // CPU readback resolve path (if not disabled).
+   ReadbackResolveMode readback_mode = GetReadbackResolveMode();
+-  if (readback_mode == ReadbackResolveMode::kDisabled || !written_length) {
++  // "small" is only implemented for Direct3D 12; behave like "none".
++  if (readback_mode == ReadbackResolveMode::kDisabled ||
++      readback_mode == ReadbackResolveMode::kSmall || !written_length) {
+     return true;
+   }
+ 

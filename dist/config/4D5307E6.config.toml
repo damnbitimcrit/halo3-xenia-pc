@@ -1,0 +1,169 @@
+# Halo 3 (title 4D5307E6) settings for halo3-xenia-pc.
+# Xenia reads this file automatically from <xenia folder>/config/ when Halo 3
+# starts, on top of xenia-canary.config.toml. Delete a line to fall back to the
+# default; set a feature to false if it misbehaves.
+
+[Halo3]
+# Draw frames as fast as allowed instead of the console's 30 FPS. The game's
+# simulation still runs at 30 ticks per second of real time, so the game
+# speed does not change.
+halo3_unlock_framerate = true
+# Leave framerate_limit (xenia-canary.config.toml, [GPU]) at Xenia's default,
+# 0 (60 with vsync on): with halo3_immediate_present below nothing waits for
+# the emulated vblank, so it doesn't limit the frame rate; see docs/SETTINGS.md.
+#
+# Frame-rate cap while unlocked. With G-SYNC / FreeSync, use a few FPS below
+# your refresh rate (162 for 165 Hz, 141 for 144 Hz) so frames stay inside
+# the variable refresh range; 0 means no cap.
+halo3_framerate_limit = 162
+# Smooth movement between the game's 30 Hz simulation ticks (only active
+# while the frame rate is unlocked). Turn off if objects look wrong.
+halo3_interpolation = true
+# When the first-person weapon and arms skip a blend: "animation" (only on
+# real jumps), "any" (also on any fast turn: melee and throws step), "off".
+halo3_fp_snap = "animation"
+# Smooth time-animated surfaces (shields, plasma, holograms, water, foliage)
+# between ticks. Its hooks run for most draws. false here stops the work; to
+# remove the hooks too, put halo3_smooth_shader_time = false under [Halo3] in
+# xenia-canary.config.toml (read before this file).
+halo3_smooth_shader_time = true
+# Mouse aiming. 1.0 turns 0.057 degrees per mouse count (about 20 cm per 360
+# at 800 DPI).
+halo3_mouse_aim = true
+halo3_mouse_sensitivity = 1.0
+# Scoped aim already slows down by the zoom magnification, like the stick.
+# Raise or lower this to change it on top of that.
+halo3_mouse_zoom_sensitivity = 1.0
+halo3_mouse_invert_y = false
+# Diagnostics: every 5 seconds, xenia.log gets a line with the frame, tick
+# and present rates and what mouse aim and interpolation did. Set it to false
+# for a quieter log.
+halo3_log_stats = true
+# Start building a frame only once the render thread has taken the previous
+# one, instead of building frames that are never drawn (about half of them
+# when the frame rate drops). Not applied below about 33 FPS.
+halo3_pace_to_render = true
+# With pacing: delay each frame so it is ready just before the render thread
+# needs it, which keeps aiming as direct as without pacing.
+halo3_pace_late_start = true
+# The frame-rate cap sleeps until each frame is due. If frame times look
+# uneven on a display without G-SYNC / FreeSync, try 300 (microseconds of
+# busy-waiting at the end of each wait; costs some CPU).
+halo3_pacer_spin_us = 0
+# The game's render thread sleeps while it waits for a frame and during
+# loads, instead of spinning on a CPU core.
+halo3_render_thread_sleep = true
+# Present each frame as soon as it is drawn. The game's own setting waits for
+# the next emulated vblank whenever a frame takes a little longer than one,
+# which holds busy scenes well below the cap (about 82 FPS with a 165 Hz
+# framerate_limit). If you set this to false, raise framerate_limit to your
+# cap (165), or the game stays at 60; put it back to 60 whenever
+# halo3_unlock_framerate is false.
+halo3_immediate_present = true
+# Hold the game's presents at least one halo3_framerate_limit period apart.
+# Off: once a frame is late it keeps later frames at that phase, which adds
+# latency. Only try it if you see tearing or uneven pacing near the cap.
+halo3_present_spacing = false
+# Theater screenshots and the effect state in checkpoints and saves: copy
+# what the GPU wrote into the game's memory when the game reads it (a short
+# pause at that moment only). Off: black Theater screenshots, and effects
+# alive at a checkpoint glitch after a revert.
+halo3_gpu_readback = true
+# Theater: seeking back in a multiplayer film restores a snapshot the game
+# took every 10 seconds; keep its effect state too (copied in the background,
+# no pause). Off: effects alive then glitch after seeking back.
+halo3_gpu_readback_film_snapshots = true
+
+[HID]
+# Keyboard plays as controller 1.
+keyboard_mode = 1
+keyboard_user_index = 0
+# Click into the game window to lock the mouse for aiming (that click isn't
+# passed to the game); Alt+Tab releases it, and so does any Xenia dialog
+# (sign-in, profiles, messages) while it is open. While it is locked,
+# keyboard and mouse win over a connected gamepad. F11 toggles fullscreen.
+mouse_lock = true
+# Wooting / analog keyboards: walk slower by pressing W/A/S/D part way.
+keyboard_analog_movement = true
+
+# Key bindings. Values are keys separated by spaces: a letter or digit, or a
+# Windows virtual-key code like 0x20 (Space). Mouse: 0x01 left, 0x02 right,
+# 0x04 middle, 0x05 / 0x06 side buttons, 0x0A wheel up, 0x0B wheel down.
+# Avoid numpad + - * (Xenia speed hotkeys), F1-F12 and Pause.
+[HID.Key]
+keybind_left_thumb_up = "W"            # move
+keybind_left_thumb_down = "S"
+keybind_left_thumb_left = "A"
+keybind_left_thumb_right = "D"
+keybind_left_thumb = "0x11 C"          # crouch: Ctrl, C
+keybind_a = "0x20"                     # jump: Space
+keybind_right_trigger = "0x01"         # fire: left mouse
+keybind_right_thumb = "0x02"           # zoom: right mouse
+keybind_left_trigger = "G"             # throw grenade / fire left weapon
+keybind_b = "Q 0x05"                   # melee: Q, mouse side button
+keybind_right_shoulder = "R E"         # reload / pick up / interact
+keybind_x = "F"                        # use equipment
+keybind_y = "0x0A 0x0B 1"              # switch weapon: wheel, 1
+keybind_left_shoulder = "Z"            # switch grenade type
+keybind_start = "0x1B 0x0D"            # pause menu: Escape, Enter
+keybind_back = "0x09"                  # scoreboard: Tab
+keybind_dpad_up = "0x26"               # arrows
+keybind_dpad_down = "0x28"
+keybind_dpad_left = "0x25"
+keybind_dpad_right = "0x27"
+keybind_right_thumb_up = ""            # aim is on the mouse
+keybind_right_thumb_down = ""
+keybind_right_thumb_left = ""
+keybind_right_thumb_right = ""
+keybind_guide = ""
+
+[GPU]
+# The game reads back a few pixels of the scene brightness every frame for
+# its auto exposure. "small" reads back only such small resolves, a frame
+# or two later, without the slowdown of "fast" or "full"; "none" leaves the
+# exposure stuck (darker or flatter lighting than on a console).
+readback_resolve = "small"
+# Lens flares (lights, Regenerators, equipment) are dimmed and hidden by
+# occlusion queries. "fast" guesses that a hidden flare is still slightly
+# visible, so small flares behind walls stay drawn; "fast-alt" reuses the
+# last real answer, at no extra cost. Leave occlusion_query_viz off: it costs
+# frames, makes the glows stutter and doesn't hide them.
+occlusion_query = "fast-alt"
+# Halo 3 simulates particles, contrails, light volumes and beams on the GPU
+# (memory export). Its CPU writes next to that memory every frame, which made
+# Xenia put stale data back over it: plasma trails and drop-pod smoke
+# stretching across the screen. This keeps the GPU's data in those four
+# buffers (only there: the CPU writes the game's other export targets too),
+# at no cost and without changing the game's memory, so console saves and
+# films load as before. Leave readback_memexport off: it also fixes them,
+# but waits for the GPU at every export.
+memexport_keep_gpu_data = true
+# Switches such as host_present_thread ([Display]) and
+# gpu_thread_profile ([GPU]) are left to xenia-canary.config.toml: a line
+# here would override that file. See docs/SETTINGS.md.
+
+[APU]
+# When the game's audio falls behind (loads, new effects compiling), fade out
+# instead of cutting off, and come back with a fade in once this many 5.3 ms
+# frames are queued. 0 restores Xenia's original behaviour.
+apu_prebuffer_frames = 3
+apu_fade_ms = 3.0
+# Refill the audio queue right after the game's audio was late.
+apu_max_catchup_frames = 2
+# Ask the game for audio at exactly the rate it plays (Xenia asked slightly
+# too often, so the sound fell further behind the picture over a session).
+apu_exact_pump_interval = true
+# Keep this many audio frames (5.3 ms each) queued, enough to carry the
+# sound through map loads, and skip requests while more than this plus
+# apu_max_queued_frames are queued.
+apu_target_queued_frames = 9
+apu_max_queued_frames = 8
+# Restart the audio decoder for each new sound (also when the game cuts one
+# off), so no tail of the previous sound clicks at the start of the next.
+xma_reset_decoder_per_stream = true
+# The game's audio threads and Xenia's XMA decoder at the highest priority.
+apu_raise_thread_priority = true
+
+[Kernel]
+# Don't run the game's render and streaming threads below normal priority.
+thread_priority_floor_normal = true

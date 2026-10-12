@@ -1,0 +1,18 @@
+---
+# Xenia Canary's .clang-format (at xenia/UPSTREAM_COMMIT) without the
+# KeepEmptyLines key, which clang-format 18 doesn't know. Usage:
+# clang-format-18 --style=file:tools/clang-format-18.yaml -i <files>
+BasedOnStyle: Google
+DerivePointerAlignment: false
+PointerAlignment: Left
+SortIncludes: true
+InsertNewlineAtEOF: true
+InsertBraces: true
+
+# Regroup causes unnecessary noise due to clang-format bug.
+IncludeBlocks: Preserve
+
+---
+Language: Java
+DisableFormat: true
+SortIncludes: false
